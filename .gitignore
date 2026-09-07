@@ -1,0 +1,13 @@
+/build/
+/out/
+/.cache/
+/.idea/
+/.vscode/
+CMakeUserPresets.json
+*.user
+*.suo
+*.VC.db
+*.VC.VC.opendb
+.DS_Store
+/assets/data/*
+!/assets/data/README.md
