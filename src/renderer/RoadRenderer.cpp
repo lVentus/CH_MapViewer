@@ -2,7 +2,6 @@
 
 #include "data/ch/CHGraph.h"
 #include "renderer/MapCamera2D.h"
-#include "gpu/unfolding/IUnfoldingStrategy.h"
 
 #include <glad/gl.h>
 
@@ -42,7 +41,6 @@ static_assert(sizeof(GPUNode) == 8);
 static_assert(sizeof(GPUEdge) == 32);
 static_assert(sizeof(DrawArraysIndirectCommand) == 16);
 
-constexpr std::uint32_t kFilterWorkGroupSize = 256;
 constexpr double kPi = 3.14159265358979323846;
 
 void CheckBufferSize(std::size_t sizeBytes) {
@@ -57,9 +55,11 @@ void CheckBufferSize(std::size_t sizeBytes) {
 } // namespace
 
 RoadRenderer::RoadRenderer(const std::filesystem::path& shaderDirectory)
-    : filterProgram_(shaderDirectory / "range_filter.comp"),
-      roadProgram_(shaderDirectory / "road.vert", shaderDirectory / "road.frag") {
+    : roadProgram_(shaderDirectory / "road.vert", shaderDirectory / "road.frag") {
     glGenVertexArrays(1, &vertexArray_);
+
+    const DrawArraysIndirectCommand command{0, 1, 0, 0};
+    uploadedIndirectBuffer_.Allocate(sizeof(command), &command, GL_DYNAMIC_DRAW);
 }
 
 RoadRenderer::~RoadRenderer() {
@@ -134,64 +134,95 @@ void RoadRenderer::SetGraph(const data::CHGraph& graph) {
 
     const auto nodeBytes = nodes.size() * sizeof(GPUNode);
     const auto edgeBytes = edges.size() * sizeof(GPUEdge);
-    const auto visibleBytes = edges.size() * sizeof(std::uint32_t);
     CheckBufferSize(nodeBytes);
     CheckBufferSize(edgeBytes);
-    CheckBufferSize(visibleBytes);
 
     nodeBuffer_.Allocate(nodeBytes, nodes.data(), GL_STATIC_DRAW);
     edgeBuffer_.Allocate(edgeBytes, edges.data(), GL_STATIC_DRAW);
-    visibleEdgeBuffer_.Allocate(visibleBytes, nullptr, GL_DYNAMIC_DRAW);
-
-    const DrawArraysIndirectCommand command{0, 1, 0, 0};
-    indirectBuffer_.Allocate(sizeof(command), &command, GL_DYNAMIC_DRAW);
     edgeCount_ = static_cast<std::uint32_t>(edges.size());
+    uploadCapacity_ = 0;
 }
 
-void RoadRenderer::Draw(const MapCamera2D& camera, std::int32_t lodLevel, int framebufferWidth,
-                        int framebufferHeight,
-                        gpu::unfolding::IUnfoldingStrategy& unfoldingStrategy) {
-    if (edgeCount_ == 0 || framebufferWidth <= 0 || framebufferHeight <= 0) {
-        return;
+RoadDrawData RoadRenderer::UploadEdgeIds(std::span<const std::uint32_t> edgeIds) {
+    EnsureUploadCapacity(edgeIds.size());
+    if (!edgeIds.empty()) {
+        uploadedEdgeBuffer_.Update(0, edgeIds.size_bytes(), edgeIds.data());
     }
 
-    const std::uint32_t zero = 0;
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, indirectBuffer_.Id());
-    glClearBufferSubData(GL_SHADER_STORAGE_BUFFER, GL_R32UI, 0, sizeof(zero), GL_RED_INTEGER,
-                         GL_UNSIGNED_INT, &zero);
+    if (edgeIds.size() > std::numeric_limits<std::uint32_t>::max() / 2u) {
+        throw std::runtime_error("too many CPU edges for indirect line rendering");
+    }
 
-    filterProgram_.Bind();
-    edgeBuffer_.BindBase(GL_SHADER_STORAGE_BUFFER, 0);
-    visibleEdgeBuffer_.BindBase(GL_SHADER_STORAGE_BUFFER, 1);
-    indirectBuffer_.BindBase(GL_SHADER_STORAGE_BUFFER, 2);
-    glUniform1ui(glGetUniformLocation(filterProgram_.Id(), "uEdgeCount"), edgeCount_);
-    glUniform1i(glGetUniformLocation(filterProgram_.Id(), "uLevel"), lodLevel);
-    filterProgram_.Dispatch((edgeCount_ + kFilterWorkGroupSize - 1) / kFilterWorkGroupSize);
+    const DrawArraysIndirectCommand command{
+        static_cast<std::uint32_t>(edgeIds.size() * 2),
+        1,
+        0,
+        0,
+    };
+    uploadedIndirectBuffer_.Update(0, sizeof(command), &command);
 
-    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_COMMAND_BARRIER_BIT);
+    return {
+        uploadedEdgeBuffer_.Id(),
+        uploadedIndirectBuffer_.Id(),
+    };
+}
 
-    const auto unfolded = unfoldingStrategy.Execute({
-        .edgeBuffer = edgeBuffer_.Id(),
-        .edgeCount = edgeCount_,
-        .inputEdgeBuffer = visibleEdgeBuffer_.Id(),
-        .inputDrawCommandBuffer = indirectBuffer_.Id(),
-        .outputCapacity = edgeCount_,
-    });
+void RoadRenderer::Draw(const MapCamera2D& camera, int framebufferWidth, int framebufferHeight,
+                        const RoadDrawData& drawData, float viewScale, float viewOffsetX,
+                        const std::array<float, 4>& color) const {
+    if (edgeCount_ == 0 || framebufferWidth <= 0 || framebufferHeight <= 0 ||
+        drawData.edgeIdBuffer == 0 || drawData.drawCommandBuffer == 0) {
+        return;
+    }
 
     roadProgram_.Bind();
     nodeBuffer_.BindBase(GL_SHADER_STORAGE_BUFFER, 0);
     edgeBuffer_.BindBase(GL_SHADER_STORAGE_BUFFER, 1);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, unfolded.edgeBuffer);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, drawData.edgeIdBuffer);
     glUniform2f(glGetUniformLocation(roadProgram_.Id(), "uCameraCenter"), camera.CenterX(),
                 camera.CenterY());
-    glUniform1f(glGetUniformLocation(roadProgram_.Id(), "uZoom"), camera.ZoomFactor());
+    glUniform1f(glGetUniformLocation(roadProgram_.Id(), "uZoom"), camera.ViewScale());
     glUniform1f(glGetUniformLocation(roadProgram_.Id(), "uAspectScale"),
                 static_cast<float>(framebufferHeight) / static_cast<float>(framebufferWidth));
+    glUniform1f(glGetUniformLocation(roadProgram_.Id(), "uViewScale"), viewScale);
+    glUniform1f(glGetUniformLocation(roadProgram_.Id(), "uViewOffsetX"), viewOffsetX);
+    glUniform4f(glGetUniformLocation(roadProgram_.Id(), "uColor"), color[0], color[1], color[2],
+                color[3]);
 
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glBindVertexArray(vertexArray_);
-    glBindBuffer(GL_DRAW_INDIRECT_BUFFER, unfolded.drawCommandBuffer);
+    glBindBuffer(GL_DRAW_INDIRECT_BUFFER, drawData.drawCommandBuffer);
     glDrawArraysIndirect(GL_LINES, nullptr);
     glBindVertexArray(0);
+    glDisable(GL_BLEND);
+}
+
+void RoadRenderer::DrawViewport(const MapCamera2D& camera, int viewportX, int viewportY,
+                                int viewportWidth, int viewportHeight,
+                                const RoadDrawData& drawData,
+                                const std::array<float, 4>& color) const {
+    if (viewportWidth <= 0 || viewportHeight <= 0) {
+        return;
+    }
+
+    GLint previousViewport[4]{};
+    glGetIntegerv(GL_VIEWPORT, previousViewport);
+    glViewport(viewportX, viewportY, viewportWidth, viewportHeight);
+    Draw(camera, viewportWidth, viewportHeight, drawData, 1.0f, 0.0f, color);
+    glViewport(previousViewport[0], previousViewport[1], previousViewport[2], previousViewport[3]);
+}
+
+void RoadRenderer::EnsureUploadCapacity(std::size_t edgeCount) {
+    if (uploadCapacity_ >= edgeCount && uploadCapacity_ != 0) {
+        return;
+    }
+
+    const auto capacity = std::max<std::size_t>(edgeCount, 1);
+    const auto sizeBytes = capacity * sizeof(std::uint32_t);
+    CheckBufferSize(sizeBytes);
+    uploadedEdgeBuffer_.Allocate(sizeBytes, nullptr, GL_DYNAMIC_DRAW);
+    uploadCapacity_ = capacity;
 }
 
 } // namespace chmv::renderer

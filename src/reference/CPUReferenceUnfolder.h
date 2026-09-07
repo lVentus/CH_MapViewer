@@ -13,6 +13,8 @@ public:
     explicit CPUReferenceUnfolder(const data::CHGraph& graph) : graph_(graph) {}
 
     [[nodiscard]] std::vector<std::uint32_t> UnfoldFully(std::span<const std::uint32_t> roots) const;
+    void UnfoldFully(std::span<const std::uint32_t> roots,
+                     std::vector<std::uint32_t>& output) const;
 
 private:
     const data::CHGraph& graph_;

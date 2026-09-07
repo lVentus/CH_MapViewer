@@ -23,6 +23,7 @@ public:
     virtual ~IUnfoldingStrategy() = default;
 
     [[nodiscard]] virtual std::string_view Name() const = 0;
+    [[nodiscard]] virtual bool FullyUnfolds() const = 0;
     [[nodiscard]] virtual UnfoldingOutput Execute(const UnfoldingInput& input) = 0;
 };
 

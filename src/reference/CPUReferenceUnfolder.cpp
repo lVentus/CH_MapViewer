@@ -7,6 +7,14 @@ namespace chmv::reference {
 std::vector<std::uint32_t>
 CPUReferenceUnfolder::UnfoldFully(std::span<const std::uint32_t> roots) const {
     std::vector<std::uint32_t> output;
+    UnfoldFully(roots, output);
+    return output;
+}
+
+void CPUReferenceUnfolder::UnfoldFully(std::span<const std::uint32_t> roots,
+                                       std::vector<std::uint32_t>& output) const {
+    output.clear();
+
     std::vector<std::uint32_t> stack;
     stack.reserve(128);
 
@@ -31,8 +39,6 @@ CPUReferenceUnfolder::UnfoldFully(std::span<const std::uint32_t> roots) const {
             stack.push_back(edge.childA);
         }
     }
-
-    return output;
 }
 
 } // namespace chmv::reference

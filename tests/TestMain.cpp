@@ -1,4 +1,7 @@
+#include "benchmark/CorrectnessValidator.h"
 #include "data/ch/CHLoader.h"
+#include "pipeline/CPUReferencePipeline.h"
+#include "reference/CPURangeFilter.h"
 #include "reference/CPUReferenceUnfolder.h"
 
 #include <filesystem>
@@ -15,7 +18,7 @@ void Require(bool condition, const char* message) {
     }
 }
 
-void TestLoaderAndReferenceUnfolding() {
+chmv::data::CHGraph LoadTestGraph() {
     const auto base = std::filesystem::temp_directory_path() / "chmv_test";
     const auto graphPath = base.string() + ".sch";
     const auto rangePath = base.string() + ".sch.ranges";
@@ -40,7 +43,14 @@ void TestLoaderAndReferenceUnfolding() {
         ranges << "2 2 1\n";
     }
 
-    const auto graph = chmv::data::CHLoader::Load(graphPath, rangePath);
+    auto graph = chmv::data::CHLoader::Load(graphPath, rangePath);
+    std::filesystem::remove(graphPath);
+    std::filesystem::remove(rangePath);
+    return graph;
+}
+
+void TestLoaderAndReferenceUnfolding() {
+    const auto graph = LoadTestGraph();
     Require(graph.NodeCount() == 3, "node count mismatch");
     Require(graph.EdgeCount() == 3, "edge count mismatch");
     Require(graph.ShortcutCount() == 1, "shortcut count mismatch");
@@ -53,9 +63,35 @@ void TestLoaderAndReferenceUnfolding() {
 
     Require(output.size() == 2, "unexpected unfolded edge count");
     Require(output[0] == 0 && output[1] == 1, "unexpected unfolding order");
+}
 
-    std::filesystem::remove(graphPath);
-    std::filesystem::remove(rangePath);
+void TestCPURangeFilterAndPipeline() {
+    const auto graph = LoadTestGraph();
+
+    chmv::reference::CPURangeFilter filter;
+    std::vector<std::uint32_t> alive;
+    filter.Filter(graph, 1, alive);
+    Require(alive.size() == 3, "unexpected CPU range-filter result");
+
+    chmv::pipeline::CPUReferencePipeline pipeline;
+    const auto result = pipeline.Process(graph, 1, true);
+    Require(result.stats.aliveEdgeCount == 3, "unexpected CPU pipeline alive count");
+    Require(result.edgeIds.size() == 4, "unexpected CPU pipeline unfolded count");
+}
+
+void TestCorrectnessValidator() {
+    const std::vector<std::uint32_t> cpu{1, 2, 2, 4};
+    const std::vector<std::uint32_t> gpuPass{4, 2, 1, 2};
+    const auto pass = chmv::benchmark::CorrectnessValidator::Compare(cpu, gpuPass);
+    Require(pass.Passed(), "validator should ignore output order");
+    Require(pass.cpuDuplicateCount == 1 && pass.gpuDuplicateCount == 1,
+            "duplicate counts mismatch");
+
+    const std::vector<std::uint32_t> gpuFail{1, 2, 3, 4};
+    const auto fail = chmv::benchmark::CorrectnessValidator::Compare(cpu, gpuFail);
+    Require(!fail.Passed(), "validator should detect different edge multisets");
+    Require(fail.missingEdgeCount == 1, "missing edge count mismatch");
+    Require(fail.unexpectedEdgeCount == 1, "unexpected edge count mismatch");
 }
 
 } // namespace
@@ -63,6 +99,8 @@ void TestLoaderAndReferenceUnfolding() {
 int main() {
     try {
         TestLoaderAndReferenceUnfolding();
+        TestCPURangeFilterAndPipeline();
+        TestCorrectnessValidator();
         std::cout << "All tests passed.\n";
         return 0;
     } catch (const std::exception& error) {

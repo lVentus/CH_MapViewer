@@ -20,6 +20,8 @@ layout(std430, binding = 2) readonly buffer VisibleEdges {
 uniform vec2 uCameraCenter;
 uniform float uZoom;
 uniform float uAspectScale;
+uniform float uViewScale;
+uniform float uViewOffsetX;
 
 void main() {
     uint edgeId = visibleEdgeIds[uint(gl_VertexID) >> 1u];
@@ -27,5 +29,7 @@ void main() {
     uint nodeId = (gl_VertexID & 1) == 0 ? edge.topology.x : edge.topology.y;
     vec2 position = (nodePositions[nodeId] - uCameraCenter) * uZoom;
     position.x *= uAspectScale;
+    position *= uViewScale;
+    position.x += uViewOffsetX;
     gl_Position = vec4(position, 0.0, 1.0);
 }

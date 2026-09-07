@@ -5,7 +5,7 @@ set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(GLFW_INSTALL OFF CACHE BOOL "" FORCE)
 
-if(MSVC)
+if(DEFINED CHMV_MSVC_RUNTIME_LIBRARY)
     set(USE_MSVC_RUNTIME_LIBRARY_DLL ON CACHE BOOL "" FORCE)
 endif()
 
@@ -16,6 +16,9 @@ FetchContent_Declare(
     GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(glfw)
+if(DEFINED CHMV_MSVC_RUNTIME_LIBRARY)
+    set_property(TARGET glfw PROPERTY MSVC_RUNTIME_LIBRARY "${CHMV_MSVC_RUNTIME_LIBRARY}")
+endif()
 
 FetchContent_Declare(
     glad
@@ -26,6 +29,9 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(glad)
 glad_add_library(chmv_glad REPRODUCIBLE API gl:core=4.3)
+if(DEFINED CHMV_MSVC_RUNTIME_LIBRARY)
+    set_property(TARGET chmv_glad PROPERTY MSVC_RUNTIME_LIBRARY "${CHMV_MSVC_RUNTIME_LIBRARY}")
+endif()
 
 FetchContent_Declare(
     imgui
@@ -33,10 +39,7 @@ FetchContent_Declare(
     GIT_TAG v1.91.9b
     GIT_SHALLOW TRUE
 )
-FetchContent_GetProperties(imgui)
-if(NOT imgui_POPULATED)
-    FetchContent_Populate(imgui)
-endif()
+FetchContent_MakeAvailable(imgui)
 
 add_library(imgui STATIC
     ${imgui_SOURCE_DIR}/imgui.cpp
@@ -52,3 +55,6 @@ target_include_directories(imgui PUBLIC
     ${imgui_SOURCE_DIR}/backends
 )
 target_link_libraries(imgui PUBLIC glfw chmv_glad)
+if(DEFINED CHMV_MSVC_RUNTIME_LIBRARY)
+    set_property(TARGET imgui PROPERTY MSVC_RUNTIME_LIBRARY "${CHMV_MSVC_RUNTIME_LIBRARY}")
+endif()

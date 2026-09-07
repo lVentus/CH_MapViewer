@@ -14,6 +14,7 @@ public:
     explicit IterativeDFSUnfoldingStrategy(const std::filesystem::path& shaderDirectory);
 
     [[nodiscard]] std::string_view Name() const override { return "Iterative DFS"; }
+    [[nodiscard]] bool FullyUnfolds() const override { return true; }
     [[nodiscard]] UnfoldingOutput Execute(const UnfoldingInput& input) override;
 
 private:

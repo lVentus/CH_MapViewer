@@ -6,7 +6,8 @@
 namespace chmv::renderer {
 namespace {
 
-constexpr float kZoomPerScrollStep = 1.25f;
+constexpr float kOverviewZoom = 10.0f;
+constexpr float kZoomPerScrollStep = 1.08f;
 constexpr float kMaxZoom = 1048576.0f;
 
 } // namespace
@@ -14,7 +15,11 @@ constexpr float kMaxZoom = 1048576.0f;
 void MapCamera2D::Reset() {
     centerX_ = 0.0f;
     centerY_ = 0.0f;
-    zoom_ = 1.0f;
+    zoom_ = kOverviewZoom;
+}
+
+float MapCamera2D::ViewScale() const {
+    return zoom_ / kOverviewZoom;
 }
 
 void MapCamera2D::Zoom(float scrollSteps) {
@@ -27,7 +32,7 @@ void MapCamera2D::PanPixels(double deltaX, double deltaY, int framebufferHeight)
         return;
     }
 
-    const auto worldPerPixel = 2.0f / (zoom_ * static_cast<float>(framebufferHeight));
+    const auto worldPerPixel = 2.0f / (ViewScale() * static_cast<float>(framebufferHeight));
     centerX_ -= static_cast<float>(deltaX) * worldPerPixel;
     centerY_ += static_cast<float>(deltaY) * worldPerPixel;
 }

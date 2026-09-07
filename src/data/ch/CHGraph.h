@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <vector>
 
 namespace chmv::data {
@@ -15,8 +16,14 @@ public:
     [[nodiscard]] const std::vector<EdgeRange>& Ranges() const { return ranges_; }
 
     [[nodiscard]] std::vector<CHNode>& Nodes() { return nodes_; }
-    [[nodiscard]] std::vector<CHEdge>& Edges() { return edges_; }
-    [[nodiscard]] std::vector<EdgeRange>& Ranges() { return ranges_; }
+    [[nodiscard]] std::vector<CHEdge>& Edges() {
+        shortcutCount_.reset();
+        return edges_;
+    }
+    [[nodiscard]] std::vector<EdgeRange>& Ranges() {
+        drawableEdgeCount_.reset();
+        return ranges_;
+    }
 
     [[nodiscard]] const CHEdge& Edge(std::uint32_t edgeId) const;
     [[nodiscard]] const EdgeRange& Range(std::uint32_t edgeId) const;
@@ -30,6 +37,8 @@ private:
     std::vector<CHNode> nodes_;
     std::vector<CHEdge> edges_;
     std::vector<EdgeRange> ranges_;
+    mutable std::optional<std::size_t> drawableEdgeCount_;
+    mutable std::optional<std::size_t> shortcutCount_;
 };
 
 } // namespace chmv::data
