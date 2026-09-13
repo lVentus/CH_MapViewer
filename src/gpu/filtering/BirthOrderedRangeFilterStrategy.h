@@ -17,6 +17,7 @@ public:
     [[nodiscard]] std::string_view Name() const override { return "Birth-Ordered"; }
     void SetGraph(const data::CHGraph& graph) override;
     [[nodiscard]] RangeFilterExecutionStats Execute(const RangeFilterInput& input) override;
+    [[nodiscard]] RangeFilterDiagnostics ReadBackDiagnostics(std::int32_t lodLevel) const override;
 
 private:
     ComputeProgram prepareDispatchProgram_;

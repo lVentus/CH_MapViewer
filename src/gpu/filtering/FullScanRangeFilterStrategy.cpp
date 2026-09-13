@@ -30,4 +30,12 @@ RangeFilterExecutionStats FullScanRangeFilterStrategy::Execute(const RangeFilter
     return {edgeCount_};
 }
 
+RangeFilterDiagnostics FullScanRangeFilterStrategy::ReadBackDiagnostics(std::int32_t) const {
+    return {
+        edgeCount_,
+        (edgeCount_ + kWorkGroupSize - 1) / kWorkGroupSize,
+        kWorkGroupSize,
+    };
+}
+
 } // namespace chmv::gpu::filtering

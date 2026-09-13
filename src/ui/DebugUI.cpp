@@ -99,6 +99,7 @@ DebugUIActions DebugUI::Draw(
     float& maxScreenErrorPixels,
     const pipeline::CPUProcessingStats* cpuStats,
     const pipeline::GPUProcessingStats* gpuStats,
+    const pipeline::GPURangeBenchmarkResult* gpuRangeBenchmarkResult,
     const benchmark::PipelineValidationResult* validationResult,
     bool canValidate) {
     DebugUIActions actions;
@@ -187,7 +188,7 @@ DebugUIActions DebugUI::Draw(
             if (ImGui::Button("Reset view")) {
                 camera->Reset();
             }
-            ImGui::TextDisabled("Mouse wheel: zoom | Middle mouse: pan");
+            ImGui::TextDisabled("Mouse wheel: zoom | Left mouse: pan");
         }
     } else {
         ImGui::TextUnformatted("No CH dataset loaded.");
@@ -302,13 +303,37 @@ DebugUIActions DebugUI::Draw(
         } else {
             ImGui::TextUnformatted("GPU range candidates: GPU-managed");
         }
-        if (gpuStats->rangeFilterMs) {
-            ImGui::Text("GPU range filter: %.6f ms", *gpuStats->rangeFilterMs);
+    }
+
+    if (gpuStats && processingMode != pipeline::ProcessingMode::CPUReference) {
+        ImGui::Separator();
+        ImGui::TextUnformatted("GPU range filter benchmark");
+        if (ImGui::Button("Run GPU Range Benchmark")) {
+            actions.runGpuRangeBenchmark = true;
         }
-        if (gpuStats->geometryRefinementMs) {
-            ImGui::Text("GPU geometry refinement: %.6f ms", *gpuStats->geometryRefinementMs);
-        } else {
-            ImGui::TextDisabled("GPU geometry refinement: none (ranges only)");
+        ImGui::TextDisabled(
+            "20 warm-up + 200 measured executions, synchronized in batches of 10.");
+        ImGui::TextDisabled(
+            "Measures range filtering only; geometry refinement and drawing are excluded.");
+
+        if (gpuRangeBenchmarkResult) {
+            ImGui::Text("Filter: %s | LOD: %d", gpuRangeBenchmarkResult->filterStrategy.c_str(),
+                        gpuRangeBenchmarkResult->lodLevel);
+            if (gpuRangeBenchmarkResult->candidateEdgeCount) {
+                ImGui::Text("Candidate edges: %zu", *gpuRangeBenchmarkResult->candidateEdgeCount);
+            } else {
+                ImGui::TextDisabled("Candidate edges: unavailable");
+            }
+            ImGui::Text("Alive edges: %zu", gpuRangeBenchmarkResult->aliveEdgeCount);
+            ImGui::Text("Mean: %.6f ms", gpuRangeBenchmarkResult->meanMs);
+            ImGui::Text("Median: %.6f ms", gpuRangeBenchmarkResult->medianMs);
+            ImGui::Text("Min / Max: %.6f / %.6f ms", gpuRangeBenchmarkResult->minMs,
+                        gpuRangeBenchmarkResult->maxMs);
+            ImGui::Text("P95 / P99: %.6f / %.6f ms", gpuRangeBenchmarkResult->p95Ms,
+                        gpuRangeBenchmarkResult->p99Ms);
+            ImGui::Text("StdDev: %.6f ms", gpuRangeBenchmarkResult->stdDevMs);
+            ImGui::TextDisabled(
+                "Statistics are computed from 20 synchronized batch-average samples.");
         }
     }
 
@@ -316,9 +341,9 @@ DebugUIActions DebugUI::Draw(
         ImGui::Text("CPU scanned edges: %zu", cpuStats->rangeScannedEdgeCount);
         ImGui::Text("CPU alive edges: %zu", cpuStats->aliveEdgeCount);
         ImGui::Text("CPU output edges: %zu", cpuStats->outputEdgeCount);
-        ImGui::Text("CPU range filter: %.6f ms", cpuStats->rangeFilterMs);
+        ImGui::Text("CPU range filter (last): %.6f ms", cpuStats->rangeFilterMs);
         if (cpuStats->geometryRefinementMs > 0.0) {
-            ImGui::Text("CPU geometry refinement: %.6f ms", cpuStats->geometryRefinementMs);
+            ImGui::Text("CPU geometry refinement (last): %.6f ms", cpuStats->geometryRefinementMs);
         } else {
             ImGui::TextDisabled("CPU geometry refinement: none (ranges only)");
         }

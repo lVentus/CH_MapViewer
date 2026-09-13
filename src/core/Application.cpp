@@ -9,6 +9,7 @@
 
 #include <array>
 #include <chrono>
+#include <iomanip>
 #include <iostream>
 #include <utility>
 
@@ -70,6 +71,7 @@ void Application::InstallDataset(data::CHGraph graph) {
     lodController_.SetManualLevel(roadRenderer_.MaxLevel());
     camera_.Reset();
     ClearValidation();
+    gpuRangeBenchmarkResult_.reset();
 }
 
 int Application::Run() {
@@ -172,9 +174,37 @@ int Application::Run() {
             graph_ ? &lodController_ : nullptr, datasetCatalog_, datasetLoad, processingMode_,
             cpuGeometryRefinement_, maxScreenErrorPixels_,
             cpuResult ? &cpuResult->stats : nullptr, graph_ ? &gpuStats : nullptr,
+            gpuRangeBenchmarkResult_ ? &*gpuRangeBenchmarkResult_ : nullptr,
             validationResult_ ? &*validationResult_ : nullptr,
             processingMode_ == pipeline::ProcessingMode::Validation && cpuResult && gpuResult);
         debugUI_.EndFrame();
+
+        if (actions.runGpuRangeBenchmark && graph_) {
+            gpuRangeBenchmarkResult_ = gpuPipeline_.RunRangeFilterBenchmark(
+                roadRenderer_.EdgeBufferId(), roadRenderer_.EdgeCount(), lodLevel,
+                rangeFilterStrategyManager_.Current());
+
+            const auto& benchmark = *gpuRangeBenchmarkResult_;
+            std::cout << "\n[GPU Range Filter Benchmark]\n"
+                      << "  Filter: " << benchmark.filterStrategy << '\n'
+                      << "  LOD: " << benchmark.lodLevel << '\n';
+            if (benchmark.candidateEdgeCount) {
+                std::cout << "  Candidate edges: " << *benchmark.candidateEdgeCount << '\n';
+            }
+            std::cout << "  Alive edges: " << benchmark.aliveEdgeCount << '\n'
+                      << "  Warm-up iterations: " << benchmark.warmupIterations << '\n'
+                      << "  Measured iterations: " << benchmark.measuredIterations << '\n'
+                      << "  Batch size: " << benchmark.batchSize << '\n'
+                      << std::fixed << std::setprecision(6)
+                      << "  Mean: " << benchmark.meanMs << " ms\n"
+                      << "  Median: " << benchmark.medianMs << " ms\n"
+                      << "  Min: " << benchmark.minMs << " ms\n"
+                      << "  Max: " << benchmark.maxMs << " ms\n"
+                      << "  P95: " << benchmark.p95Ms << " ms\n"
+                      << "  P99: " << benchmark.p99Ms << " ms\n"
+                      << "  StdDev: " << benchmark.stdDevMs << " ms\n\n"
+                      << std::defaultfloat;
+        }
 
         if (actions.validateCurrentResult && cpuResult && gpuResult) {
             gpuPipeline_.ReadBackEdgeIds(gpuResult->aliveEdgeIdBuffer,

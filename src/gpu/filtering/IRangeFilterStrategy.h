@@ -23,6 +23,12 @@ struct RangeFilterExecutionStats {
     std::optional<std::size_t> candidateEdgeCount;
 };
 
+struct RangeFilterDiagnostics {
+    std::optional<std::size_t> candidateEdgeCount;
+    std::optional<std::uint32_t> dispatchGroupCount;
+    std::optional<std::uint32_t> localSizeX;
+};
+
 class IRangeFilterStrategy {
 public:
     virtual ~IRangeFilterStrategy() = default;
@@ -31,6 +37,9 @@ public:
     virtual void SetGraph(const data::CHGraph& graph) = 0;
     virtual void Reset() {}
     [[nodiscard]] virtual RangeFilterExecutionStats Execute(const RangeFilterInput& input) = 0;
+    [[nodiscard]] virtual RangeFilterDiagnostics ReadBackDiagnostics(std::int32_t) const {
+        return {};
+    }
 };
 
 } // namespace chmv::gpu::filtering

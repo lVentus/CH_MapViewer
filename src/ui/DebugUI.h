@@ -31,6 +31,7 @@ namespace chmv::pipeline {
 enum class ProcessingMode;
 struct CPUProcessingStats;
 struct GPUProcessingStats;
+struct GPURangeBenchmarkResult;
 }
 
 namespace chmv::renderer {
@@ -43,6 +44,7 @@ namespace chmv::ui {
 struct DebugUIActions {
     std::optional<std::size_t> datasetRequest;
     bool validateCurrentResult = false;
+    bool runGpuRangeBenchmark = false;
 };
 
 class DebugUI {
@@ -67,6 +69,7 @@ public:
         float& maxScreenErrorPixels,
         const pipeline::CPUProcessingStats* cpuStats,
         const pipeline::GPUProcessingStats* gpuStats,
+        const pipeline::GPURangeBenchmarkResult* gpuRangeBenchmarkResult,
         const benchmark::PipelineValidationResult* validationResult,
         bool canValidate);
     void EndFrame() const;

@@ -57,6 +57,7 @@ private:
     geometry::RefinementMode cpuGeometryRefinement_ = geometry::RefinementMode::None;
     float maxScreenErrorPixels_ = 1.0f;
     std::optional<benchmark::PipelineValidationResult> validationResult_;
+    std::optional<pipeline::GPURangeBenchmarkResult> gpuRangeBenchmarkResult_;
     std::vector<std::uint32_t> gpuAliveReadback_;
     std::vector<std::uint32_t> gpuOutputReadback_;
     std::int32_t validationLod_ = 0;

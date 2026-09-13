@@ -85,4 +85,28 @@ RangeFilterExecutionStats BirthOrderedRangeFilterStrategy::Execute(const RangeFi
     return {};
 }
 
+RangeFilterDiagnostics BirthOrderedRangeFilterStrategy::ReadBackDiagnostics(std::int32_t lodLevel) const {
+    RangeFilterDiagnostics diagnostics;
+    if (levelCount_ == 0 || lodLevel < 0 || static_cast<std::uint32_t>(lodLevel) >= levelCount_) {
+        return diagnostics;
+    }
+
+    std::uint32_t candidateCount = 0;
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, scanEndBuffer_.Id());
+    glGetBufferSubData(GL_SHADER_STORAGE_BUFFER,
+                       static_cast<GLintptr>(static_cast<std::uint32_t>(lodLevel) * sizeof(std::uint32_t)),
+                       sizeof(candidateCount), &candidateCount);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+
+    DispatchIndirectCommand dispatch{};
+    glBindBuffer(GL_DISPATCH_INDIRECT_BUFFER, dispatchBuffer_.Id());
+    glGetBufferSubData(GL_DISPATCH_INDIRECT_BUFFER, 0, sizeof(dispatch), &dispatch);
+    glBindBuffer(GL_DISPATCH_INDIRECT_BUFFER, 0);
+
+    diagnostics.candidateEdgeCount = candidateCount;
+    diagnostics.dispatchGroupCount = dispatch.groupsX;
+    diagnostics.localSizeX = 256;
+    return diagnostics;
+}
+
 } // namespace chmv::gpu::filtering
