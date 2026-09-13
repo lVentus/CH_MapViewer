@@ -1,7 +1,0 @@
-{
-	"InstallScripts" : 
-	[
-		"/home/ventus/Project/CH_MapViewer/build-linux/_deps/glad-subbuild/cmake_install.cmake"
-	],
-	"Parallel" : false
-}
