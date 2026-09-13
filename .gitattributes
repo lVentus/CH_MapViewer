@@ -1,2 +1,3 @@
-# Auto detect text files and perform LF normalization
-* text=auto
+# Keep Linux scripts usable when the repository is edited/committed from Windows.
+*.sh text eol=lf
+flake.nix text eol=lf
