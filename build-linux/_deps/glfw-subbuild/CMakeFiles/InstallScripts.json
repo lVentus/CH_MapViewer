@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"/home/ventus/Project/CH_MapViewer/build-linux/_deps/glfw-subbuild/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

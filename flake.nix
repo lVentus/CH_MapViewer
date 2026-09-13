@@ -10,6 +10,9 @@
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = import nixpkgs { inherit system; };
+        pythonEnv = pkgs.python3.withPackages (pythonPackages: with pythonPackages; [
+          jinja2
+        ]);
       in {
         devShells.default = pkgs.mkShell {
           nativeBuildInputs = with pkgs; [
@@ -18,13 +21,14 @@
             pkg-config
             gcc
             git
-            python3
+            pythonEnv
             wayland-scanner
           ];
 
           buildInputs = with pkgs; [
             mesa
             libGL
+            libffi
 
             wayland
             wayland-protocols
@@ -38,9 +42,15 @@
             xorgproto
           ];
 
+          # CMake's FindPython resolves the pythonEnv interpreter symlink to the
+          # base Python store path. Keep the environment's site-packages visible
+          # so GLAD's generator can still import Jinja2.
+          PYTHONPATH = "${pythonEnv}/${pkgs.python3.sitePackages}";
+
           LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [
             pkgs.libGL
             pkgs.mesa
+            pkgs.libffi
             pkgs.wayland
             pkgs.libxkbcommon
             pkgs.libx11

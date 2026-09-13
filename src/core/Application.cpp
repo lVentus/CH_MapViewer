@@ -225,7 +225,7 @@ void Application::UpdateCameraInput(float deltaSeconds) {
     double cursorY = 0.0;
     window_.CursorPosition(cursorX, cursorY);
 
-    if (window_.MiddleMouseDown()) {
+    if (window_.LeftMouseDown()) {
         if (wasPanning_) {
             int width = 0;
             int height = 0;

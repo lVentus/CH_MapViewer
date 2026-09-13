@@ -18,7 +18,7 @@ public:
     [[nodiscard]] GLFWwindow* Handle() const { return window_; }
     [[nodiscard]] bool ShouldClose() const;
     [[nodiscard]] float ContentScale() const;
-    [[nodiscard]] bool MiddleMouseDown() const;
+    [[nodiscard]] bool LeftMouseDown() const;
 
     void FramebufferSize(int& width, int& height) const;
     void CursorPosition(double& x, double& y) const;

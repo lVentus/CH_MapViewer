@@ -82,8 +82,8 @@ float Window::ContentScale() const {
     return std::max(xScale, yScale);
 }
 
-bool Window::MiddleMouseDown() const {
-    return glfwGetMouseButton(window_, GLFW_MOUSE_BUTTON_MIDDLE) == GLFW_PRESS;
+bool Window::LeftMouseDown() const {
+    return glfwGetMouseButton(window_, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
 }
 
 void Window::FramebufferSize(int& width, int& height) const {

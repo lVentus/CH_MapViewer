@@ -1,0 +1,61 @@
+#version 430 core
+
+layout(local_size_x = 256) in;
+
+struct Edge {
+    uvec4 topology;
+    ivec4 levels;
+};
+
+layout(std430, binding = 0) readonly buffer Edges {
+    Edge edges[];
+};
+
+layout(std430, binding = 1) writeonly buffer VisibleEdges {
+    uint visibleEdgeIds[];
+};
+
+layout(std430, binding = 2) buffer DrawCommand {
+    uint count;
+    uint instanceCount;
+    uint first;
+    uint baseInstance;
+} command;
+
+uniform uint uEdgeCount;
+uniform int uLevel;
+
+shared uint localCount;
+shared uint globalBase;
+
+void main() {
+    uint localIndex = gl_LocalInvocationID.x;
+    if (localIndex == 0u) {
+        localCount = 0u;
+        globalBase = 0u;
+    }
+    barrier();
+
+    uint edgeId = gl_GlobalInvocationID.x;
+    bool alive = false;
+    if (edgeId < uEdgeCount) {
+        int birthLevel = edges[edgeId].levels.x;
+        int deathLevel = edges[edgeId].levels.y;
+        alive = birthLevel >= 0 && deathLevel >= 0 && uLevel <= birthLevel && uLevel >= deathLevel;
+    }
+
+    uint groupOffset = 0u;
+    if (alive) {
+        groupOffset = atomicAdd(localCount, 1u);
+    }
+    barrier();
+
+    if (localIndex == 0u && localCount != 0u) {
+        globalBase = atomicAdd(command.count, localCount * 2u) >> 1u;
+    }
+    barrier();
+
+    if (alive) {
+        visibleEdgeIds[globalBase + groupOffset] = edgeId;
+    }
+}

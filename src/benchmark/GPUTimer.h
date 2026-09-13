@@ -22,12 +22,19 @@ public:
 
 private:
     void CollectReadyResults();
+    [[nodiscard]] std::uint64_t ElapsedNanoseconds(std::uint64_t start,
+                                                    std::uint64_t end) const;
 
-    static constexpr std::size_t QueryCount = 4;
-    std::array<std::uint32_t, QueryCount> queries_{};
+    static constexpr std::size_t QueryCount = 8;
+    std::array<std::uint32_t, QueryCount> startQueries_{};
+    std::array<std::uint32_t, QueryCount> endQueries_{};
     std::array<bool, QueryCount> pending_{};
+    std::array<std::uint64_t, QueryCount> sequence_{};
     std::size_t nextQuery_ = 0;
     int activeQuery_ = -1;
+    int timestampBits_ = 0;
+    std::uint64_t nextSequence_ = 1;
+    std::uint64_t lastSequence_ = 0;
     std::optional<double> lastMilliseconds_;
 };
 
