@@ -17,9 +17,9 @@ public:
     explicit TextScanner(const std::filesystem::path& path)
         : buffer_(BufferSize) {
 #ifdef _WIN32
-    _wfopen_s(&file_, path.c_str(), L"rb");
+        _wfopen_s(&file_, path.c_str(), L"rb");
 #else
-    file_ = std::fopen(path.c_str(), "rb");
+        file_ = std::fopen(path.c_str(), "rb");
 #endif
         if (!file_) {
             throw std::runtime_error("could not open file: " + path.string());
@@ -125,10 +125,32 @@ std::uint32_t DecodeChild(std::int64_t value) {
     return static_cast<std::uint32_t>(value);
 }
 
+constexpr std::uint64_t kProgressInterval = 1u << 14;
+
+void ReportProgress(const CHLoader::ProgressCallback& callback, CHLoadStage stage,
+                    std::uint64_t current, std::uint64_t total, std::uint64_t completedBefore,
+                    std::uint64_t overallTotal) {
+    if (!callback) {
+        return;
+    }
+
+    const auto overallCurrent = completedBefore + current;
+    callback({
+        stage,
+        current,
+        total,
+        overallTotal == 0
+            ? 1.0f
+            : static_cast<float>(static_cast<double>(overallCurrent) /
+                                 static_cast<double>(overallTotal)),
+    });
+}
+
 } // namespace
 
 CHGraph CHLoader::Load(const std::filesystem::path& graphPath,
-                       const std::filesystem::path& rangesPath) {
+                       const std::filesystem::path& rangesPath,
+                       ProgressCallback progressCallback) {
     TextScanner graphScanner(graphPath);
 
     const auto nodeCount = graphScanner.Read<std::uint64_t>();
@@ -139,10 +161,13 @@ CHGraph CHLoader::Load(const std::filesystem::path& graphPath,
         throw std::runtime_error("graph is too large for the current 32-bit id representation");
     }
 
+    const auto overallTotal = nodeCount + edgeCount + edgeCount;
+
     CHGraph graph;
     graph.Nodes().resize(static_cast<std::size_t>(nodeCount));
     graph.Edges().resize(static_cast<std::size_t>(edgeCount));
 
+    ReportProgress(progressCallback, CHLoadStage::Nodes, 0, nodeCount, 0, overallTotal);
     for (std::uint64_t i = 0; i < nodeCount; ++i) {
         const auto id = graphScanner.Read<std::uint32_t>();
         if (id >= nodeCount) {
@@ -156,8 +181,12 @@ CHGraph CHLoader::Load(const std::filesystem::path& graphPath,
         node.elevation = graphScanner.Read<float>();
         node.level = graphScanner.Read<std::uint32_t>();
         graph.Nodes()[id] = node;
+        if ((i + 1) % kProgressInterval == 0 || i + 1 == nodeCount) {
+            ReportProgress(progressCallback, CHLoadStage::Nodes, i + 1, nodeCount, 0, overallTotal);
+        }
     }
 
+    ReportProgress(progressCallback, CHLoadStage::Edges, 0, edgeCount, nodeCount, overallTotal);
     for (std::uint64_t edgeId = 0; edgeId < edgeCount; ++edgeId) {
         CHEdge edge;
         edge.source = graphScanner.Read<std::uint32_t>();
@@ -172,11 +201,17 @@ CHGraph CHLoader::Load(const std::filesystem::path& graphPath,
             throw std::runtime_error("edge endpoint out of range");
         }
         graph.Edges()[static_cast<std::size_t>(edgeId)] = edge;
+        if ((edgeId + 1) % kProgressInterval == 0 || edgeId + 1 == edgeCount) {
+            ReportProgress(progressCallback, CHLoadStage::Edges, edgeId + 1, edgeCount, nodeCount,
+                           overallTotal);
+        }
     }
 
     TextScanner rangeScanner(rangesPath);
     graph.Ranges().assign(static_cast<std::size_t>(edgeCount), EdgeRange{});
 
+    ReportProgress(progressCallback, CHLoadStage::Ranges, 0, edgeCount, nodeCount + edgeCount,
+                   overallTotal);
     for (std::uint64_t i = 0; i < edgeCount; ++i) {
         const auto edgeId = rangeScanner.Read<std::uint32_t>();
         if (edgeId >= edgeCount) {
@@ -187,6 +222,10 @@ CHGraph CHLoader::Load(const std::filesystem::path& graphPath,
         range.birthLevel = rangeScanner.Read<std::int32_t>();
         range.deathLevel = rangeScanner.Read<std::int32_t>();
         graph.Ranges()[edgeId] = range;
+        if ((i + 1) % kProgressInterval == 0 || i + 1 == edgeCount) {
+            ReportProgress(progressCallback, CHLoadStage::Ranges, i + 1, edgeCount,
+                           nodeCount + edgeCount, overallTotal);
+        }
     }
 
     return graph;

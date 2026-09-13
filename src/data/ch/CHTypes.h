@@ -23,6 +23,7 @@ struct CHEdge {
     std::int32_t maxSpeed = 0;
     std::uint32_t childA = InvalidEdgeId;
     std::uint32_t childB = InvalidEdgeId;
+    float geometryError = 0.0f;
 
     [[nodiscard]] bool IsShortcut() const {
         return childA != InvalidEdgeId && childB != InvalidEdgeId;

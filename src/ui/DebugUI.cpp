@@ -2,8 +2,10 @@
 
 #include "benchmark/CorrectnessValidator.h"
 #include "core/Window.h"
+#include "data/AsyncDatasetLoader.h"
 #include "data/DatasetCatalog.h"
 #include "data/ch/CHGraph.h"
+#include "gpu/filtering/RangeFilterStrategyManager.h"
 #include "gpu/unfolding/UnfoldingStrategyManager.h"
 #include "pipeline/CPUReferencePipeline.h"
 #include "pipeline/GPUDrivenPipeline.h"
@@ -25,11 +27,33 @@ const char* ProcessingModeName(pipeline::ProcessingMode mode) {
     case pipeline::ProcessingMode::GPUDriven:
         return "GPU Driven";
     case pipeline::ProcessingMode::CPUReference:
-        return "CPU Reference (Serial)";
+        return "CPU Paper (Ordered)";
     case pipeline::ProcessingMode::Validation:
         return "Validation";
     }
     return "Unknown";
+}
+
+const char* DatasetLoadPhaseName(data::DatasetLoadPhase phase) {
+    switch (phase) {
+    case data::DatasetLoadPhase::Idle:
+        return "Idle";
+    case data::DatasetLoadPhase::ReadingNodes:
+        return "Reading nodes";
+    case data::DatasetLoadPhase::ReadingEdges:
+        return "Reading edges";
+    case data::DatasetLoadPhase::ReadingRanges:
+        return "Reading ranges";
+    case data::DatasetLoadPhase::PreparingRangeIndex:
+        return "Preparing range index";
+    case data::DatasetLoadPhase::PreparingGeometryErrors:
+        return "Preparing geometry errors";
+    case data::DatasetLoadPhase::Ready:
+        return "Ready";
+    case data::DatasetLoadPhase::Failed:
+        return "Load failed";
+    }
+    return "Loading";
 }
 
 } // namespace
@@ -64,11 +88,15 @@ void DebugUI::BeginFrame() const {
 
 DebugUIActions DebugUI::Draw(
     const data::CHGraph* graph,
+    gpu::filtering::RangeFilterStrategyManager& rangeFilterStrategyManager,
     gpu::unfolding::UnfoldingStrategyManager& strategyManager,
     renderer::MapCamera2D* camera,
     renderer::LODController* lodController,
     data::DatasetCatalog& datasetCatalog,
+    const data::DatasetLoadSnapshot& datasetLoad,
     pipeline::ProcessingMode& processingMode,
+    geometry::RefinementMode& cpuGeometryRefinement,
+    float& maxScreenErrorPixels,
     const pipeline::CPUProcessingStats* cpuStats,
     const pipeline::GPUProcessingStats* gpuStats,
     const benchmark::PipelineValidationResult* validationResult,
@@ -101,14 +129,30 @@ DebugUIActions DebugUI::Draw(
             ImGui::EndCombo();
         }
 
+        if (datasetLoad.Active()) {
+            ImGui::BeginDisabled();
+        }
         if (ImGui::Button("Load dataset")) {
             actions.datasetRequest = selectedDataset_;
+        }
+        if (datasetLoad.Active()) {
+            ImGui::EndDisabled();
         }
         ImGui::SameLine();
     }
 
     if (ImGui::Button("Refresh datasets")) {
         datasetCatalog.Refresh();
+    }
+
+    if (datasetLoad.Active()) {
+        const auto* phaseName = DatasetLoadPhaseName(datasetLoad.phase);
+        ImGui::ProgressBar(datasetLoad.progress, ImVec2(-1.0f, 0.0f), phaseName);
+        ImGui::TextDisabled("%.1f%% | Dataset loading runs on a background thread.",
+                            datasetLoad.progress * 100.0f);
+    } else if (datasetLoad.phase == data::DatasetLoadPhase::Failed) {
+        ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.35f, 1.0f), "Load failed: %s",
+                           datasetLoad.error.c_str());
     }
 
     ImGui::Separator();
@@ -171,7 +215,25 @@ DebugUIActions DebugUI::Draw(
     }
 
     if (processingMode != pipeline::ProcessingMode::CPUReference) {
-        ImGui::TextUnformatted("GPU unfolding strategy");
+        ImGui::TextUnformatted("GPU filtering strategy");
+        const auto rangeFilterStrategies = rangeFilterStrategyManager.Strategies();
+        if (!rangeFilterStrategies.empty()) {
+            const auto currentName = rangeFilterStrategyManager.Current().Name();
+            if (ImGui::BeginCombo("##range-filter-strategy", currentName.data())) {
+                for (std::size_t i = 0; i < rangeFilterStrategies.size(); ++i) {
+                    const bool selected = i == rangeFilterStrategyManager.CurrentIndex();
+                    if (ImGui::Selectable(rangeFilterStrategies[i]->Name().data(), selected)) {
+                        rangeFilterStrategyManager.Select(i);
+                    }
+                    if (selected) {
+                        ImGui::SetItemDefaultFocus();
+                    }
+                }
+                ImGui::EndCombo();
+            }
+        }
+
+        ImGui::TextUnformatted("GPU geometry refinement");
         const auto strategies = strategyManager.Strategies();
         if (!strategies.empty()) {
             const auto currentName = strategyManager.Current().Name();
@@ -189,23 +251,80 @@ DebugUIActions DebugUI::Draw(
             }
         }
     } else {
-        ImGui::TextDisabled("Serial CPU reference uses full unfolding.");
+        ImGui::TextUnformatted("CPU geometry refinement");
+        int refinement = static_cast<int>(cpuGeometryRefinement);
+        constexpr const char* refinementNames[] = {
+            "None (paper ranges only)",
+            "Full unfold",
+            "Adaptive (screen-space)",
+        };
+        if (ImGui::BeginCombo("##cpu-geometry-refinement", refinementNames[refinement])) {
+            for (int i = 0; i < 3; ++i) {
+                const bool selected = refinement == i;
+                if (ImGui::Selectable(refinementNames[i], selected)) {
+                    refinement = i;
+                    cpuGeometryRefinement = static_cast<geometry::RefinementMode>(refinement);
+                }
+                if (selected) {
+                    ImGui::SetItemDefaultFocus();
+                }
+            }
+            ImGui::EndCombo();
+        }
+        if (cpuGeometryRefinement == geometry::RefinementMode::Full) {
+            ImGui::TextDisabled(
+                "Birth-ordered lifetime retrieval first, then full shortcut geometry unfolding.");
+        } else if (cpuGeometryRefinement == geometry::RefinementMode::Adaptive) {
+            ImGui::TextDisabled(
+                "Birth-ordered lifetime retrieval first, then screen-space geometry refinement.");
+        } else {
+            ImGui::TextDisabled(
+                "Paper runtime path: birth-ordered lifetime retrieval, no geometry refinement.");
+        }
+    }
+
+    const bool adaptiveGPU =
+        processingMode != pipeline::ProcessingMode::CPUReference &&
+        strategyManager.Current().Mode() == geometry::RefinementMode::Adaptive;
+    const bool adaptiveCPU =
+        processingMode == pipeline::ProcessingMode::CPUReference &&
+        cpuGeometryRefinement == geometry::RefinementMode::Adaptive;
+    if (adaptiveGPU || adaptiveCPU) {
+        ImGui::SliderFloat("Max screen error", &maxScreenErrorPixels, 1.0f, 512.0f, "%.1f px",
+                           ImGuiSliderFlags_Logarithmic);
+        ImGui::TextDisabled(
+            "1 px is the finest setting; larger values keep coarser shortcut geometry.");
     }
 
     if (gpuStats && processingMode != pipeline::ProcessingMode::CPUReference) {
-        if (gpuStats->rangeFilterMs) {
-            ImGui::Text("GPU range filter: %.3f ms", *gpuStats->rangeFilterMs);
+        if (gpuStats->rangeCandidateEdgeCount.has_value()) {
+            ImGui::Text("GPU range candidates: %zu", *gpuStats->rangeCandidateEdgeCount);
+        } else {
+            ImGui::TextUnformatted("GPU range candidates: GPU-managed");
         }
-        if (gpuStats->unfoldingMs) {
-            ImGui::Text("GPU unfolding: %.3f ms", *gpuStats->unfoldingMs);
+        if (gpuStats->rangeFilterMs) {
+            ImGui::Text("GPU range filter: %.6f ms", *gpuStats->rangeFilterMs);
+        }
+        if (gpuStats->geometryRefinementMs) {
+            ImGui::Text("GPU geometry refinement: %.6f ms", *gpuStats->geometryRefinementMs);
+        } else {
+            ImGui::TextDisabled("GPU geometry refinement: none (ranges only)");
         }
     }
 
     if (cpuStats && processingMode != pipeline::ProcessingMode::GPUDriven) {
+        ImGui::Text("CPU scanned edges: %zu", cpuStats->rangeScannedEdgeCount);
         ImGui::Text("CPU alive edges: %zu", cpuStats->aliveEdgeCount);
         ImGui::Text("CPU output edges: %zu", cpuStats->outputEdgeCount);
-        ImGui::Text("CPU range filter: %.3f ms", cpuStats->rangeFilterMs);
-        ImGui::Text("CPU unfolding: %.3f ms", cpuStats->unfoldingMs);
+        ImGui::Text("CPU range filter: %.6f ms", cpuStats->rangeFilterMs);
+        if (cpuStats->geometryRefinementMs > 0.0) {
+            ImGui::Text("CPU geometry refinement: %.6f ms", cpuStats->geometryRefinementMs);
+        } else {
+            ImGui::TextDisabled("CPU geometry refinement: none (ranges only)");
+        }
+        if (cpuStats->cacheHit) {
+            ImGui::TextDisabled("CPU result reused for unchanged LOD.");
+        }
     }
 
     if (processingMode == pipeline::ProcessingMode::Validation) {
@@ -229,6 +348,17 @@ DebugUIActions DebugUI::Draw(
             ImGui::TextUnformatted("+");
             ImGui::SameLine();
             ImGui::TextColored(ImVec4(0.20f, 0.75f, 1.0f, 1.0f), "GPU overlay");
+        }
+
+        if (strategyManager.Current().Mode() == geometry::RefinementMode::Full) {
+            ImGui::TextDisabled(
+                "CPU full geometry unfolding mirrors the selected GPU refinement for validation.");
+        } else if (strategyManager.Current().Mode() == geometry::RefinementMode::Adaptive) {
+            ImGui::TextDisabled(
+                "CPU adaptive refinement uses the same precomputed error and pixel threshold.");
+        } else {
+            ImGui::TextDisabled(
+                "CPU and GPU both render the topology-safe lifetime edge set directly.");
         }
 
         if (!canValidate) {

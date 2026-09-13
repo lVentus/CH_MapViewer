@@ -6,7 +6,6 @@
 #include <glad/gl.h>
 
 #include <algorithm>
-#include <cmath>
 #include <limits>
 #include <stdexcept>
 #include <vector>
@@ -26,8 +25,8 @@ struct alignas(16) GPUEdge {
     std::uint32_t childB;
     std::int32_t birthLevel;
     std::int32_t deathLevel;
-    std::uint32_t padding0;
-    std::uint32_t padding1;
+    float geometryError;
+    std::uint32_t padding;
 };
 
 struct DrawArraysIndirectCommand {
@@ -41,7 +40,6 @@ static_assert(sizeof(GPUNode) == 8);
 static_assert(sizeof(GPUEdge) == 32);
 static_assert(sizeof(DrawArraysIndirectCommand) == 16);
 
-constexpr double kPi = 3.14159265358979323846;
 
 void CheckBufferSize(std::size_t sizeBytes) {
     GLint64 maxBlockSize = 0;
@@ -74,31 +72,15 @@ void RoadRenderer::SetGraph(const data::CHGraph& graph) {
         return;
     }
 
-    double minLatitude = std::numeric_limits<double>::max();
-    double maxLatitude = std::numeric_limits<double>::lowest();
-    double minLongitude = std::numeric_limits<double>::max();
-    double maxLongitude = std::numeric_limits<double>::lowest();
-
-    for (const auto& node : graph.Nodes()) {
-        minLatitude = std::min(minLatitude, node.latitude);
-        maxLatitude = std::max(maxLatitude, node.latitude);
-        minLongitude = std::min(minLongitude, node.longitude);
-        maxLongitude = std::max(maxLongitude, node.longitude);
-    }
-
-    const auto centerLatitude = (minLatitude + maxLatitude) * 0.5;
-    const auto centerLongitude = (minLongitude + maxLongitude) * 0.5;
-    const auto longitudeScale = std::cos(centerLatitude * kPi / 180.0);
-    const auto halfWidth = std::max((maxLongitude - minLongitude) * 0.5 * longitudeScale, 1e-12);
-    const auto halfHeight = std::max((maxLatitude - minLatitude) * 0.5, 1e-12);
-    const auto normalization = 0.95 / std::max(halfWidth, halfHeight);
+    const auto& projection = graph.Projection();
 
     std::vector<GPUNode> nodes;
     nodes.reserve(graph.NodeCount());
     for (const auto& node : graph.Nodes()) {
+        const auto position = projection.Project(node.latitude, node.longitude);
         nodes.push_back({
-            static_cast<float>((node.longitude - centerLongitude) * longitudeScale * normalization),
-            static_cast<float>((node.latitude - centerLatitude) * normalization),
+            static_cast<float>(position.x),
+            static_cast<float>(position.y),
         });
     }
 
@@ -117,7 +99,7 @@ void RoadRenderer::SetGraph(const data::CHGraph& graph) {
             edge.childB,
             range.birthLevel,
             range.deathLevel,
-            0,
+            edge.geometryError,
             0,
         });
 

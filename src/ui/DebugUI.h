@@ -1,5 +1,7 @@
 #pragma once
 
+#include "geometry/GeometryRefinement.h"
+
 #include <cstddef>
 #include <optional>
 
@@ -14,6 +16,11 @@ class Window;
 namespace chmv::data {
 class CHGraph;
 class DatasetCatalog;
+struct DatasetLoadSnapshot;
+}
+
+namespace chmv::gpu::filtering {
+class RangeFilterStrategyManager;
 }
 
 namespace chmv::gpu::unfolding {
@@ -49,11 +56,15 @@ public:
     void BeginFrame() const;
     [[nodiscard]] DebugUIActions Draw(
         const data::CHGraph* graph,
+        gpu::filtering::RangeFilterStrategyManager& rangeFilterStrategyManager,
         gpu::unfolding::UnfoldingStrategyManager& strategyManager,
         renderer::MapCamera2D* camera,
         renderer::LODController* lodController,
         data::DatasetCatalog& datasetCatalog,
+        const data::DatasetLoadSnapshot& datasetLoad,
         pipeline::ProcessingMode& processingMode,
+        geometry::RefinementMode& cpuGeometryRefinement,
+        float& maxScreenErrorPixels,
         const pipeline::CPUProcessingStats* cpuStats,
         const pipeline::GPUProcessingStats* gpuStats,
         const benchmark::PipelineValidationResult* validationResult,

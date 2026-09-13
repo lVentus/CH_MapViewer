@@ -4,18 +4,40 @@
 
 namespace chmv::reference {
 
-void CPURangeFilter::Filter(const data::CHGraph& graph, std::int32_t level,
-                            std::vector<std::uint32_t>& output) const {
-    output.clear();
-    if (output.capacity() < graph.DrawableEdgeCount()) {
-        output.reserve(graph.DrawableEdgeCount());
+void CPURangeFilter::SetGraph(const data::CHGraph& graph) {
+    graph_ = &graph;
+}
+
+CPURangeFilterStats CPURangeFilter::Filter(const data::CHGraph& graph, std::int32_t level,
+                                           std::vector<std::uint32_t>& output) {
+    if (graph_ != &graph) {
+        SetGraph(graph);
     }
 
-    for (std::uint32_t edgeId = 0; edgeId < graph.EdgeCount(); ++edgeId) {
-        if (graph.Range(edgeId).IsAlive(level)) {
-            output.push_back(edgeId);
+    output.clear();
+    const auto& index = graph.OrderedRanges();
+    if (level < 0 || static_cast<std::size_t>(level) >= index.scanEndByLevel.size()) {
+        return {};
+    }
+
+    const auto levelIndex = static_cast<std::size_t>(level);
+    const auto scanEnd = index.scanEndByLevel[levelIndex];
+    const auto expectedOutput = index.aliveCountByLevel[levelIndex];
+    if (output.capacity() < expectedOutput) {
+        output.reserve(expectedOutput);
+    }
+
+    for (std::size_t i = 0; i < scanEnd; ++i) {
+        const auto& entry = index.entries[i];
+        if (entry.deathLevel <= level) {
+            output.push_back(entry.edgeId);
         }
     }
+
+    return {
+        scanEnd,
+        output.size(),
+    };
 }
 
 } // namespace chmv::reference

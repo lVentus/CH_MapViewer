@@ -1,20 +1,22 @@
 #pragma once
 
 #include "benchmark/GPUTimer.h"
-#include "gpu/ComputeProgram.h"
 #include "gpu/GPUBuffer.h"
+#include "gpu/filtering/IRangeFilterStrategy.h"
 #include "gpu/unfolding/IUnfoldingStrategy.h"
+#include "geometry/GeometryRefinement.h"
 
+#include <cstddef>
 #include <cstdint>
-#include <filesystem>
 #include <optional>
 #include <vector>
 
 namespace chmv::pipeline {
 
 struct GPUProcessingStats {
+    std::optional<std::size_t> rangeCandidateEdgeCount;
     std::optional<double> rangeFilterMs;
-    std::optional<double> unfoldingMs;
+    std::optional<double> geometryRefinementMs;
 };
 
 struct GPUProcessingResult {
@@ -26,24 +28,26 @@ struct GPUProcessingResult {
 
 class GPUDrivenPipeline {
 public:
-    explicit GPUDrivenPipeline(const std::filesystem::path& shaderDirectory);
-
-    void SetGraph(std::uint32_t edgeCount);
+    void SetGraph(std::uint32_t edgeCount, std::uint32_t drawableEdgeCount);
     [[nodiscard]] GPUProcessingResult Process(
         std::uint32_t graphEdgeBuffer, std::uint32_t edgeCount, std::int32_t lodLevel,
-        gpu::unfolding::IUnfoldingStrategy& unfoldingStrategy);
+        gpu::filtering::IRangeFilterStrategy& rangeFilterStrategy,
+        gpu::unfolding::IUnfoldingStrategy& unfoldingStrategy,
+        const geometry::RefinementParameters& refinementParameters);
     void ReadBackEdgeIds(std::uint32_t edgeIdBuffer, std::uint32_t drawCommandBuffer,
                          std::vector<std::uint32_t>& output) const;
 
     [[nodiscard]] GPUProcessingStats Stats() const;
 
 private:
-    gpu::ComputeProgram filterProgram_;
     gpu::GPUBuffer visibleEdgeBuffer_;
     gpu::GPUBuffer indirectBuffer_;
     benchmark::GPUTimer filterTimer_;
-    benchmark::GPUTimer unfoldingTimer_;
-    std::uint32_t capacity_ = 0;
+    benchmark::GPUTimer geometryRefinementTimer_;
+    std::uint32_t edgeCount_ = 0;
+    std::uint32_t visibleCapacity_ = 0;
+    std::optional<std::size_t> rangeCandidateEdgeCount_;
+    bool geometryRefinementActive_ = false;
 };
 
 } // namespace chmv::pipeline

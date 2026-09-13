@@ -1,11 +1,14 @@
 #include "core/Application.h"
 
 #include "benchmark/CorrectnessValidator.h"
-#include "data/ch/CHLoader.h"
+#include "gpu/filtering/BirthOrderedRangeFilterStrategy.h"
+#include "gpu/filtering/FullScanRangeFilterStrategy.h"
+#include "gpu/unfolding/AdaptiveDFSUnfoldingStrategy.h"
 #include "gpu/unfolding/IterativeDFSUnfoldingStrategy.h"
 #include "gpu/unfolding/NoUnfoldingStrategy.h"
 
 #include <array>
+#include <chrono>
 #include <iostream>
 #include <utility>
 
@@ -31,25 +34,38 @@ Application::Application(const std::filesystem::path& assetDirectory)
     : window_("CH_MapViewer"),
       context_(window_),
       roadRenderer_(assetDirectory / "shaders"),
-      gpuPipeline_(assetDirectory / "shaders"),
       debugUI_(window_),
       datasetCatalog_(assetDirectory / "data") {
+    rangeFilterStrategyManager_.Register(
+        std::make_unique<gpu::filtering::BirthOrderedRangeFilterStrategy>(
+            assetDirectory / "shaders"));
+    rangeFilterStrategyManager_.Register(
+        std::make_unique<gpu::filtering::FullScanRangeFilterStrategy>(assetDirectory / "shaders"));
+
     strategyManager_.Register(std::make_unique<gpu::unfolding::NoUnfoldingStrategy>());
     strategyManager_.Register(
         std::make_unique<gpu::unfolding::IterativeDFSUnfoldingStrategy>(assetDirectory / "shaders"));
+    strategyManager_.Register(
+        std::make_unique<gpu::unfolding::AdaptiveDFSUnfoldingStrategy>(assetDirectory / "shaders"));
 }
 
 void Application::LoadDataset(const std::filesystem::path& graphPath,
                               const std::filesystem::path& rangesPath) {
-    std::cout << "Loading " << graphPath << '\n';
-    auto graph = data::CHLoader::Load(graphPath, rangesPath);
+    if (datasetLoader_.Start(graphPath, rangesPath)) {
+        std::cout << "Loading " << graphPath << " in background\n";
+    }
+}
+
+void Application::InstallDataset(data::CHGraph graph) {
     std::cout << "Loaded " << graph.NodeCount() << " nodes and " << graph.EdgeCount()
               << " edges\n";
     graph_ = std::make_unique<data::CHGraph>(std::move(graph));
-    (void)graph_->ShortcutCount();
-    (void)graph_->DrawableEdgeCount();
     roadRenderer_.SetGraph(*graph_);
-    gpuPipeline_.SetGraph(roadRenderer_.EdgeCount());
+    gpuPipeline_.SetGraph(roadRenderer_.EdgeCount(),
+                          static_cast<std::uint32_t>(graph_->DrawableEdgeCount()));
+    rangeFilterStrategyManager_.SetGraph(*graph_);
+    cpuPipeline_.SetGraph(*graph_);
+    cpuDrawData_ = {};
     lodController_.SetLevelRange(roadRenderer_.MinLevel(), roadRenderer_.MaxLevel());
     lodController_.SetManualLevel(roadRenderer_.MaxLevel());
     camera_.Reset();
@@ -57,10 +73,16 @@ void Application::LoadDataset(const std::filesystem::path& graphPath,
 }
 
 int Application::Run() {
+    auto previousFrameTime = std::chrono::steady_clock::now();
+
     while (!window_.ShouldClose()) {
+        const auto currentFrameTime = std::chrono::steady_clock::now();
+        const auto deltaSeconds =
+            std::chrono::duration<float>(currentFrameTime - previousFrameTime).count();
+        previousFrameTime = currentFrameTime;
         window_.PollEvents();
         debugUI_.BeginFrame();
-        UpdateCameraInput();
+        UpdateCameraInput(deltaSeconds);
 
         int width = 0;
         int height = 0;
@@ -70,14 +92,29 @@ int Application::Run() {
 
         std::optional<pipeline::GPUProcessingResult> gpuResult;
         std::optional<pipeline::CPUProcessingResult> cpuResult;
-        renderer::RoadDrawData cpuDrawData;
         std::int32_t lodLevel = 0;
+        geometry::RefinementParameters gpuRefinement;
 
         if (graph_) {
             lodLevel = lodController_.Level(camera_.ZoomFactor());
+            const auto screenPixelScale =
+                camera_.ViewScale() * static_cast<float>(height) * 0.5f;
+            gpuRefinement = {
+                strategyManager_.Current().Mode(),
+                screenPixelScale,
+                maxScreenErrorPixels_,
+            };
+            const geometry::RefinementParameters cpuRefinement{
+                cpuGeometryRefinement_,
+                screenPixelScale,
+                maxScreenErrorPixels_,
+            };
             const auto strategyIndex = strategyManager_.CurrentIndex();
+            const auto rangeFilterStrategyIndex = rangeFilterStrategyManager_.CurrentIndex();
             if (validationResult_ &&
-                (validationLod_ != lodLevel || validationStrategy_ != strategyIndex)) {
+                (validationLod_ != lodLevel || validationStrategy_ != strategyIndex ||
+                 validationRangeFilterStrategy_ != rangeFilterStrategyIndex ||
+                 validationRefinement_ != gpuRefinement)) {
                 ClearValidation();
             }
 
@@ -85,35 +122,40 @@ int Application::Run() {
             case pipeline::ProcessingMode::GPUDriven:
                 gpuResult = gpuPipeline_.Process(roadRenderer_.EdgeBufferId(),
                                                  roadRenderer_.EdgeCount(), lodLevel,
-                                                 strategyManager_.Current());
+                                                 rangeFilterStrategyManager_.Current(),
+                                                 strategyManager_.Current(), gpuRefinement);
                 roadRenderer_.Draw(camera_, width, height, ToRoadDrawData(*gpuResult), 1.0f, 0.0f,
                                    kDefaultRoadColor);
                 break;
 
             case pipeline::ProcessingMode::CPUReference:
-                cpuResult = cpuPipeline_.Process(*graph_, lodLevel, true);
-                cpuDrawData = roadRenderer_.UploadEdgeIds(cpuResult->edgeIds);
-                roadRenderer_.Draw(camera_, width, height, cpuDrawData, 1.0f, 0.0f,
+                cpuResult = cpuPipeline_.Process(*graph_, lodLevel, cpuRefinement);
+                if (!cpuResult->stats.cacheHit || cpuDrawData_.edgeIdBuffer == 0) {
+                    cpuDrawData_ = roadRenderer_.UploadEdgeIds(cpuResult->edgeIds);
+                }
+                roadRenderer_.Draw(camera_, width, height, cpuDrawData_, 1.0f, 0.0f,
                                    kDefaultRoadColor);
                 break;
 
             case pipeline::ProcessingMode::Validation:
-                cpuResult = cpuPipeline_.Process(*graph_, lodLevel,
-                                                 strategyManager_.Current().FullyUnfolds());
+                cpuResult = cpuPipeline_.Process(*graph_, lodLevel, gpuRefinement);
                 gpuResult = gpuPipeline_.Process(roadRenderer_.EdgeBufferId(),
                                                  roadRenderer_.EdgeCount(), lodLevel,
-                                                 strategyManager_.Current());
-                cpuDrawData = roadRenderer_.UploadEdgeIds(cpuResult->edgeIds);
+                                                 rangeFilterStrategyManager_.Current(),
+                                                 strategyManager_.Current(), gpuRefinement);
+                if (!cpuResult->stats.cacheHit || cpuDrawData_.edgeIdBuffer == 0) {
+                    cpuDrawData_ = roadRenderer_.UploadEdgeIds(cpuResult->edgeIds);
+                }
 
                 if (debugUI_.SplitScreenValidation()) {
                     const int leftWidth = width / 2;
                     const int rightWidth = width - leftWidth;
-                    roadRenderer_.DrawViewport(camera_, 0, 0, leftWidth, height, cpuDrawData,
+                    roadRenderer_.DrawViewport(camera_, 0, 0, leftWidth, height, cpuDrawData_,
                                                kCPURoadColor);
                     roadRenderer_.DrawViewport(camera_, leftWidth, 0, rightWidth, height,
                                                ToRoadDrawData(*gpuResult), kGPURoadColor);
                 } else {
-                    roadRenderer_.Draw(camera_, width, height, cpuDrawData, 1.0f, 0.0f,
+                    roadRenderer_.Draw(camera_, width, height, cpuDrawData_, 1.0f, 0.0f,
                                        kCPUOverlayColor);
                     roadRenderer_.Draw(camera_, width, height, ToRoadDrawData(*gpuResult), 1.0f,
                                        0.0f, kGPUOverlayColor);
@@ -123,9 +165,12 @@ int Application::Run() {
         }
 
         const auto gpuStats = gpuPipeline_.Stats();
+        const auto datasetLoad = datasetLoader_.Snapshot();
         const auto actions = debugUI_.Draw(
-            graph_.get(), strategyManager_, graph_ ? &camera_ : nullptr,
-            graph_ ? &lodController_ : nullptr, datasetCatalog_, processingMode_,
+            graph_.get(), rangeFilterStrategyManager_, strategyManager_,
+            graph_ ? &camera_ : nullptr,
+            graph_ ? &lodController_ : nullptr, datasetCatalog_, datasetLoad, processingMode_,
+            cpuGeometryRefinement_, maxScreenErrorPixels_,
             cpuResult ? &cpuResult->stats : nullptr, graph_ ? &gpuStats : nullptr,
             validationResult_ ? &*validationResult_ : nullptr,
             processingMode_ == pipeline::ProcessingMode::Validation && cpuResult && gpuResult);
@@ -145,6 +190,8 @@ int Application::Run() {
             validationResult_ = result;
             validationLod_ = lodLevel;
             validationStrategy_ = strategyManager_.CurrentIndex();
+            validationRangeFilterStrategy_ = rangeFilterStrategyManager_.CurrentIndex();
+            validationRefinement_ = gpuRefinement;
         }
 
         if (actions.datasetRequest) {
@@ -153,15 +200,20 @@ int Application::Run() {
         }
 
         window_.SwapBuffers();
+
+        if (auto loadedGraph = datasetLoader_.TakeCompleted()) {
+            InstallDataset(std::move(*loadedGraph));
+        }
     }
 
     return 0;
 }
 
-void Application::UpdateCameraInput() {
+void Application::UpdateCameraInput(float deltaSeconds) {
     const auto scroll = window_.ConsumeScrollY();
     if (debugUI_.WantsMouse()) {
         wasPanning_ = false;
+        camera_.Update(deltaSeconds);
         return;
     }
 
@@ -187,12 +239,14 @@ void Application::UpdateCameraInput() {
 
     lastCursorX_ = cursorX;
     lastCursorY_ = cursorY;
+    camera_.Update(deltaSeconds);
 }
 
 void Application::ClearValidation() {
     validationResult_.reset();
     gpuAliveReadback_.clear();
     gpuOutputReadback_.clear();
+    validationRefinement_ = {};
 }
 
 } // namespace chmv::core

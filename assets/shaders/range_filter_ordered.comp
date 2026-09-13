@@ -2,28 +2,27 @@
 
 layout(local_size_x = 256) in;
 
-struct Edge {
-    uvec4 topology;
-    ivec4 levels;
+layout(std430, binding = 0) readonly buffer OrderedRanges {
+    uvec2 ranges[];
 };
 
-layout(std430, binding = 0) readonly buffer Edges {
-    Edge edges[];
+layout(std430, binding = 1) readonly buffer ScanEnds {
+    uint scanEndByLevel[];
 };
 
-layout(std430, binding = 1) writeonly buffer VisibleEdges {
+layout(std430, binding = 2) writeonly buffer VisibleEdges {
     uint visibleEdgeIds[];
 };
 
-layout(std430, binding = 2) buffer DrawCommand {
+layout(std430, binding = 3) buffer DrawCommand {
     uint count;
     uint instanceCount;
     uint first;
     uint baseInstance;
 } command;
 
-uniform uint uEdgeCount;
 uniform int uLevel;
+uniform uint uLevelCount;
 
 shared uint localCount;
 shared uint globalBase;
@@ -36,16 +35,18 @@ void main() {
     }
     barrier();
 
-    uint edgeId = gl_GlobalInvocationID.x;
-    bool alive = false;
-    if (edgeId < uEdgeCount) {
-        int birthLevel = edges[edgeId].levels.x;
-        int deathLevel = edges[edgeId].levels.y;
-        alive = birthLevel >= 0 && deathLevel >= 0 && uLevel <= birthLevel && uLevel >= deathLevel;
+    if (uLevel < 0 || uint(uLevel) >= uLevelCount) {
+        return;
     }
 
+    uint candidateCount = scanEndByLevel[uint(uLevel)];
+    uint rangeIndex = gl_GlobalInvocationID.x;
+    bool alive = rangeIndex < candidateCount && ranges[rangeIndex].y <= uint(uLevel);
+
     uint groupOffset = 0u;
+    uint edgeId = 0u;
     if (alive) {
+        edgeId = ranges[rangeIndex].x;
         groupOffset = atomicAdd(localCount, 1u);
     }
     barrier();

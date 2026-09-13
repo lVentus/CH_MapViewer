@@ -15,6 +15,11 @@ public:
     [[nodiscard]] std::vector<std::uint32_t> UnfoldFully(std::span<const std::uint32_t> roots) const;
     void UnfoldFully(std::span<const std::uint32_t> roots,
                      std::vector<std::uint32_t>& output) const;
+    void UnfoldFully(std::span<const std::uint32_t> roots, std::vector<std::uint32_t>& output,
+                     std::vector<std::uint32_t>& stack) const;
+    void UnfoldAdaptive(std::span<const std::uint32_t> roots, std::vector<std::uint32_t>& output,
+                        std::vector<std::uint32_t>& stack, float screenPixelScale,
+                        float maxScreenErrorPixels) const;
 
 private:
     const data::CHGraph& graph_;

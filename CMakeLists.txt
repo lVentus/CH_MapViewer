@@ -8,6 +8,8 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
 
 project(CH_MapViewer VERSION 0.1.0 LANGUAGES C CXX)
 
+find_package(Threads REQUIRED)
+
 if(MSVC OR CMAKE_CXX_SIMULATE_ID STREQUAL "MSVC")
     set(CHMV_MSVC_RUNTIME_LIBRARY "${CMAKE_MSVC_RUNTIME_LIBRARY}")
 endif()
@@ -27,9 +29,12 @@ endif()
 
 add_library(chmv_data
     src/benchmark/CorrectnessValidator.cpp
+    src/data/AsyncDatasetLoader.cpp
     src/data/DatasetCatalog.cpp
     src/data/ch/CHGraph.cpp
+    src/data/ch/CHProjection.cpp
     src/data/ch/CHLoader.cpp
+    src/data/preprocessing/GeometryErrorPreprocessor.cpp
     src/pipeline/CPUReferencePipeline.cpp
     src/reference/CPURangeFilter.cpp
     src/reference/CPUReferenceUnfolder.cpp
@@ -38,6 +43,7 @@ add_library(chmv_data
 target_include_directories(chmv_data PUBLIC src)
 
 target_compile_features(chmv_data PUBLIC cxx_std_20)
+target_link_libraries(chmv_data PUBLIC Threads::Threads)
 
 if(DEFINED CHMV_MSVC_RUNTIME_LIBRARY)
     set_property(TARGET chmv_data PROPERTY MSVC_RUNTIME_LIBRARY "${CHMV_MSVC_RUNTIME_LIBRARY}")
@@ -61,10 +67,14 @@ if(CHMV_BUILD_APP)
         src/gpu/GPUBuffer.cpp
         src/gpu/ComputeProgram.cpp
         src/gpu/GraphicsProgram.cpp
+        src/gpu/filtering/RangeFilterStrategyManager.cpp
+        src/gpu/filtering/FullScanRangeFilterStrategy.cpp
+        src/gpu/filtering/BirthOrderedRangeFilterStrategy.cpp
         src/benchmark/GPUTimer.cpp
         src/gpu/unfolding/UnfoldingStrategyManager.cpp
         src/gpu/unfolding/NoUnfoldingStrategy.cpp
         src/gpu/unfolding/IterativeDFSUnfoldingStrategy.cpp
+        src/gpu/unfolding/AdaptiveDFSUnfoldingStrategy.cpp
         src/pipeline/GPUDrivenPipeline.cpp
         src/renderer/LODController.cpp
         src/renderer/MapCamera2D.cpp
@@ -93,9 +103,11 @@ if(CHMV_BUILD_APP)
     endif()
 
     add_custom_command(TARGET CH_MapViewer POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory
+            $<TARGET_FILE_DIR:CH_MapViewer>/assets/shaders
         COMMAND ${CMAKE_COMMAND} -E copy_directory
-            ${CMAKE_CURRENT_SOURCE_DIR}/assets
-            $<TARGET_FILE_DIR:CH_MapViewer>/assets
+            ${CMAKE_CURRENT_SOURCE_DIR}/assets/shaders
+            $<TARGET_FILE_DIR:CH_MapViewer>/assets/shaders
     )
 endif()
 

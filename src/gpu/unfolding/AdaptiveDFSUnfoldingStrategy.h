@@ -9,13 +9,13 @@
 
 namespace chmv::gpu::unfolding {
 
-class IterativeDFSUnfoldingStrategy final : public IUnfoldingStrategy {
+class AdaptiveDFSUnfoldingStrategy final : public IUnfoldingStrategy {
 public:
-    explicit IterativeDFSUnfoldingStrategy(const std::filesystem::path& shaderDirectory);
+    explicit AdaptiveDFSUnfoldingStrategy(const std::filesystem::path& shaderDirectory);
 
-    [[nodiscard]] std::string_view Name() const override { return "Full DFS (geometry)"; }
+    [[nodiscard]] std::string_view Name() const override { return "Adaptive DFS (screen-space)"; }
     [[nodiscard]] geometry::RefinementMode Mode() const override {
-        return geometry::RefinementMode::Full;
+        return geometry::RefinementMode::Adaptive;
     }
     [[nodiscard]] UnfoldingOutput Execute(const UnfoldingInput& input) override;
 

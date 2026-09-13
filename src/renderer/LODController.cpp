@@ -6,8 +6,8 @@
 namespace chmv::renderer {
 namespace {
 
-constexpr float kOverviewZoom = 10.0f;
-constexpr float kFullDetailZoom = 320.0f;
+constexpr float kOverviewZoom = 10.0f / 3.0f;
+constexpr float kFullDetailZoom = 320.0f / 3.0f;
 
 } // namespace
 
