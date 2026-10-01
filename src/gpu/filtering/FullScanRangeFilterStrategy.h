@@ -14,7 +14,12 @@ public:
     explicit FullScanRangeFilterStrategy(const std::filesystem::path& shaderDirectory);
 
     [[nodiscard]] std::string_view Name() const override { return "Full Scan"; }
+    [[nodiscard]] bool SupportsStreamingWorkingSet() const override { return true; }
+    [[nodiscard]] PersistentStreamingRangeFilterKind PersistentStreamingKind() const override {
+        return PersistentStreamingRangeFilterKind::FullScan;
+    }
     void SetGraph(const data::CHGraph& graph) override;
+    void SetStreamingRanges(std::span<const data::EdgeRange> ranges) override;
     [[nodiscard]] RangeFilterExecutionStats Execute(const RangeFilterInput& input) override;
     [[nodiscard]] RangeFilterDiagnostics ReadBackDiagnostics(std::int32_t lodLevel) const override;
 

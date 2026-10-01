@@ -21,6 +21,16 @@ void RangeFilterStrategyManager::SetGraph(const data::CHGraph& graph) {
     }
 }
 
+void RangeFilterStrategyManager::SetStreamingRanges(
+    std::span<const data::EdgeRange> ranges) {
+    for (auto& strategy : strategies_) {
+        if (strategy->SupportsStreamingWorkingSet()) {
+            strategy->SetStreamingRanges(ranges);
+            strategy->Reset();
+        }
+    }
+}
+
 void RangeFilterStrategyManager::Select(std::size_t index) {
     if (index >= strategies_.size()) {
         throw std::out_of_range("range filter strategy index out of range");

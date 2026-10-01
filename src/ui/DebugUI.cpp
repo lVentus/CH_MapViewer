@@ -12,12 +12,23 @@
 #include "pipeline/ProcessingMode.h"
 #include "renderer/LODController.h"
 #include "renderer/MapCamera2D.h"
+#include "streaming/index/CHIndex.h"
+#include "streaming/runtime/GraphPageStreamer.h"
+#include "streaming/analysis/TextSourceScanner.h"
 
 #include <imgui.h>
 #include <backends/imgui_impl_glfw.h>
 #include <backends/imgui_impl_opengl3.h>
 
 #include <GLFW/glfw3.h>
+
+#include <algorithm>
+#include <array>
+#include <cstdio>
+#include <fstream>
+#include <limits>
+#include <stdexcept>
+#include <vector>
 
 namespace chmv::ui {
 namespace {
@@ -38,16 +49,40 @@ const char* DatasetLoadPhaseName(data::DatasetLoadPhase phase) {
     switch (phase) {
     case data::DatasetLoadPhase::Idle:
         return "Idle";
+    case data::DatasetLoadPhase::CheckingPreprocess:
+        return "Checking preprocess cache";
+    case data::DatasetLoadPhase::AnalyzingSourceLayout:
+        return "Preprocess: scanning source layout";
+    case data::DatasetLoadPhase::LoadingSourceForPreprocess:
+        return "Preprocess: reading source / building compact tables";
+    case data::DatasetLoadPhase::ReorderingNodes:
+        return "Preprocess: reordering nodes";
+    case data::DatasetLoadPhase::ResolvingGeometryBounds:
+        return "Preprocess: resolving shortcut geometry bounds";
+    case data::DatasetLoadPhase::ReorderingEdges:
+        return "Preprocess: direct fixed-grid edge layout";
+    case data::DatasetLoadPhase::WritingPreprocessedGraph:
+        return "Preprocess: writing reordered graph";
+    case data::DatasetLoadPhase::WritingPreprocessedRanges:
+        return "Preprocess: writing reordered ranges";
+    case data::DatasetLoadPhase::ValidatingPreprocessedLayout:
+        return "Preprocess: validating output";
+    case data::DatasetLoadPhase::WritingPreprocessedIndex:
+        return "Preprocess: writing streaming index";
     case data::DatasetLoadPhase::ReadingNodes:
-        return "Reading nodes";
+        return "Loading preprocessed nodes";
     case data::DatasetLoadPhase::ReadingEdges:
-        return "Reading edges";
+        return "Loading preprocessed edges";
     case data::DatasetLoadPhase::ReadingRanges:
-        return "Reading ranges";
+        return "Loading preprocessed ranges";
     case data::DatasetLoadPhase::PreparingRangeIndex:
         return "Preparing range index";
     case data::DatasetLoadPhase::PreparingGeometryErrors:
         return "Preparing geometry errors";
+    case data::DatasetLoadPhase::PreparingRoadStyleMetadata:
+        return "Preparing road-type style metadata";
+    case data::DatasetLoadPhase::PreprocessedForStreaming:
+        return "Preprocess ready for out-of-core runtime";
     case data::DatasetLoadPhase::Ready:
         return "Ready";
     case data::DatasetLoadPhase::Failed:
@@ -75,9 +110,179 @@ DebugUI::DebugUI(const core::Window& window) {
 }
 
 DebugUI::~DebugUI() {
+    if (roadTypeDiagnosticWorker_.joinable()) {
+        roadTypeDiagnosticWorker_.request_stop();
+        roadTypeDiagnosticWorker_.join();
+    }
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();
     ImGui::DestroyContext();
+}
+
+void DebugUI::StartRoadTypeDiagnostic(std::filesystem::path graphPath,
+                                      std::filesystem::path rangesPath) {
+    if (roadTypeDiagnosticRunning_.exchange(true)) {
+        return;
+    }
+    if (roadTypeDiagnosticWorker_.joinable()) {
+        roadTypeDiagnosticWorker_.join();
+    }
+
+    roadTypeDiagnosticProcessed_.store(0u);
+    roadTypeDiagnosticTotal_.store(0u);
+    {
+        std::lock_guard lock(roadTypeDiagnosticMutex_);
+        roadTypeDiagnosticResult_.reset();
+    }
+
+    roadTypeDiagnosticWorker_ = std::jthread(
+        [this, graphPath = std::move(graphPath), rangesPath = std::move(rangesPath)](
+            std::stop_token stopToken) {
+            RoadTypeDiagnosticResult result;
+            result.graphPath = graphPath;
+            try {
+                using streaming::analysis::detail::TextSourceScanner;
+
+                TextSourceScanner graphScanner(graphPath);
+                const auto nodeCount = graphScanner.Read<std::uint64_t>();
+                const auto edgeCount = graphScanner.Read<std::uint64_t>();
+
+                const auto indexPath = streaming::index::CHIndex::DefaultPath(graphPath);
+                const bool validIndex = streaming::index::CHIndex::IsValid(
+                    indexPath, graphPath, rangesPath, {});
+
+                std::optional<streaming::index::CHIndexData> index;
+                if (validIndex) {
+                    index = streaming::index::CHIndex::Load(indexPath);
+                    if (index->nodeCount != nodeCount || index->edgeCount != edgeCount) {
+                        throw std::runtime_error(
+                            "CHIDX counts do not match the selected .sch file");
+                    }
+                    if (index->graphEdgeBlocks.empty()) {
+                        throw std::runtime_error(
+                            "CHIDX has no graph edge-block offsets for the selected .sch file");
+                    }
+                    graphScanner.Seek(index->graphEdgeBlocks.front().byteOffset);
+                } else {
+                    const auto totalWork = nodeCount + edgeCount;
+                    roadTypeDiagnosticTotal_.store(totalWork);
+                    constexpr std::uint64_t kProgressInterval = 1u << 16u;
+                    for (std::uint64_t node = 0; node < nodeCount; ++node) {
+                        if ((node & (kProgressInterval - 1u)) == 0u &&
+                            stopToken.stop_requested()) {
+                            roadTypeDiagnosticRunning_.store(false);
+                            return;
+                        }
+                        graphScanner.Read<std::uint32_t>();
+                        graphScanner.Read<std::uint64_t>();
+                        graphScanner.Read<double>();
+                        graphScanner.Read<double>();
+                        graphScanner.Read<float>();
+                        graphScanner.Read<std::uint32_t>();
+                        if ((node + 1u) % kProgressInterval == 0u || node + 1u == nodeCount) {
+                            roadTypeDiagnosticProcessed_.store(node + 1u);
+                        }
+                    }
+                }
+
+                std::uint64_t scanCount = edgeCount;
+                if (index && index->HasRootPayload()) {
+                    scanCount = std::min<std::uint64_t>(index->rootPayloadRecordCount, edgeCount);
+                    result.rootSubset = true;
+                    result.comparedIndex = true;
+                }
+
+                const auto progressBase = index ? 0u : nodeCount;
+                roadTypeDiagnosticTotal_.store(progressBase + scanCount);
+
+                std::ifstream indexStream;
+                std::vector<streaming::index::CHIndexRootRecord> indexRecords;
+                if (result.comparedIndex) {
+                    indexStream.open(index->indexPath, std::ios::binary);
+                    if (!indexStream) {
+                        throw std::runtime_error("could not open CHIDX root payload for Type diagnostic");
+                    }
+                    if (index->rootPayloadSectionOffset >
+                        static_cast<std::uint64_t>(std::numeric_limits<std::streamoff>::max())) {
+                        throw std::runtime_error("CHIDX root payload offset exceeds stream range");
+                    }
+                    indexStream.seekg(
+                        static_cast<std::streamoff>(index->rootPayloadSectionOffset), std::ios::beg);
+                    if (!indexStream) {
+                        throw std::runtime_error("could not seek CHIDX root payload for Type diagnostic");
+                    }
+                    indexRecords.resize(1u << 16u);
+                }
+
+                constexpr std::uint64_t kChunkEdges = 1u << 16u;
+                std::uint64_t processed = 0u;
+                while (processed < scanCount) {
+                    if (stopToken.stop_requested()) {
+                        roadTypeDiagnosticRunning_.store(false);
+                        return;
+                    }
+                    const auto chunkCount = static_cast<std::size_t>(
+                        std::min<std::uint64_t>(kChunkEdges, scanCount - processed));
+
+                    if (result.comparedIndex) {
+                        indexStream.read(
+                            reinterpret_cast<char*>(indexRecords.data()),
+                            static_cast<std::streamsize>(
+                                chunkCount * sizeof(streaming::index::CHIndexRootRecord)));
+                        if (!indexStream) {
+                            throw std::runtime_error("truncated CHIDX root payload during Type diagnostic");
+                        }
+                    }
+
+                    for (std::size_t local = 0; local < chunkCount; ++local) {
+                        graphScanner.Read<std::uint32_t>();
+                        graphScanner.Read<std::uint32_t>();
+                        graphScanner.Read<float>();
+                        const auto rawType = graphScanner.Read<std::int32_t>();
+                        graphScanner.Read<std::int32_t>();
+                        graphScanner.Read<std::int64_t>();
+                        graphScanner.Read<std::int64_t>();
+
+                        const auto sourceStyle = data::RoadStyleIndexFromType(rawType);
+                        ++result.sourceHistogram[sourceStyle];
+
+                        if (result.comparedIndex) {
+                            const auto& record = indexRecords[local];
+                            const auto expectedEdgeId = processed + local;
+                            if (record.globalEdgeId != expectedEdgeId) {
+                                ++result.recordIdMismatches;
+                            }
+                            if (!streaming::index::HasRootRoadStyleMetadata(
+                                    record.boundsLo, record.boundsHi)) {
+                                ++result.missingIndexMetadata;
+                            }
+                            const auto indexStyle = std::min<std::uint32_t>(
+                                streaming::index::DecodeRootRoadStyle(
+                                    record.boundsLo, record.boundsHi),
+                                data::RoadStyleTypeCount - 1u);
+                            ++result.indexHistogram[indexStyle];
+                            if (indexStyle != sourceStyle) {
+                                ++result.styleMismatches;
+                            }
+                        }
+                    }
+
+                    processed += chunkCount;
+                    result.scannedEdges = processed;
+                    roadTypeDiagnosticProcessed_.store(progressBase + processed);
+                }
+            } catch (const std::exception& error) {
+                result.error = error.what();
+            } catch (...) {
+                result.error = "unknown error while scanning road Types";
+            }
+
+            {
+                std::lock_guard lock(roadTypeDiagnosticMutex_);
+                roadTypeDiagnosticResult_ = std::move(result);
+            }
+            roadTypeDiagnosticRunning_.store(false);
+        });
 }
 
 void DebugUI::BeginFrame() const {
@@ -101,7 +306,10 @@ DebugUIActions DebugUI::Draw(
     const pipeline::GPUProcessingStats* gpuStats,
     const pipeline::GPURangeBenchmarkResult* gpuRangeBenchmarkResult,
     const benchmark::PipelineValidationResult* validationResult,
-    bool canValidate) {
+    bool canValidate,
+    const streaming::index::CHIndexData* streamingIndex,
+    const streaming::runtime::GraphPageStreamingStats* streamingStats,
+    renderer::RoadStyleConfig& roadStyles) {
     DebugUIActions actions;
 
     ImGui::Begin("CH_MapViewer");
@@ -135,6 +343,7 @@ DebugUIActions DebugUI::Draw(
         }
         if (ImGui::Button("Load dataset")) {
             actions.datasetRequest = selectedDataset_;
+            actions.datasetStreaming = streamDataset_;
         }
         if (datasetLoad.Active()) {
             ImGui::EndDisabled();
@@ -145,6 +354,10 @@ DebugUIActions DebugUI::Draw(
     if (ImGui::Button("Refresh datasets")) {
         datasetCatalog.Refresh();
     }
+
+    ImGui::Checkbox("Out-of-core GPU runtime", &streamDataset_);
+    ImGui::TextDisabled(
+        "Enabled: use preprocessed .chidx pages. Disabled: whole-resident CHGraph for CPU/validation.");
 
     if (datasetLoad.Active()) {
         const auto* phaseName = DatasetLoadPhaseName(datasetLoad.phase);
@@ -158,13 +371,23 @@ DebugUIActions DebugUI::Draw(
 
     ImGui::Separator();
 
-    if (graph) {
-        ImGui::Text("Nodes: %zu", graph->NodeCount());
-        ImGui::Text("Edges: %zu", graph->EdgeCount());
-        ImGui::Text("Shortcuts: %zu", graph->ShortcutCount());
-        ImGui::Text("Drawable ranges: %zu", graph->DrawableEdgeCount());
+    if (graph || streamingIndex) {
+        if (streamingIndex) {
+            ImGui::Text("Nodes: %llu", static_cast<unsigned long long>(streamingIndex->nodeCount));
+            ImGui::Text("Edges: %llu", static_cast<unsigned long long>(streamingIndex->edgeCount));
+            ImGui::Text("Runtime pages: %zu", streamingIndex->graphPages.size());
+            ImGui::TextDisabled("Out-of-core runtime: CHGraph is not whole-resident.");
+        }
+        if (graph) {
+            ImGui::Text("Nodes: %zu", graph->NodeCount());
+            ImGui::Text("Edges: %zu", graph->EdgeCount());
+            ImGui::Text("Shortcuts: %zu", graph->ShortcutCount());
+            ImGui::Text("Drawable ranges: %zu", graph->DrawableEdgeCount());
+        }
         if (camera && lodController) {
-            ImGui::Text("Zoom: %.2fx", camera->ZoomFactor());
+            ImGui::Text("Physical zoom: %.2fx", camera->ZoomFactor());
+            ImGui::Text("Approx. vertical world span: %.2f km",
+                        camera->ViewHalfHeightMeters() * 2.0 / 1000.0);
             ImGui::Text("LOD range: %d - %d", lodController->MinLevel(), lodController->MaxLevel());
 
             bool automaticLOD = lodController->Automatic();
@@ -176,7 +399,9 @@ DebugUIActions DebugUI::Draw(
             }
 
             if (lodController->Automatic()) {
-                ImGui::Text("LOD level: %d", lodController->Level(camera->ZoomFactor()));
+                ImGui::Text("LOD level: %d (continuous %.2f)",
+                            lodController->Level(camera->ZoomFactor()),
+                            lodController->ContinuousLevel(camera->ZoomFactor()));
             } else {
                 int manualLevel = lodController->ManualLevel();
                 if (ImGui::SliderInt("LOD level", &manualLevel, lodController->MinLevel(),
@@ -195,8 +420,149 @@ DebugUIActions DebugUI::Draw(
     }
 
     ImGui::Separator();
+    if (ImGui::CollapsingHeader("Road styling", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::Checkbox("Use road type colors/widths", &roadStyles.enabled);
+        ImGui::SliderFloat("Global road width scale", &roadStyles.globalWidthScale, 0.25f, 4.0f,
+                           "%.2fx");
+        ImGui::SliderInt("Road type", &selectedRoadStyleType_, 0,
+                         static_cast<int>(data::RoadStyleTypeCount - 1u));
+        const auto typeIndex = static_cast<std::size_t>(selectedRoadStyleType_);
+        ImGui::ColorEdit4("Road color", roadStyles.colors[typeIndex].data());
+        ImGui::SliderFloat("Road width (px)", &roadStyles.widthsPixels[typeIndex], 0.5f, 12.0f,
+                           "%.2f");
+        if (ImGui::Button("Reset this road type")) {
+            roadStyles.ResetType(static_cast<std::uint32_t>(selectedRoadStyleType_));
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Reset all road styles")) {
+            roadStyles.ResetDefaults();
+        }
+        ImGui::TextDisabled(
+            "Source .sch exposes a numeric road type. Defaults treat lower type numbers as more "
+            "important/thicker; type mapping, color and width remain configurable here.");
+
+        ImGui::SeparatorText("Road Type diagnostic");
+        ImGui::TextDisabled(
+            "Manual/read-only diagnostic. It never runs during preprocess or rendering and does "
+            "not write .sch, .ranges, .chidx or the preprocess manifest.");
+
+        if (!datasets.empty()) {
+            if (roadTypeDiagnosticRunning_.load()) {
+                ImGui::BeginDisabled();
+            }
+            if (ImGui::Button("Scan selected dataset Types")) {
+                StartRoadTypeDiagnostic(datasets[selectedDataset_].graphPath,
+                                        datasets[selectedDataset_].rangesPath);
+            }
+            if (roadTypeDiagnosticRunning_.load()) {
+                ImGui::EndDisabled();
+            }
+            ImGui::SameLine();
+            ImGui::TextDisabled("%s", datasets[selectedDataset_].name.c_str());
+        }
+
+        if (roadTypeDiagnosticRunning_.load()) {
+            const auto current = roadTypeDiagnosticProcessed_.load();
+            const auto total = roadTypeDiagnosticTotal_.load();
+            const float fraction = total == 0u
+                                       ? 0.0f
+                                       : static_cast<float>(
+                                             static_cast<double>(current) /
+                                             static_cast<double>(total));
+            ImGui::ProgressBar(fraction, ImVec2(-1.0f, 0.0f), "Scanning Types...");
+            ImGui::TextDisabled("%llu / %llu records",
+                                static_cast<unsigned long long>(current),
+                                static_cast<unsigned long long>(total));
+        }
+
+        std::optional<RoadTypeDiagnosticResult> roadTypeResult;
+        {
+            std::lock_guard lock(roadTypeDiagnosticMutex_);
+            roadTypeResult = roadTypeDiagnosticResult_;
+        }
+        if (roadTypeResult) {
+            if (!roadTypeResult->error.empty()) {
+                ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.35f, 1.0f),
+                                   "Type diagnostic failed: %s",
+                                   roadTypeResult->error.c_str());
+            } else {
+                ImGui::Text("Scanned edges: %llu",
+                            static_cast<unsigned long long>(roadTypeResult->scannedEdges));
+                if (roadTypeResult->rootSubset) {
+                    ImGui::TextDisabled(
+                        "A valid CHIDX was found, so this scans the drawable root prefix used by "
+                        "pre-refine rendering instead of all ~1B EUR edges.");
+                } else {
+                    ImGui::TextDisabled(
+                        "No comparable RootPayload was available; source .sch edge Types were "
+                        "scanned directly.");
+                }
+
+                if (roadTypeResult->comparedIndex) {
+                    ImGui::Text(
+                        "CHIDX metadata missing: %llu | Type mismatches: %llu | Edge-ID mismatches: %llu",
+                        static_cast<unsigned long long>(roadTypeResult->missingIndexMetadata),
+                        static_cast<unsigned long long>(roadTypeResult->styleMismatches),
+                        static_cast<unsigned long long>(roadTypeResult->recordIdMismatches));
+                    ImGui::TextDisabled(
+                        "CHIDX counts are the effective pre-refine style values the renderer sees. "
+                        "A large .sch/CHIDX mismatch directly explains a one-color coarse map.");
+                }
+
+                const int columns = roadTypeResult->comparedIndex ? 4 : 3;
+                if (ImGui::BeginTable("RoadTypeDiagnosticTable", columns,
+                                      ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
+                                          ImGuiTableFlags_SizingStretchProp)) {
+                    ImGui::TableSetupColumn("Type/style");
+                    ImGui::TableSetupColumn(".sch count");
+                    if (roadTypeResult->comparedIndex) {
+                        ImGui::TableSetupColumn("CHIDX effective");
+                    }
+                    ImGui::TableSetupColumn(".sch share");
+                    ImGui::TableHeadersRow();
+
+                    for (std::uint32_t type = 0; type < data::RoadStyleTypeCount; ++type) {
+                        const auto sourceCount = roadTypeResult->sourceHistogram[type];
+                        const auto indexCount = roadTypeResult->indexHistogram[type];
+                        if (sourceCount == 0u && indexCount == 0u) {
+                            continue;
+                        }
+                        ImGui::TableNextRow();
+                        ImGui::TableSetColumnIndex(0);
+                        if (type == data::RoadStyleFallbackType) {
+                            ImGui::Text("63 (fallback)");
+                        } else {
+                            ImGui::Text("%u", type);
+                        }
+                        ImGui::TableSetColumnIndex(1);
+                        ImGui::Text("%llu", static_cast<unsigned long long>(sourceCount));
+                        int shareColumn = 2;
+                        if (roadTypeResult->comparedIndex) {
+                            ImGui::TableSetColumnIndex(2);
+                            ImGui::Text("%llu", static_cast<unsigned long long>(indexCount));
+                            shareColumn = 3;
+                        }
+                        ImGui::TableSetColumnIndex(shareColumn);
+                        const double share = roadTypeResult->scannedEdges == 0u
+                                                 ? 0.0
+                                                 : 100.0 * static_cast<double>(sourceCount) /
+                                                       static_cast<double>(
+                                                           roadTypeResult->scannedEdges);
+                        ImGui::Text("%.3f%%", share);
+                    }
+                    ImGui::EndTable();
+                }
+            }
+        }
+
+    }
+
     ImGui::TextUnformatted("Processing pipeline");
 
+    if (streamingIndex) {
+        processingMode = pipeline::ProcessingMode::GPUDriven;
+        ImGui::BeginDisabled();
+    }
     if (ImGui::BeginCombo("##pipeline", ProcessingModeName(processingMode))) {
         constexpr pipeline::ProcessingMode modes[] = {
             pipeline::ProcessingMode::GPUDriven,
@@ -214,6 +580,10 @@ DebugUIActions DebugUI::Draw(
         }
         ImGui::EndCombo();
     }
+    if (streamingIndex) {
+        ImGui::EndDisabled();
+        ImGui::TextDisabled("Streaming runtime currently uses the GPU Driven path only.");
+    }
 
     if (processingMode != pipeline::ProcessingMode::CPUReference) {
         ImGui::TextUnformatted("GPU filtering strategy");
@@ -222,9 +592,20 @@ DebugUIActions DebugUI::Draw(
             const auto currentName = rangeFilterStrategyManager.Current().Name();
             if (ImGui::BeginCombo("##range-filter-strategy", currentName.data())) {
                 for (std::size_t i = 0; i < rangeFilterStrategies.size(); ++i) {
+                    const bool supported =
+                        !streamingIndex ||
+                        rangeFilterStrategies[i]->PersistentStreamingKind() !=
+                            gpu::filtering::PersistentStreamingRangeFilterKind::Unsupported;
                     const bool selected = i == rangeFilterStrategyManager.CurrentIndex();
-                    if (ImGui::Selectable(rangeFilterStrategies[i]->Name().data(), selected)) {
+                    if (!supported) {
+                        ImGui::BeginDisabled();
+                    }
+                    if (ImGui::Selectable(rangeFilterStrategies[i]->Name().data(), selected) &&
+                        supported) {
                         rangeFilterStrategyManager.Select(i);
+                    }
+                    if (!supported) {
+                        ImGui::EndDisabled();
                     }
                     if (selected) {
                         ImGui::SetItemDefaultFocus();
@@ -240,15 +621,39 @@ DebugUIActions DebugUI::Draw(
             const auto currentName = strategyManager.Current().Name();
             if (ImGui::BeginCombo("##strategy", currentName.data())) {
                 for (std::size_t i = 0; i < strategies.size(); ++i) {
+                    const bool adaptiveStreamingSupported =
+                        !streamingIndex ||
+                        (streamingIndex->HasRootPayload() &&
+                         streamingIndex->edgeSpatialBoundsCount == streamingIndex->edgeCount);
+                    const bool supported =
+                        strategies[i]->Mode() != geometry::RefinementMode::Adaptive ||
+                        adaptiveStreamingSupported;
                     const bool selected = i == strategyManager.CurrentIndex();
-                    if (ImGui::Selectable(strategies[i]->Name().data(), selected)) {
+                    if (!supported) {
+                        ImGui::BeginDisabled();
+                    }
+                    if (ImGui::Selectable(strategies[i]->Name().data(), selected) && supported) {
                         strategyManager.Select(i);
+                    }
+                    if (!supported) {
+                        ImGui::EndDisabled();
                     }
                     if (selected) {
                         ImGui::SetItemDefaultFocus();
                     }
                 }
                 ImGui::EndCombo();
+            }
+        }
+        if (streamingIndex) {
+            ImGui::TextDisabled(
+                "Adaptive is the normal large-map refinement path: viewport/guard roots stop once their projected geometry error is below the pixel threshold.");
+            ImGui::TextDisabled(
+                "Full DFS remains an exhaustive correctness/stress mode and can request a very large hierarchy working set.");
+            if (!streamingIndex->HasRootPayload() ||
+                streamingIndex->edgeSpatialBoundsCount != streamingIndex->edgeCount) {
+                ImGui::TextDisabled(
+                    "Adaptive requires the current preprocessed CHIDX root payload and per-edge spatial bounds.");
             }
         }
     } else {
@@ -305,7 +710,202 @@ DebugUIActions DebugUI::Draw(
         }
     }
 
-    if (gpuStats && processingMode != pipeline::ProcessingMode::CPUReference) {
+    if (streamingStats) {
+        ImGui::Separator();
+        ImGui::TextUnformatted("Runtime page streaming");
+        ImGui::TextDisabled("Out-of-core cache budgets");
+        ImGui::SliderInt("CPU cache budget (MiB, 0=Auto)", &streamingRamBudgetMiB_, 0, 15360);
+        ImGui::SliderInt("GPU cache budget (MiB)", &streamingGpuBudgetMiB_, 128, 2048);
+        if (ImGui::Button("Apply budgets")) {
+            actions.applyStreamingBudgets = true;
+            actions.streamingRamBudgetMiB = streamingRamBudgetMiB_ <= 0
+                                                 ? 0u
+                                                 : static_cast<std::uint32_t>(streamingRamBudgetMiB_);
+            actions.streamingGpuBudgetMiB =
+                static_cast<std::uint32_t>(std::max(streamingGpuBudgetMiB_, 128));
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Stress preset")) {
+            streamingRamBudgetMiB_ = 384;
+            streamingGpuBudgetMiB_ = 192;
+            actions.applyStreamingBudgets = true;
+            actions.streamingRamBudgetMiB = 384;
+            actions.streamingGpuBudgetMiB = 192;
+        }
+        ImGui::TextDisabled(
+            "CPU 0 = automatic from currently available RAM (up to 15 GiB). Applying keeps .sch/.ranges/.chidx; only runtime caches are reset.");
+        ImGui::Text("Required pages: %u / %u resident", streamingStats->requiredResidentCount,
+                    streamingStats->requiredPageCount);
+        ImGui::Text("RAM candidates: %u / %u resident | LOD-window pages: %u | GPU-warm: %u",
+                    streamingStats->desiredResidentCount, streamingStats->desiredPageCount,
+                    streamingStats->lodPrefetchPageCount,
+                    streamingStats->lodGpuWarmPageCount);
+        ImGui::TextDisabled("Spatial guard: current floor/ceil LOD use +%u fixed cells (base cell %.2f km); far prefetched LODs use viewport only",
+                            streamingStats->spatialPrefetchRadius,
+                            streamingStats->spatialCellSizeMeters / 1000.0);
+        ImGui::Text("LOD target / displayed: %.2f / %.2f%s",
+                    streamingStats->targetLodLevelFloat,
+                    streamingStats->displayLodLevelFloat,
+                    streamingStats->lodTransitionPending ? " (streaming/chasing)" : "");
+        ImGui::Text("LOD preload window: %u .. %u | predictive focus %.2f",
+                    streamingStats->lodPrefetchMinLevel,
+                    streamingStats->lodPrefetchMaxLevel,
+                    streamingStats->lodPrefetchFocusLevel);
+        ImGui::TextDisabled("Overlapping LOD windows reuse resident/queued/loading page IDs; only newly entering pages are requested.");
+        ImGui::TextDisabled("Range-only rendering blends edge lifetimes continuously between floor/ceil LOD; no whole-level snap is required.");
+        ImGui::Text("Resident / queued / loading pages: %u / %u / %u",
+                    streamingStats->residentPageCount, streamingStats->queuedPageCount,
+                    streamingStats->loadingPageCount);
+        ImGui::Text("Refinement tiles: %u / %u resident | %u queued | %u loading",
+                    streamingStats->residentRefinementBlockCount,
+                    streamingStats->desiredRefinementBlockCount,
+                    streamingStats->queuedRefinementBlockCount,
+                    streamingStats->loadingRefinementBlockCount);
+        ImGui::Text("Refinement requests last: %u / %u accepted (%u outside 7x7)",
+                    streamingStats->lastSpatiallyAcceptedRefinementRequestCount,
+                    streamingStats->lastRefinementRequestCount,
+                    streamingStats->lastRefinementRequestCount >=
+                            streamingStats->lastSpatiallyAcceptedRefinementRequestCount
+                        ? streamingStats->lastRefinementRequestCount -
+                              streamingStats->lastSpatiallyAcceptedRefinementRequestCount
+                        : 0u);
+        ImGui::Text("GPU refinement requests / spatial rejects / tile loads: %llu / %llu / %llu",
+                    static_cast<unsigned long long>(streamingStats->totalRefinementRequests),
+                    static_cast<unsigned long long>(
+                        streamingStats->totalSpatiallyRejectedRefinementRequests),
+                    static_cast<unsigned long long>(streamingStats->totalRefinementBlockLoads));
+        ImGui::Text("CPU cache total / peak / hard budget: %.2f / %.2f / %.2f MiB",
+                    static_cast<double>(streamingStats->totalCpuCacheBytes) / (1024.0 * 1024.0),
+                    static_cast<double>(streamingStats->peakCpuCacheBytes) / (1024.0 * 1024.0),
+                    static_cast<double>(streamingStats->ramBudgetBytes) / (1024.0 * 1024.0));
+        ImGui::Text("Page+refinement RAM: %.2f / %.2f MiB",
+                    static_cast<double>(streamingStats->residentBytes) / (1024.0 * 1024.0),
+                    static_cast<double>(streamingStats->dataCacheBudgetBytes) /
+                        (1024.0 * 1024.0));
+        ImGui::Text("Decoded node cache: %.2f / %.2f MiB",
+                    static_cast<double>(streamingStats->nodeBlockCacheBytes) / (1024.0 * 1024.0),
+                    static_cast<double>(streamingStats->nodeBlockCacheBudgetBytes) /
+                        (1024.0 * 1024.0));
+        ImGui::Text("Node-block hits / misses / evictions: %llu / %llu / %llu",
+                    static_cast<unsigned long long>(streamingStats->nodeBlockCacheHits),
+                    static_cast<unsigned long long>(streamingStats->nodeBlockCacheMisses),
+                    static_cast<unsigned long long>(streamingStats->nodeBlockCacheEvictions));
+        ImGui::Text("Page cache hit / miss | loads / evictions: %llu / %llu | %llu / %llu",
+                    static_cast<unsigned long long>(streamingStats->pageCacheHits),
+                    static_cast<unsigned long long>(streamingStats->pageCacheMisses),
+                    static_cast<unsigned long long>(streamingStats->totalPageLoads),
+                    static_cast<unsigned long long>(streamingStats->totalEvictions));
+        ImGui::Text("Backing RAM cache hit / miss | evictions: %llu / %llu | %llu",
+                    static_cast<unsigned long long>(streamingStats->refinementBlockCacheHits),
+                    static_cast<unsigned long long>(streamingStats->refinementBlockCacheMisses),
+                    static_cast<unsigned long long>(
+                        streamingStats->totalRefinementBlockEvictions));
+        ImGui::Text("Last / mean page load: %.3f / %.3f ms", streamingStats->lastPageLoadMs,
+                    streamingStats->meanPageLoadMs);
+        ImGui::Text("Root planner last: %.3f ms | rebuilds / cache reuse: %llu / %llu",
+                    streamingStats->lastRootPlannerMs,
+                    static_cast<unsigned long long>(streamingStats->rootPlannerRebuilds),
+                    static_cast<unsigned long long>(streamingStats->rootPlannerCacheReuses));
+        ImGui::Text("Planner candidates alive/spatial: %u / %u | path: %s",
+                    streamingStats->rootPlannerAliveCandidates,
+                    streamingStats->rootPlannerSpatialCandidates,
+                    streamingStats->rootPlannerUsedLodFirst ? "LOD-first" : "spatial-first");
+        ImGui::Text("Last / mean refinement tile load: %.3f / %.3f ms",
+                    streamingStats->lastRefinementBlockLoadMs,
+                    streamingStats->meanRefinementBlockLoadMs);
+        ImGui::Separator();
+        ImGui::TextUnformatted("Persistent GPU runtime");
+        ImGui::Text("GPU allocated / hard budget: %.2f / %.2f MiB",
+                    static_cast<double>(streamingStats->gpuAllocatedBytes) / (1024.0 * 1024.0),
+                    static_cast<double>(streamingStats->gpuBudgetBytes) / (1024.0 * 1024.0));
+        ImGui::Text("Root records required / transition / capacity: %llu / %llu / %u",
+                    static_cast<unsigned long long>(streamingStats->gpuRequiredRootRecords),
+                    static_cast<unsigned long long>(streamingStats->gpuTransitionRootRecords),
+                    streamingStats->gpuRootRecordCapacity);
+        if (!streamingStats->gpuRootWorkingSetFits) {
+            ImGui::TextColored(
+                ImVec4(1.0f, 0.55f, 0.20f, 1.0f),
+                "Root working set exceeds GPU cache: stable partial residency (no churn).");
+        }
+        ImGui::Text("Root pages cached / active: %u / %u",
+                    streamingStats->gpuPersistentRootPagesCached,
+                    streamingStats->gpuPersistentRootPagesActive);
+        ImGui::Text("Backing tiles resident: %u / %u GPU slots",
+                    streamingStats->gpuPersistentBackingBlocks,
+                    streamingStats->gpuPersistentBackingBlockCapacity);
+        ImGui::Text("Visible roots / draw requested / capacity: %u / %u / %u",
+                    streamingStats->gpuVisibleRootCount,
+                    streamingStats->gpuDrawEdgeCount,
+                    streamingStats->gpuDrawCapacity);
+        if (streamingStats->gpuDrawOverflowCount != 0u) {
+            ImGui::TextColored(ImVec4(1.0f, 0.30f, 0.20f, 1.0f),
+                               "DRAW OVERFLOW: %u segments dropped this frame",
+                               streamingStats->gpuDrawOverflowCount);
+        }
+        ImGui::Text("GPU missing backing tiles: %u | Adaptive admitted this wave: %u",
+                    streamingStats->gpuMissingBlockRequests,
+                    streamingStats->gpuAdaptiveBlockRequestsAdmitted);
+        ImGui::Text("Refinement cache hit / miss: %u / %u | cached roots: %u",
+                    streamingStats->gpuRefinementCacheHits,
+                    streamingStats->gpuRefinementCacheMisses,
+                    streamingStats->gpuCachedRefinedRoots);
+        ImGui::Text("Cached refinement geometry: %u / %u segments | overflows: %u",
+                    streamingStats->gpuRefinementGeometryUsed,
+                    streamingStats->gpuRefinementGeometryCapacity,
+                    streamingStats->gpuRefinementGeometryOverflows);
+        ImGui::Text("Refinement geometry banks: write %u | used %u / 8 | recycles: %llu",
+                    streamingStats->gpuRefinementWriteBank,
+                    streamingStats->gpuRefinementBanksUsed,
+                    static_cast<unsigned long long>(streamingStats->gpuRefinementBankRecycles));
+        ImGui::Text("GPU root/backing evictions: %llu / %llu",
+                    static_cast<unsigned long long>(streamingStats->gpuRootPageEvictions),
+                    static_cast<unsigned long long>(streamingStats->gpuBackingBlockEvictions));
+        ImGui::Text("GPU cache pressure root/backing: %llu / %llu | touched blocks: %u",
+                    static_cast<unsigned long long>(
+                        streamingStats->gpuRootCacheAllocationFailures),
+                    static_cast<unsigned long long>(
+                        streamingStats->gpuBackingCacheAllocationFailures),
+                    streamingStats->gpuBackingBlocksTouchedLastReadback);
+        ImGui::Text("GPU filter+cull / refine / compose: %.3f / %.3f / %.3f ms",
+                    streamingStats->gpuFilterCullMs, streamingStats->gpuRefinementMs,
+                    streamingStats->gpuComposeMs);
+        ImGui::Text("Last incremental root/backing upload: %.3f / %.3f ms",
+                    streamingStats->lastGpuRootUploadMs,
+                    streamingStats->lastGpuBackingUploadMs);
+        ImGui::Text("Cumulative GPU upload traffic root/backing: %.2f / %.2f MiB",
+                    static_cast<double>(streamingStats->gpuIncrementalRootBytesUploaded) /
+                        (1024.0 * 1024.0),
+                    static_cast<double>(streamingStats->gpuIncrementalBackingBytesUploaded) /
+                        (1024.0 * 1024.0));
+        if (streamingStats->gpuRefinementStackOverflows != 0 ||
+            streamingStats->gpuRefinementHashOverflows != 0 ||
+            streamingStats->gpuRefinementGeometryOverflows != 0) {
+            ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.20f, 1.0f),
+                               "Refinement overflow stack/hash/geometry: %u / %u / %u",
+                               streamingStats->gpuRefinementStackOverflows,
+                               streamingStats->gpuRefinementHashOverflows,
+                               streamingStats->gpuRefinementGeometryOverflows);
+        }
+        ImGui::TextDisabled(
+            "7x7 controls residency only. GPU refinement uses viewport + a small guard band and caches Full-DFS results per root.");
+        ImGui::TextDisabled(
+            "Current view ready measures root-page demand only; it is not geometry-refinement time.");
+        ImGui::Text("Estimated source read: %.2f MiB",
+                    static_cast<double>(streamingStats->estimatedSourceBytesRead) /
+                        (1024.0 * 1024.0));
+        if (!streamingStats->currentDemandReady) {
+            ImGui::TextDisabled("Current view waiting for pages: %.2f ms",
+                                streamingStats->currentDemandWaitMs);
+        } else {
+            ImGui::TextDisabled("Current view ready: %.2f ms", streamingStats->lastDemandReadyMs);
+        }
+        if (!streamingStats->lastError.empty()) {
+            ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.35f, 1.0f), "Streaming error: %s",
+                               streamingStats->lastError.c_str());
+        }
+    }
+
+    if (gpuStats && processingMode != pipeline::ProcessingMode::CPUReference && !streamingIndex) {
         ImGui::Separator();
         ImGui::TextUnformatted("GPU range filter benchmark");
         if (ImGui::Button("Run GPU Range Benchmark")) {

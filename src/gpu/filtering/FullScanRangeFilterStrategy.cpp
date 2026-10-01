@@ -19,6 +19,11 @@ void FullScanRangeFilterStrategy::SetGraph(const data::CHGraph& graph) {
     edgeCount_ = static_cast<std::uint32_t>(graph.EdgeCount());
 }
 
+void FullScanRangeFilterStrategy::SetStreamingRanges(
+    std::span<const data::EdgeRange> ranges) {
+    edgeCount_ = static_cast<std::uint32_t>(ranges.size());
+}
+
 RangeFilterExecutionStats FullScanRangeFilterStrategy::Execute(const RangeFilterInput& input) {
     filterProgram_.Bind();
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, input.graphEdgeBuffer);
@@ -27,7 +32,7 @@ RangeFilterExecutionStats FullScanRangeFilterStrategy::Execute(const RangeFilter
     glUniform1ui(glGetUniformLocation(filterProgram_.Id(), "uEdgeCount"), input.graphEdgeCount);
     glUniform1i(glGetUniformLocation(filterProgram_.Id(), "uLevel"), input.lodLevel);
     filterProgram_.Dispatch((input.graphEdgeCount + kWorkGroupSize - 1) / kWorkGroupSize);
-    return {edgeCount_};
+    return {input.graphEdgeCount};
 }
 
 RangeFilterDiagnostics FullScanRangeFilterStrategy::ReadBackDiagnostics(std::int32_t) const {

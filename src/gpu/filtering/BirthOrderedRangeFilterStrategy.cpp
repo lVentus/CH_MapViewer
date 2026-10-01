@@ -4,8 +4,11 @@
 
 #include <glad/gl.h>
 
+#include <algorithm>
 #include <cstddef>
+#include <limits>
 #include <stdexcept>
+#include <vector>
 
 namespace chmv::gpu::filtering {
 namespace {
@@ -39,11 +42,10 @@ BirthOrderedRangeFilterStrategy::BirthOrderedRangeFilterStrategy(
     dispatchBuffer_.Allocate(sizeof(dispatch), &dispatch, GL_DYNAMIC_DRAW);
 }
 
-void BirthOrderedRangeFilterStrategy::SetGraph(const data::CHGraph& graph) {
-    const auto& index = graph.OrderedRanges();
+void BirthOrderedRangeFilterStrategy::UploadIndex(const data::OrderedRangeIndex& index) {
     levelCount_ = static_cast<std::uint32_t>(index.scanEndByLevel.size());
-
     if (index.entries.empty() || index.scanEndByLevel.empty()) {
+        levelCount_ = 0;
         return;
     }
 
@@ -53,6 +55,70 @@ void BirthOrderedRangeFilterStrategy::SetGraph(const data::CHGraph& graph) {
     CheckBufferSize(scanEndBytes);
     orderedRangeBuffer_.Allocate(rangeBytes, index.entries.data(), GL_STATIC_DRAW);
     scanEndBuffer_.Allocate(scanEndBytes, index.scanEndByLevel.data(), GL_STATIC_DRAW);
+}
+
+void BirthOrderedRangeFilterStrategy::SetGraph(const data::CHGraph& graph) {
+    UploadIndex(graph.OrderedRanges());
+}
+
+void BirthOrderedRangeFilterStrategy::SetStreamingRanges(
+    std::span<const data::EdgeRange> ranges) {
+    data::OrderedRangeIndex index;
+    std::int32_t maxBirthLevel = -1;
+    std::size_t drawableCount = 0;
+    for (const auto& range : ranges) {
+        if (!range.IsDrawable() || range.birthLevel < range.deathLevel) {
+            continue;
+        }
+        maxBirthLevel = std::max(maxBirthLevel, range.birthLevel);
+        ++drawableCount;
+    }
+
+    if (maxBirthLevel < 0 || drawableCount == 0) {
+        UploadIndex(index);
+        return;
+    }
+    if (drawableCount > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::runtime_error("too many streamed drawable edges for 32-bit ordered range indexing");
+    }
+
+    const auto levelCount = static_cast<std::size_t>(maxBirthLevel) + 1u;
+    std::vector<std::uint32_t> birthCounts(levelCount, 0u);
+    for (const auto& range : ranges) {
+        if (!range.IsDrawable() || range.birthLevel < range.deathLevel) {
+            continue;
+        }
+        ++birthCounts[static_cast<std::size_t>(range.birthLevel)];
+    }
+
+    std::vector<std::uint32_t> bucketStart(levelCount, 0u);
+    std::uint32_t offset = 0u;
+    for (std::size_t level = levelCount; level-- > 0;) {
+        bucketStart[level] = offset;
+        offset += birthCounts[level];
+    }
+
+    index.entries.resize(drawableCount);
+    auto writePosition = bucketStart;
+    for (std::size_t localEdgeId = 0; localEdgeId < ranges.size(); ++localEdgeId) {
+        const auto& range = ranges[localEdgeId];
+        if (!range.IsDrawable() || range.birthLevel < range.deathLevel) {
+            continue;
+        }
+        const auto birth = static_cast<std::size_t>(range.birthLevel);
+        index.entries[writePosition[birth]++] = {
+            static_cast<std::uint32_t>(localEdgeId),
+            range.deathLevel,
+        };
+    }
+
+    index.scanEndByLevel.resize(levelCount);
+    std::uint32_t scanCount = 0u;
+    for (std::size_t level = levelCount; level-- > 0;) {
+        scanCount += birthCounts[level];
+        index.scanEndByLevel[level] = scanCount;
+    }
+    UploadIndex(index);
 }
 
 RangeFilterExecutionStats BirthOrderedRangeFilterStrategy::Execute(const RangeFilterInput& input) {

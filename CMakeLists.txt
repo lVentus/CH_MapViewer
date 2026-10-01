@@ -38,6 +38,12 @@ add_library(chmv_data
     src/pipeline/CPUReferencePipeline.cpp
     src/reference/CPURangeFilter.cpp
     src/reference/CPUReferenceUnfolder.cpp
+    src/streaming/analysis/DatasetLayoutAnalyzer.cpp
+    src/streaming/analysis/DatasetLayoutReport.cpp
+    src/streaming/preprocess/DatasetPreprocessor.cpp
+    src/streaming/preprocess/ExternalPreprocess.cpp
+    src/streaming/index/CHIndex.cpp
+    src/streaming/runtime/GraphPageStreamer.cpp
 )
 
 target_include_directories(chmv_data PUBLIC src)
@@ -70,6 +76,8 @@ if(CHMV_BUILD_APP)
         src/gpu/filtering/RangeFilterStrategyManager.cpp
         src/gpu/filtering/FullScanRangeFilterStrategy.cpp
         src/gpu/filtering/BirthOrderedRangeFilterStrategy.cpp
+        src/gpu/streaming/RefinementRequestCollector.cpp
+        src/gpu/streaming/PersistentStreamingPipeline.cpp
         src/benchmark/GPUTimer.cpp
         src/gpu/unfolding/UnfoldingStrategyManager.cpp
         src/gpu/unfolding/NoUnfoldingStrategy.cpp

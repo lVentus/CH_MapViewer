@@ -17,7 +17,14 @@ void DatasetCatalog::Refresh() {
         return;
     }
 
-    for (const auto& item : std::filesystem::recursive_directory_iterator(directory_)) {
+    std::filesystem::recursive_directory_iterator iterator(directory_);
+    const std::filesystem::recursive_directory_iterator end;
+    for (; iterator != end; ++iterator) {
+        const auto& item = *iterator;
+        if (item.is_directory() && item.path().filename() == ".chmv") {
+            iterator.disable_recursion_pending();
+            continue;
+        }
         if (!item.is_regular_file()) {
             continue;
         }

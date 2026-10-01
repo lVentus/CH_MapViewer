@@ -1,18 +1,29 @@
 #pragma once
 
+#include "data/ch/CHTypes.h"
 #include "gpu/GPUBuffer.h"
 #include "gpu/GraphicsProgram.h"
+#include "renderer/RoadStyle.h"
 
 #include <array>
 #include <cstdint>
 #include <filesystem>
 #include <span>
+#include <vector>
 
 namespace chmv::data {
 class CHGraph;
 }
 
+namespace chmv::streaming::runtime {
+struct ResidentGraphPage;
+struct ResidentRefinementBlock;
+struct StreamingSpatialWindow;
+}
+
 namespace chmv::renderer {
+
+namespace streaming_runtime = chmv::streaming::runtime;
 
 class MapCamera2D;
 
@@ -30,15 +41,23 @@ public:
     RoadRenderer& operator=(const RoadRenderer&) = delete;
 
     void SetGraph(const data::CHGraph& graph);
+    void SetStreamingWorkingSet(
+        std::span<const streaming_runtime::ResidentGraphPage* const> pages,
+        std::span<const streaming_runtime::ResidentRefinementBlock* const> refinementBlocks,
+        std::span<const std::uint64_t> edgeSpatialBounds,
+        const streaming_runtime::StreamingSpatialWindow& refinementWindow);
+    void ClearGraph();
     [[nodiscard]] RoadDrawData UploadEdgeIds(std::span<const std::uint32_t> edgeIds);
     void Draw(const MapCamera2D& camera, int framebufferWidth, int framebufferHeight,
               const RoadDrawData& drawData, float viewScale, float viewOffsetX,
-              const std::array<float, 4>& color) const;
+              const std::array<float, 4>& color, const RoadStyleConfig& styles) const;
     void DrawViewport(const MapCamera2D& camera, int viewportX, int viewportY,
                       int viewportWidth, int viewportHeight, const RoadDrawData& drawData,
-                      const std::array<float, 4>& color) const;
+                      const std::array<float, 4>& color, const RoadStyleConfig& styles) const;
 
+    [[nodiscard]] std::span<const data::EdgeRange> StreamingRanges() const { return streamingRanges_; }
     [[nodiscard]] std::uint32_t EdgeBufferId() const { return edgeBuffer_.Id(); }
+    [[nodiscard]] std::uint32_t StreamingLinkBufferId() const { return streamingLinkBuffer_.Id(); }
     [[nodiscard]] std::uint32_t EdgeCount() const { return edgeCount_; }
     [[nodiscard]] std::int32_t MinLevel() const { return minLevel_; }
     [[nodiscard]] std::int32_t MaxLevel() const { return maxLevel_; }
@@ -50,6 +69,7 @@ private:
     gpu::GraphicsProgram roadProgram_;
     gpu::GPUBuffer nodeBuffer_;
     gpu::GPUBuffer edgeBuffer_;
+    gpu::GPUBuffer streamingLinkBuffer_;
     gpu::GPUBuffer uploadedEdgeBuffer_;
     gpu::GPUBuffer uploadedIndirectBuffer_;
     std::uint32_t vertexArray_ = 0;
@@ -57,6 +77,7 @@ private:
     std::size_t uploadCapacity_ = 0;
     std::int32_t minLevel_ = 0;
     std::int32_t maxLevel_ = 0;
+    std::vector<data::EdgeRange> streamingRanges_;
 };
 
 } // namespace chmv::renderer

@@ -23,13 +23,16 @@ uniform float uAspectScale;
 uniform float uViewScale;
 uniform float uViewOffsetX;
 
+flat out uint vRoadType;
+
 void main() {
     uint edgeId = visibleEdgeIds[uint(gl_VertexID) >> 1u];
     Edge edge = edges[edgeId];
-    uint nodeId = (gl_VertexID & 1) == 0 ? edge.topology.x : edge.topology.y;
+    uint nodeId = (gl_VertexID & 1) == 0u ? edge.topology.x : edge.topology.y;
     vec2 position = (nodePositions[nodeId] - uCameraCenter) * uZoom;
     position.x *= uAspectScale;
     position *= uViewScale;
     position.x += uViewOffsetX;
     gl_Position = vec4(position, 0.0, 1.0);
+    vRoadType = uint(edge.levels.w) & 63u;
 }

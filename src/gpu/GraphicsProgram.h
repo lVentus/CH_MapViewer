@@ -10,6 +10,9 @@ public:
     GraphicsProgram() = default;
     GraphicsProgram(const std::filesystem::path& vertexShaderPath,
                     const std::filesystem::path& fragmentShaderPath);
+    GraphicsProgram(const std::filesystem::path& vertexShaderPath,
+                    const std::filesystem::path& geometryShaderPath,
+                    const std::filesystem::path& fragmentShaderPath);
     ~GraphicsProgram();
 
     GraphicsProgram(const GraphicsProgram&) = delete;
@@ -18,6 +21,9 @@ public:
     GraphicsProgram& operator=(GraphicsProgram&& other) noexcept;
 
     void Load(const std::filesystem::path& vertexShaderPath,
+              const std::filesystem::path& fragmentShaderPath);
+    void Load(const std::filesystem::path& vertexShaderPath,
+              const std::filesystem::path& geometryShaderPath,
               const std::filesystem::path& fragmentShaderPath);
     void Bind() const;
 

@@ -1,0 +1,153 @@
+#version 450 core
+
+layout(local_size_x = 64) in;
+
+const uint CACHE_READY_FULL = 1u;
+const uint CACHE_ADAPTIVE_PARTIAL = 4u;
+const uint CACHE_ADAPTIVE_READY = 5u;
+const uint CACHE_STATE_MASK = 0xffu;
+const uint CACHE_BANK_SHIFT = 8u;
+const uint MAX_HASH_PROBES = 96u;
+const uint CACHED_SEGMENT_BIT = 0x80000000u;
+const uint CACHE_BANK_COUNT = 8u;
+
+struct RootRecord {
+    uint globalEdgeId;
+    int birthLevel;
+    int deathLevel;
+    uint boundsLo;
+    uint boundsHi;
+    uint padding0;
+    uint padding1;
+    uint padding2;
+    vec4 segment;
+};
+
+// Bindings 0 and 9 are intentionally kept compatible with the persistent pipeline even though
+// range-only/root composition no longer depends on backing residency. Backing data is a refinement
+// input only; direct root drawing uses RootRecord.segment.
+layout(std430, binding = 0) readonly buffer BlockPageTable { uint blockSlots[]; };
+layout(std430, binding = 1) readonly buffer VisibleRoots { uint visibleRoots[]; };
+layout(std430, binding = 2) readonly buffer VisibleCounter { uint visibleCount; };
+layout(std430, binding = 3) readonly buffer RefinementHash { uvec4 cacheEntries[]; };
+layout(std430, binding = 4) readonly buffer RefinedSegments { vec4 cachedSegments[]; };
+layout(std430, binding = 5) writeonly buffer DrawItems { uint drawItems[]; };
+layout(std430, binding = 6) buffer DrawCounter { uint drawCount; };
+layout(std430, binding = 7) buffer BlockRequests { uint requestWords[]; };
+layout(std430, binding = 8) buffer RefinementBankLastUse { uint bankLastUse[CACHE_BANK_COUNT]; };
+layout(std430, binding = 9) buffer BlockUseBits { uint useWords[]; };
+layout(std430, binding = 10) readonly buffer RootRecords { RootRecord roots[]; };
+layout(std430, binding = 11) writeonly buffer DrawAlphas { float drawAlphas[]; };
+
+uniform uint uBlockRecordCount;
+uniform uint uBlockCount;
+uniform uint uHashMask;
+uniform uint uDrawCapacity;
+uniform uint uRefinementEnabled;
+uniform uint uFrameId;
+uniform float uLevelFloat;
+
+uint hashEdge(uint edgeId) {
+    uint x = edgeId + 1u;
+    x ^= x >> 16u;
+    x *= 0x7feb352du;
+    x ^= x >> 15u;
+    x *= 0x846ca68bu;
+    x ^= x >> 16u;
+    return x;
+}
+
+// Entries can be removed when an old geometry bank is recycled, so empty slots are tombstones for
+// lookup purposes. Probe the full bounded window instead of terminating on the first zero key.
+uint findCache(uint rootEdge) {
+    uint key = rootEdge + 1u;
+    uint start = hashEdge(rootEdge) & uHashMask;
+    for (uint probe = 0u; probe < MAX_HASH_PROBES; ++probe) {
+        uint index = (start + probe) & uHashMask;
+        if (cacheEntries[index].x == key) {
+            return index;
+        }
+    }
+    return 0xffffffffu;
+}
+
+float lifetimeAlpha(RootRecord root) {
+    int lowLevel = int(floor(uLevelFloat));
+    int highLevel = int(ceil(uLevelFloat));
+    bool aliveLow = lowLevel <= root.birthLevel && lowLevel >= root.deathLevel;
+    bool aliveHigh = highLevel <= root.birthLevel && highLevel >= root.deathLevel;
+    if (lowLevel == highLevel) {
+        return aliveLow ? 1.0 : 0.0;
+    }
+
+    // Zooming into more detail decreases the CH level. Between high and low integer levels,
+    // fade roots according to their lifetime instead of replacing the whole edge set in one frame.
+    float fineWeight = clamp(float(highLevel) - uLevelFloat, 0.0, 1.0);
+    return (aliveHigh ? (1.0 - fineWeight) : 0.0) +
+           (aliveLow ? fineWeight : 0.0);
+}
+
+void appendRoot(uint rootRecordIndex, float alpha) {
+    uint dst = atomicAdd(drawCount, 1u);
+    if (dst < uDrawCapacity) {
+        // The high bit remains clear. An unrefined draw item is a persistent RootRecord index,
+        // so it has self-contained endpoints and never waits on a backing block.
+        drawItems[dst] = rootRecordIndex;
+        drawAlphas[dst] = alpha;
+    }
+}
+
+void main() {
+    uint rootIndex = gl_GlobalInvocationID.x;
+    if (rootIndex >= visibleCount) {
+        return;
+    }
+    uint rootRecordIndex = visibleRoots[rootIndex];
+    RootRecord root = roots[rootRecordIndex];
+    uint rootEdge = root.globalEdgeId;
+    float alpha = lifetimeAlpha(root);
+    if (alpha <= 0.0) {
+        return;
+    }
+    if (uRefinementEnabled == 0u) {
+        appendRoot(rootRecordIndex, alpha);
+        return;
+    }
+
+    uint cacheIndex = findCache(rootEdge);
+    if (cacheIndex == 0xffffffffu) {
+        appendRoot(rootRecordIndex, alpha);
+        return;
+    }
+
+    uint packedState = cacheEntries[cacheIndex].w;
+    uint state = packedState & CACHE_STATE_MASK;
+    bool fullReady = state == CACHE_READY_FULL;
+    bool adaptiveCached =
+        state == CACHE_ADAPTIVE_PARTIAL || state == CACHE_ADAPTIVE_READY;
+    if (!fullReady && !adaptiveCached) {
+        appendRoot(rootRecordIndex, alpha);
+        return;
+    }
+
+    uint bank = packedState >> CACHE_BANK_SHIFT;
+    if (bank < CACHE_BANK_COUNT) {
+        atomicMax(bankLastUse[bank], uFrameId);
+    }
+
+    // Adaptive PARTIAL geometry is intentionally drawable: it is a complete crack-free
+    // approximation where unresolved child pairs are represented by their parent segment. This
+    // is what makes the map visibly refine one wave at a time instead of waiting for the entire
+    // descendant subtree to coexist in backing memory. Adaptive nodes are interleaved
+    // [segment, metadata] in the arena, so only even records are sent to the line renderer.
+    uint offset = cacheEntries[cacheIndex].y;
+    uint count = cacheEntries[cacheIndex].z;
+    uint dst = atomicAdd(drawCount, count);
+    for (uint i = 0u; i < count; ++i) {
+        if (dst + i < uDrawCapacity) {
+            uint segmentIndex = adaptiveCached ? (offset + i * 2u) : (offset + i);
+            drawItems[dst + i] = CACHED_SEGMENT_BIT | segmentIndex;
+            drawAlphas[dst + i] = alpha;
+        }
+    }
+}

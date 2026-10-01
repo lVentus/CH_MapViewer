@@ -7,6 +7,15 @@ namespace chmv::data {
 
 constexpr std::uint32_t InvalidEdgeId = std::numeric_limits<std::uint32_t>::max();
 
+constexpr std::uint32_t RoadStyleTypeCount = 64u;
+constexpr std::uint32_t RoadStyleFallbackType = RoadStyleTypeCount - 1u;
+
+[[nodiscard]] inline constexpr std::uint32_t RoadStyleIndexFromType(std::int32_t type) {
+    return type >= 0 && static_cast<std::uint32_t>(type) < RoadStyleFallbackType
+               ? static_cast<std::uint32_t>(type)
+               : RoadStyleFallbackType;
+}
+
 struct CHNode {
     std::uint64_t osmId = 0;
     double latitude = 0.0;

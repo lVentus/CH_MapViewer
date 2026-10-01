@@ -2,7 +2,10 @@
 
 #include <cstddef>
 #include <cstdint>
+#include "data/ch/CHTypes.h"
+
 #include <optional>
+#include <span>
 #include <string_view>
 
 namespace chmv::data {
@@ -10,6 +13,12 @@ class CHGraph;
 }
 
 namespace chmv::gpu::filtering {
+
+enum class PersistentStreamingRangeFilterKind : std::uint8_t {
+    Unsupported,
+    FullScan,
+    BirthOrdered,
+};
 
 struct RangeFilterInput {
     std::uint32_t graphEdgeBuffer = 0;
@@ -34,7 +43,12 @@ public:
     virtual ~IRangeFilterStrategy() = default;
 
     [[nodiscard]] virtual std::string_view Name() const = 0;
+    [[nodiscard]] virtual bool SupportsStreamingWorkingSet() const { return false; }
+    [[nodiscard]] virtual PersistentStreamingRangeFilterKind PersistentStreamingKind() const {
+        return PersistentStreamingRangeFilterKind::Unsupported;
+    }
     virtual void SetGraph(const data::CHGraph& graph) = 0;
+    virtual void SetStreamingRanges(std::span<const data::EdgeRange>) {}
     virtual void Reset() {}
     [[nodiscard]] virtual RangeFilterExecutionStats Execute(const RangeFilterInput& input) = 0;
     [[nodiscard]] virtual RangeFilterDiagnostics ReadBackDiagnostics(std::int32_t) const {

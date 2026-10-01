@@ -9,11 +9,13 @@ public:
     void SetLevelRange(std::int32_t minLevel, std::int32_t maxLevel);
     void SetAutomatic(bool automatic) { automatic_ = automatic; }
     void SetManualLevel(std::int32_t level);
+    void SetOverviewZoom(float zoom);
 
     [[nodiscard]] bool Automatic() const { return automatic_; }
     [[nodiscard]] std::int32_t ManualLevel() const { return manualLevel_; }
     [[nodiscard]] std::int32_t MinLevel() const { return minLevel_; }
     [[nodiscard]] std::int32_t MaxLevel() const { return maxLevel_; }
+    [[nodiscard]] float ContinuousLevel(float zoom) const;
     [[nodiscard]] std::int32_t Level(float zoom) const;
 
 private:
@@ -21,6 +23,7 @@ private:
     std::int32_t maxLevel_ = 0;
     std::int32_t manualLevel_ = 0;
     bool automatic_ = true;
+    float overviewZoom_ = 10.0f;
 };
 
 } // namespace chmv::renderer

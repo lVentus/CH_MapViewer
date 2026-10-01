@@ -1,0 +1,48 @@
+#version 450 core
+
+layout(local_size_x = 256) in;
+
+const uint CACHE_READY_FULL = 1u;
+const uint CACHE_ADAPTIVE_PARTIAL = 4u;
+const uint CACHE_ADAPTIVE_READY = 5u;
+const uint CACHE_STATE_MASK = 0xffu;
+const uint CACHE_BANK_SHIFT = 8u;
+const uint CACHE_BANK_COUNT = 8u;
+
+layout(std430, binding = 0) buffer RefinementHash { uvec4 cacheEntries[]; };
+layout(std430, binding = 1) buffer RefinementArenaMeta {
+    uint bankUsed[CACHE_BANK_COUNT];
+    uint bankOverflow[CACHE_BANK_COUNT];
+    uint cachedRootCount;
+};
+
+uniform uint uHashCapacity;
+uniform uint uTargetBank;
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    if (index >= uHashCapacity) {
+        return;
+    }
+
+    uint key = cacheEntries[index].x;
+    if (key == 0u) {
+        return;
+    }
+    uint packedState = cacheEntries[index].w;
+    uint state = packedState & CACHE_STATE_MASK;
+
+    // Retry-only keys (state 0) are safe to discard during maintenance and otherwise slowly fill
+    // the open-addressing table as the camera traverses new areas.
+    if (state == 0u) {
+        cacheEntries[index] = uvec4(0u);
+        return;
+    }
+
+    if ((state == CACHE_READY_FULL || state == CACHE_ADAPTIVE_PARTIAL ||
+         state == CACHE_ADAPTIVE_READY) &&
+        (packedState >> CACHE_BANK_SHIFT) == uTargetBank) {
+        cacheEntries[index] = uvec4(0u);
+        atomicAdd(cachedRootCount, 0xffffffffu);
+    }
+}

@@ -1,0 +1,68 @@
+#version 450 core
+
+layout(local_size_x = 256) in;
+
+struct RootRecord {
+    uint globalEdgeId;
+    int birthLevel;
+    int deathLevel;
+    uint boundsLo;
+    uint boundsHi;
+    uint padding0;
+    uint padding1;
+    uint padding2;
+    vec4 segment;
+};
+
+struct PageDescriptor {
+    uint offset;
+    uint count;
+    uint pageId;
+    uint padding;
+};
+
+layout(std430, binding = 0) readonly buffer RootRecords { RootRecord roots[]; };
+layout(std430, binding = 1) readonly buffer PageDescriptors { PageDescriptor pages[]; };
+// Visible roots contain persistent root-record indices, not global EdgeIDs. This lets the
+// range-only draw path use the self-contained endpoint stored with each resident root page;
+// backing blocks are only needed when hierarchy refinement actually traverses them.
+layout(std430, binding = 2) writeonly buffer VisibleRoots { uint visibleRoots[]; };
+layout(std430, binding = 3) buffer VisibleCounter { uint visibleCount; };
+
+uniform float uLevelFloat;
+uniform uint uOutputCapacity;
+uniform uint uCullMinX;
+uniform uint uCullMinY;
+uniform uint uCullMaxX;
+uniform uint uCullMaxY;
+
+bool intersectsCull(RootRecord root) {
+    uint minX = root.boundsLo & 0x3fffu;
+    uint minY = (root.boundsLo >> 16u) & 0x3fffu;
+    uint maxX = root.boundsHi & 0x3fffu;
+    uint maxY = (root.boundsHi >> 16u) & 0x3fffu;
+    return maxX >= uCullMinX && minX <= uCullMaxX &&
+           maxY >= uCullMinY && minY <= uCullMaxY;
+}
+
+void main() {
+    PageDescriptor page = pages[gl_WorkGroupID.x];
+    for (uint local = gl_LocalInvocationID.x; local < page.count; local += gl_WorkGroupSize.x) {
+        uint recordIndex = page.offset + local;
+        RootRecord root = roots[recordIndex];
+        if (root.birthLevel < 0 || root.deathLevel < 0 || !intersectsCull(root)) {
+            continue;
+        }
+        int lowLevel = int(floor(uLevelFloat));
+        int highLevel = int(ceil(uLevelFloat));
+        bool aliveLow = lowLevel <= root.birthLevel && lowLevel >= root.deathLevel;
+        bool aliveHigh = highLevel <= root.birthLevel && highLevel >= root.deathLevel;
+        if (!aliveLow && !aliveHigh) {
+            continue;
+        }
+        uint dst = atomicAdd(visibleCount, 1u);
+        if (dst < uOutputCapacity) {
+            visibleRoots[dst] = recordIndex;
+        }
+    }
+}

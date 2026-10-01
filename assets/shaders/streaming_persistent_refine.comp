@@ -1,0 +1,624 @@
+#version 450 core
+
+layout(local_size_x = 64) in;
+
+const uint INVALID_EDGE = 0xffffffffu;
+const uint CACHE_READY_FULL = 1u;
+const uint CACHE_BUILDING = 2u;
+const uint CACHE_UNCACHEABLE = 3u;
+const uint CACHE_ADAPTIVE_PARTIAL = 4u;
+const uint CACHE_ADAPTIVE_READY = 5u;
+const uint CACHE_STATE_MASK = 0xffu;
+const uint CACHE_BANK_SHIFT = 8u;
+const uint REFINEMENT_FULL = 1u;
+const uint REFINEMENT_ADAPTIVE = 2u;
+const int MAX_STACK = 128;
+const uint MAX_HASH_PROBES = 96u;
+const uint CACHE_BANK_COUNT = 8u;
+
+struct RootRecord {
+    uint globalEdgeId;
+    int birthLevel;
+    int deathLevel;
+    uint boundsLo;
+    uint boundsHi;
+    uint childA;
+    uint childB;
+    float geometryError;
+    vec4 segment;
+};
+
+layout(std430, binding = 0) readonly buffer BlockPageTable { uint blockSlots[]; };
+layout(std430, binding = 1) readonly buffer BlockChildren { uvec2 childPairs[]; };
+layout(std430, binding = 2) readonly buffer BlockEndpoints { vec4 endpoints[]; };
+layout(std430, binding = 3) readonly buffer VisibleRoots { uint visibleRoots[]; };
+layout(std430, binding = 4) readonly buffer VisibleCounter { uint visibleCount; };
+layout(std430, binding = 5) buffer RefinementHash { uvec4 cacheEntries[]; };
+// Full DFS stores one vec4 per final line. Adaptive uses two vec4 records per persistent frontier
+// node: [segment] [childA bits, childB bits, geometryError, 0]. Reusing this existing arena keeps the GPU hard
+// budget unchanged; Adaptive simply has half as many logical cached segments as Full DFS.
+layout(std430, binding = 6) buffer RefinedSegments { vec4 cachedSegments[]; };
+layout(std430, binding = 7) buffer RefinementArenaMeta {
+    uint bankUsed[CACHE_BANK_COUNT];
+    uint bankOverflow[CACHE_BANK_COUNT];
+    uint cachedRootCount;
+};
+layout(std430, binding = 8) buffer BlockRequests { uint requestWords[]; };
+layout(std430, binding = 9) buffer RefinementStats {
+    uint cacheHits;
+    uint cacheMisses;
+    uint stackOverflows;
+    uint hashOverflows;
+    uint admittedBlockRequests;
+};
+layout(std430, binding = 10) buffer BlockUseBits { uint useWords[]; };
+layout(std430, binding = 11) readonly buffer RootRecords { RootRecord roots[]; };
+layout(std430, binding = 12) readonly buffer BlockGeometryErrors { float geometryErrors[]; };
+layout(std430, binding = 13) readonly buffer BlockRoadTypes { uint roadTypeWords[]; };
+layout(std430, binding = 14) buffer RefinedRoadTypes { uint cachedRoadTypeWords[]; };
+
+uniform uint uEdgeCount;
+uniform uint uBlockRecordCount;
+uniform uint uBlockCount;
+uniform uint uHashMask;
+// Logical records per bank. In Adaptive mode every logical record occupies two vec4 slots.
+uniform uint uBankCapacity;
+uniform uint uWriteBank;
+uniform uint uRefinementMode;
+uniform float uScreenPixelScale;
+uniform float uMaxScreenErrorPixels;
+uniform uint uMaxAdaptiveBlockRequests;
+uniform uint uAdaptiveForceProgress;
+
+uint hashEdge(uint edgeId) {
+    uint x = edgeId + 1u;
+    x ^= x >> 16u;
+    x *= 0x7feb352du;
+    x ^= x >> 15u;
+    x *= 0x846ca68bu;
+    x ^= x >> 16u;
+    return x;
+}
+
+bool requestBlock(uint blockId) {
+    if (blockId >= uBlockCount) {
+        return false;
+    }
+
+    uint wordIndex = blockId >> 5u;
+    uint mask = 1u << (blockId & 31u);
+    uint previous = atomicOr(requestWords[wordIndex], mask);
+    if ((previous & mask) != 0u) {
+        return true;
+    }
+
+    if (uRefinementMode == REFINEMENT_ADAPTIVE) {
+        uint ticket = atomicAdd(admittedBlockRequests, 1u);
+        if (ticket >= uMaxAdaptiveBlockRequests) {
+            atomicAnd(requestWords[wordIndex], ~mask);
+            return false;
+        }
+    }
+    return true;
+}
+
+void requestEdgeBlock(uint edgeId) {
+    if (edgeId < uEdgeCount && uBlockRecordCount != 0u) {
+        requestBlock(edgeId / uBlockRecordCount);
+    }
+}
+
+void touchBlock(uint blockId) {
+    if (blockId < uBlockCount) {
+        atomicOr(useWords[blockId >> 5u], 1u << (blockId & 31u));
+    }
+}
+
+bool stopAtError(float geometryError) {
+    return uRefinementMode == REFINEMENT_ADAPTIVE &&
+           geometryError * uScreenPixelScale <= uMaxScreenErrorPixels;
+}
+
+uint rootRoadType(RootRecord root) {
+    uint metadata = ((root.boundsLo >> 14u) & 0x3u) |
+                    (((root.boundsLo >> 30u) & 0x3u) << 2u) |
+                    (((root.boundsHi >> 14u) & 0x3u) << 4u) |
+                    (((root.boundsHi >> 30u) & 0x3u) << 6u);
+    return (metadata & 0xc0u) == 0x80u ? (metadata & 0x3fu) : 0u;
+}
+
+uint packedRoadType(uint slot, uint local) {
+    uint wordsPerSlot = (uBlockRecordCount + 3u) >> 2u;
+    uint packed = roadTypeWords[slot * wordsPerSlot + (local >> 2u)];
+    return (packed >> ((local & 3u) * 8u)) & 0x3fu;
+}
+
+uint cachedRoadType(uint recordIndex) {
+    uint packed = cachedRoadTypeWords[recordIndex >> 2u];
+    return (packed >> ((recordIndex & 3u) * 8u)) & 0x3fu;
+}
+
+void storeCachedRoadType(uint recordIndex, uint roadType) {
+    uint wordIndex = recordIndex >> 2u;
+    uint shift = (recordIndex & 3u) * 8u;
+    uint mask = 0xffu << shift;
+    uint desiredBits = (roadType & 0x3fu) << shift;
+    uint oldValue = cachedRoadTypeWords[wordIndex];
+    for (;;) {
+        uint newValue = (oldValue & ~mask) | desiredBits;
+        uint observed = atomicCompSwap(cachedRoadTypeWords[wordIndex], oldValue, newValue);
+        if (observed == oldValue) {
+            return;
+        }
+        oldValue = observed;
+    }
+}
+
+bool resolveEdgeInternal(uint edgeId,
+                         bool requestOnMiss,
+                         out uvec2 children,
+                         out vec4 segment,
+                         out float geometryError,
+                         out uint roadType) {
+    if (edgeId >= uEdgeCount || uBlockRecordCount == 0u) {
+        children = uvec2(INVALID_EDGE);
+        segment = vec4(0.0);
+        geometryError = 0.0;
+        roadType = 0u;
+        return false;
+    }
+
+    uint blockId = edgeId / uBlockRecordCount;
+    uint slotPlusOne = blockSlots[blockId];
+    if (slotPlusOne == 0u) {
+        if (requestOnMiss) {
+            requestBlock(blockId);
+        }
+        children = uvec2(INVALID_EDGE);
+        segment = vec4(0.0);
+        geometryError = 0.0;
+        roadType = 0u;
+        return false;
+    }
+
+    touchBlock(blockId);
+    uint slot = slotPlusOne - 1u;
+    uint local = edgeId - blockId * uBlockRecordCount;
+    uint residentIndex = slot * uBlockRecordCount + local;
+    children = childPairs[residentIndex];
+    segment = endpoints[residentIndex];
+    geometryError = geometryErrors[residentIndex];
+    roadType = packedRoadType(slot, local);
+    return true;
+}
+
+bool resolveEdge(uint edgeId, out uvec2 children, out vec4 segment, out float geometryError,
+                 out uint roadType) {
+    return resolveEdgeInternal(edgeId, true, children, segment, geometryError, roadType);
+}
+
+bool resolveEdgeNoRequest(uint edgeId,
+                          out uvec2 children,
+                          out vec4 segment,
+                          out float geometryError,
+                          out uint roadType) {
+    return resolveEdgeInternal(edgeId, false, children, segment, geometryError, roadType);
+}
+
+bool adaptiveNodeCanSplit(uvec2 children, float geometryError) {
+    return children.x != INVALID_EDGE && children.y != INVALID_EDGE &&
+           !stopAtError(geometryError);
+}
+
+void storeAdaptiveNode(uint physicalBase, uint logicalIndex, vec4 segment,
+                       uvec2 children, float geometryError, uint roadType) {
+    uint physical = physicalBase + logicalIndex * 2u;
+    cachedSegments[physical] = segment;
+    cachedSegments[physical + 1u] =
+        vec4(uintBitsToFloat(children.x), uintBitsToFloat(children.y), geometryError, 0.0);
+    storeCachedRoadType(physical, roadType);
+}
+
+void loadAdaptiveNode(uint physicalBase, uint logicalIndex, out vec4 segment,
+                      out uvec2 children, out float geometryError, out uint roadType) {
+    uint physical = physicalBase + logicalIndex * 2u;
+    segment = cachedSegments[physical];
+    vec4 encoded = cachedSegments[physical + 1u];
+    children = uvec2(floatBitsToUint(encoded.x), floatBitsToUint(encoded.y));
+    geometryError = encoded.z;
+    roadType = cachedRoadType(physical);
+}
+
+uint findOrClaimCache(uint rootEdge) {
+    uint key = rootEdge + 1u;
+    uint start = hashEdge(rootEdge) & uHashMask;
+    for (uint attempt = 0u; attempt < 4u; ++attempt) {
+        uint firstEmpty = INVALID_EDGE;
+        for (uint probe = 0u; probe < MAX_HASH_PROBES; ++probe) {
+            uint index = (start + probe) & uHashMask;
+            uint existing = cacheEntries[index].x;
+            if (existing == key) {
+                return index;
+            }
+            if (existing == 0u && firstEmpty == INVALID_EDGE) {
+                firstEmpty = index;
+            }
+        }
+        if (firstEmpty == INVALID_EDGE) {
+            break;
+        }
+        uint oldKey = atomicCompSwap(cacheEntries[firstEmpty].x, 0u, key);
+        if (oldKey == 0u || oldKey == key) {
+            return firstEmpty;
+        }
+    }
+    atomicAdd(hashOverflows, 1u);
+    return INVALID_EDGE;
+}
+
+bool countLeavesFull(RootRecord root, out uint leafCount) {
+    leafCount = 0u;
+
+    bool rootShortcut = root.childA != INVALID_EDGE && root.childB != INVALID_EDGE;
+    if (!rootShortcut) {
+        leafCount = 1u;
+        return true;
+    }
+
+    uint stack[MAX_STACK];
+    int top = 0;
+    stack[top++] = root.childB;
+    stack[top++] = root.childA;
+    bool complete = true;
+
+    while (top > 0) {
+        uint edgeId = stack[--top];
+        uvec2 children;
+        vec4 segment;
+        float geometryError;
+        uint roadType;
+        if (!resolveEdge(edgeId, children, segment, geometryError, roadType)) {
+            complete = false;
+            continue;
+        }
+
+        bool shortcut = children.x != INVALID_EDGE && children.y != INVALID_EDGE;
+        if (!shortcut) {
+            ++leafCount;
+            continue;
+        }
+
+        if (top + 2 > MAX_STACK) {
+            atomicAdd(stackOverflows, 1u);
+            return false;
+        }
+        stack[top++] = children.y;
+        stack[top++] = children.x;
+    }
+    return complete;
+}
+
+uint reserveFullSegments(uint count) {
+    uint oldValue = bankUsed[uWriteBank];
+    for (;;) {
+        if (oldValue > uBankCapacity || count > uBankCapacity - oldValue) {
+            atomicAdd(bankOverflow[uWriteBank], 1u);
+            return INVALID_EDGE;
+        }
+        uint newValue = oldValue + count;
+        uint observed = atomicCompSwap(bankUsed[uWriteBank], oldValue, newValue);
+        if (observed == oldValue) {
+            return uWriteBank * uBankCapacity + oldValue;
+        }
+        oldValue = observed;
+    }
+}
+
+uint reserveAdaptiveNodes(uint count) {
+    uint oldValue = bankUsed[uWriteBank];
+    for (;;) {
+        if (oldValue > uBankCapacity || count > uBankCapacity - oldValue) {
+            atomicAdd(bankOverflow[uWriteBank], 1u);
+            return INVALID_EDGE;
+        }
+        uint newValue = oldValue + count;
+        uint observed = atomicCompSwap(bankUsed[uWriteBank], oldValue, newValue);
+        if (observed == oldValue) {
+            // Two vec4 records per logical Adaptive node.
+            return uWriteBank * (uBankCapacity * 2u) + oldValue * 2u;
+        }
+        oldValue = observed;
+    }
+}
+
+bool writeSegmentsFull(RootRecord root, uint outputOffset) {
+    bool rootShortcut = root.childA != INVALID_EDGE && root.childB != INVALID_EDGE;
+    if (!rootShortcut) {
+        cachedSegments[outputOffset] = root.segment;
+        storeCachedRoadType(outputOffset, rootRoadType(root));
+        return true;
+    }
+
+    uint stack[MAX_STACK];
+    int top = 0;
+    uint writeIndex = 0u;
+    stack[top++] = root.childB;
+    stack[top++] = root.childA;
+
+    while (top > 0) {
+        uint edgeId = stack[--top];
+        uvec2 children;
+        vec4 segment;
+        float geometryError;
+        uint roadType;
+        if (!resolveEdge(edgeId, children, segment, geometryError, roadType)) {
+            return false;
+        }
+
+        bool shortcut = children.x != INVALID_EDGE && children.y != INVALID_EDGE;
+        if (!shortcut) {
+            cachedSegments[outputOffset + writeIndex] = segment;
+            storeCachedRoadType(outputOffset + writeIndex, roadType);
+            ++writeIndex;
+            continue;
+        }
+
+        if (top + 2 > MAX_STACK) {
+            return false;
+        }
+        stack[top++] = children.y;
+        stack[top++] = children.x;
+    }
+    return true;
+}
+
+void discardClaim(uint cacheIndex) {
+    atomicExchange(cacheEntries[cacheIndex].w, 0u);
+    memoryBarrierBuffer();
+    atomicExchange(cacheEntries[cacheIndex].x, 0u);
+}
+
+// A persistent Adaptive frontier is the crucial difference from the previous wave implementation.
+// The old code restarted every retry from the root, so ALL ancestor tiles had to coexist in GPU
+// backing memory before a root could ever become drawable as refined geometry. Here every cached
+// node already contains the parent's straight segment plus its direct child ids. Once both children
+// are resident, that one node is atomically replaced by the two children in a new arena bank. The
+// parent/ancestor backing tile can then be evicted forever. Missing children leave the current
+// parent segment untouched, so refinement is visually progressive and crack-free.
+void progressAdaptive(RootRecord root,
+                      uint cacheIndex,
+                      uint previousPackedState,
+                      bool hadCachedApproximation) {
+    uint inputPhysicalOffset = hadCachedApproximation ? cacheEntries[cacheIndex].y : 0u;
+    uint inputCount = hadCachedApproximation ? cacheEntries[cacheIndex].z : 1u;
+
+    uint outputCount = 0u;
+    bool expandedAny = false;
+    bool outputComplete = true;
+
+    for (uint i = 0u; i < inputCount; ++i) {
+        vec4 segment;
+        uvec2 children;
+        float nodeError;
+        uint nodeRoadType;
+        if (hadCachedApproximation) {
+            loadAdaptiveNode(inputPhysicalOffset, i, segment, children, nodeError, nodeRoadType);
+        } else {
+            segment = root.segment;
+            children = uvec2(root.childA, root.childB);
+            nodeError = root.geometryError;
+            nodeRoadType = rootRoadType(root);
+        }
+
+        if (!adaptiveNodeCanSplit(children, nodeError)) {
+            ++outputCount;
+            continue;
+        }
+
+        uvec2 childrenA;
+        uvec2 childrenB;
+        vec4 segmentA;
+        vec4 segmentB;
+        float errorA;
+        float errorB;
+        uint roadTypeA;
+        uint roadTypeB;
+        bool readyA = resolveEdgeNoRequest(children.x, childrenA, segmentA, errorA, roadTypeA);
+        bool readyB = resolveEdgeNoRequest(children.y, childrenB, segmentB, errorB, roadTypeB);
+        if (readyA && readyB) {
+            outputCount += 2u;
+            expandedAny = true;
+            if (adaptiveNodeCanSplit(childrenA, errorA) ||
+                adaptiveNodeCanSplit(childrenB, errorB)) {
+                outputComplete = false;
+            }
+        } else {
+            if (!readyA) {
+                requestEdgeBlock(children.x);
+            }
+            if (!readyB) {
+                requestEdgeBlock(children.y);
+            }
+            ++outputCount;
+            outputComplete = false;
+        }
+    }
+
+    // Missing children never downgrade the visible result. Keep the already committed frontier
+    // byte-for-byte until at least one parent can be replaced by a complete child pair.
+    if (hadCachedApproximation && !expandedAny) {
+        // A finer committed scale may discover that a previously READY frontier needs children
+        // that are not resident yet. Keep drawing the same geometry but mark it PARTIAL so later
+        // frames retry from this exact frontier after the admitted I/O wave arrives.
+        if (outputComplete) {
+            atomicExchange(cacheEntries[cacheIndex].w, previousPackedState);
+        } else {
+            uint bankBits = previousPackedState & ~CACHE_STATE_MASK;
+            atomicExchange(cacheEntries[cacheIndex].w, CACHE_ADAPTIVE_PARTIAL | bankBits);
+        }
+        return;
+    }
+
+    if (outputCount == 0u || outputCount > uBankCapacity) {
+        if (hadCachedApproximation) {
+            atomicExchange(cacheEntries[cacheIndex].w, previousPackedState);
+        } else {
+            atomicExchange(cacheEntries[cacheIndex].w, CACHE_UNCACHEABLE);
+        }
+        return;
+    }
+
+    uint outputPhysicalOffset = reserveAdaptiveNodes(outputCount);
+    if (outputPhysicalOffset == INVALID_EDGE) {
+        if (hadCachedApproximation) {
+            atomicExchange(cacheEntries[cacheIndex].w, previousPackedState);
+        } else {
+            discardClaim(cacheIndex);
+        }
+        return;
+    }
+
+    uint writeIndex = 0u;
+    for (uint i = 0u; i < inputCount; ++i) {
+        vec4 segment;
+        uvec2 children;
+        float nodeError;
+        uint nodeRoadType;
+        if (hadCachedApproximation) {
+            loadAdaptiveNode(inputPhysicalOffset, i, segment, children, nodeError, nodeRoadType);
+        } else {
+            segment = root.segment;
+            children = uvec2(root.childA, root.childB);
+            nodeError = root.geometryError;
+            nodeRoadType = rootRoadType(root);
+        }
+
+        if (!adaptiveNodeCanSplit(children, nodeError)) {
+            // Preserve direct child ids + conservative error even when this node is currently fine
+            // enough. A later zoom-in can continue from exactly this frontier without returning to
+            // the root or rereading ancestors.
+            storeAdaptiveNode(outputPhysicalOffset, writeIndex++, segment, children, nodeError, nodeRoadType);
+            continue;
+        }
+
+        uvec2 childrenA;
+        uvec2 childrenB;
+        vec4 segmentA;
+        vec4 segmentB;
+        float errorA;
+        float errorB;
+        uint roadTypeA;
+        uint roadTypeB;
+        bool readyA = resolveEdgeNoRequest(children.x, childrenA, segmentA, errorA, roadTypeA);
+        bool readyB = resolveEdgeNoRequest(children.y, childrenB, segmentB, errorB, roadTypeB);
+        if (readyA && readyB) {
+            storeAdaptiveNode(outputPhysicalOffset, writeIndex++, segmentA, childrenA, errorA, roadTypeA);
+            storeAdaptiveNode(outputPhysicalOffset, writeIndex++, segmentB, childrenB, errorB, roadTypeB);
+        } else {
+            storeAdaptiveNode(outputPhysicalOffset, writeIndex++, segment, children, nodeError, nodeRoadType);
+        }
+    }
+
+    cacheEntries[cacheIndex].y = outputPhysicalOffset;
+    cacheEntries[cacheIndex].z = writeIndex;
+    memoryBarrierBuffer();
+    atomicExchange(cacheEntries[cacheIndex].w,
+                   (outputComplete ? CACHE_ADAPTIVE_READY : CACHE_ADAPTIVE_PARTIAL) |
+                       (uWriteBank << CACHE_BANK_SHIFT));
+    if (!hadCachedApproximation) {
+        atomicAdd(cachedRootCount, 1u);
+    }
+}
+
+void main() {
+    uint rootIndex = gl_GlobalInvocationID.x;
+    if (rootIndex >= visibleCount) {
+        return;
+    }
+
+    uint rootRecordIndex = visibleRoots[rootIndex];
+    RootRecord root = roots[rootRecordIndex];
+    uint rootEdge = root.globalEdgeId;
+    uint cacheIndex = findOrClaimCache(rootEdge);
+    if (cacheIndex == INVALID_EDGE) {
+        return;
+    }
+
+    uint packedState = cacheEntries[cacheIndex].w;
+    uint state = packedState & CACHE_STATE_MASK;
+
+    if (uRefinementMode == REFINEMENT_ADAPTIVE) {
+        if (state == CACHE_ADAPTIVE_READY) {
+            atomicAdd(cacheHits, 1u);
+            if (uAdaptiveForceProgress == 0u) {
+                return;
+            }
+            if (atomicCompSwap(cacheEntries[cacheIndex].w, packedState, CACHE_BUILDING) !=
+                packedState) {
+                return;
+            }
+            progressAdaptive(root, cacheIndex, packedState, true);
+            return;
+        }
+        if (state == CACHE_UNCACHEABLE || state == CACHE_BUILDING || state == CACHE_READY_FULL) {
+            return;
+        }
+        if (state == CACHE_ADAPTIVE_PARTIAL) {
+            if (atomicCompSwap(cacheEntries[cacheIndex].w, packedState, CACHE_BUILDING) !=
+                packedState) {
+                return;
+            }
+            atomicAdd(cacheHits, 1u);
+            progressAdaptive(root, cacheIndex, packedState, true);
+            return;
+        }
+        if (atomicCompSwap(cacheEntries[cacheIndex].w, 0u, CACHE_BUILDING) != 0u) {
+            return;
+        }
+        atomicAdd(cacheMisses, 1u);
+        progressAdaptive(root, cacheIndex, 0u, false);
+        return;
+    }
+
+    // Full DFS keeps its original all-or-nothing final geometry cache semantics.
+    if (state == CACHE_READY_FULL) {
+        atomicAdd(cacheHits, 1u);
+        return;
+    }
+    if (state == CACHE_UNCACHEABLE || state == CACHE_BUILDING ||
+        state == CACHE_ADAPTIVE_PARTIAL || state == CACHE_ADAPTIVE_READY) {
+        return;
+    }
+    if (atomicCompSwap(cacheEntries[cacheIndex].w, 0u, CACHE_BUILDING) != 0u) {
+        return;
+    }
+
+    atomicAdd(cacheMisses, 1u);
+    uint leafCount = 0u;
+    if (!countLeavesFull(root, leafCount)) {
+        atomicExchange(cacheEntries[cacheIndex].w, 0u);
+        return;
+    }
+
+    if (leafCount > uBankCapacity) {
+        atomicExchange(cacheEntries[cacheIndex].w, CACHE_UNCACHEABLE);
+        return;
+    }
+
+    uint offset = reserveFullSegments(leafCount);
+    if (offset == INVALID_EDGE) {
+        discardClaim(cacheIndex);
+        return;
+    }
+
+    if (!writeSegmentsFull(root, offset)) {
+        atomicExchange(cacheEntries[cacheIndex].w, 0u);
+        return;
+    }
+    cacheEntries[cacheIndex].y = offset;
+    cacheEntries[cacheIndex].z = leafCount;
+    memoryBarrierBuffer();
+    atomicExchange(cacheEntries[cacheIndex].w,
+                   CACHE_READY_FULL | (uWriteBank << CACHE_BANK_SHIFT));
+    atomicAdd(cachedRootCount, 1u);
+}

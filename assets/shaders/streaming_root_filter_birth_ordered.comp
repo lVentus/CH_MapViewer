@@ -1,0 +1,86 @@
+#version 450 core
+
+layout(local_size_x = 256) in;
+
+struct RootRecord {
+    uint globalEdgeId;
+    int birthLevel;
+    int deathLevel;
+    uint boundsLo;
+    uint boundsHi;
+    uint padding0;
+    uint padding1;
+    uint padding2;
+    vec4 segment;
+};
+
+struct PageDescriptor {
+    uint offset;
+    uint count;
+    uint pageId;
+    uint padding;
+};
+
+layout(std430, binding = 0) readonly buffer RootRecords { RootRecord roots[]; };
+layout(std430, binding = 1) readonly buffer PageDescriptors { PageDescriptor pages[]; };
+layout(std430, binding = 2) writeonly buffer VisibleRoots { uint visibleRoots[]; };
+layout(std430, binding = 3) buffer VisibleCounter { uint visibleCount; };
+
+uniform float uLevelFloat;
+uniform uint uOutputCapacity;
+uniform uint uCullMinX;
+uniform uint uCullMinY;
+uniform uint uCullMaxX;
+uniform uint uCullMaxY;
+
+shared uint candidateCount;
+
+bool intersectsCull(RootRecord root) {
+    uint minX = root.boundsLo & 0x3fffu;
+    uint minY = (root.boundsLo >> 16u) & 0x3fffu;
+    uint maxX = root.boundsHi & 0x3fffu;
+    uint maxY = (root.boundsHi >> 16u) & 0x3fffu;
+    return maxX >= uCullMinX && minX <= uCullMaxX &&
+           maxY >= uCullMinY && minY <= uCullMaxY;
+}
+
+void main() {
+    PageDescriptor page = pages[gl_WorkGroupID.x];
+    if (gl_LocalInvocationID.x == 0u) {
+        // ResidentGraphPage edges are stored by descending birth level. Find the first
+        // record whose birth is below the requested level entirely on GPU.
+        uint low = 0u;
+        uint high = page.count;
+        while (low < high) {
+            uint mid = low + (high - low) / 2u;
+            int lowLevel = int(floor(uLevelFloat));
+            if (roots[page.offset + mid].birthLevel >= lowLevel) {
+                low = mid + 1u;
+            } else {
+                high = mid;
+            }
+        }
+        candidateCount = low;
+    }
+    barrier();
+
+    for (uint local = gl_LocalInvocationID.x; local < candidateCount;
+         local += gl_WorkGroupSize.x) {
+        uint recordIndex = page.offset + local;
+        RootRecord root = roots[recordIndex];
+        if (root.deathLevel < 0 || !intersectsCull(root)) {
+            continue;
+        }
+        int lowLevel = int(floor(uLevelFloat));
+        int highLevel = int(ceil(uLevelFloat));
+        bool aliveLow = lowLevel <= root.birthLevel && lowLevel >= root.deathLevel;
+        bool aliveHigh = highLevel <= root.birthLevel && highLevel >= root.deathLevel;
+        if (!aliveLow && !aliveHigh) {
+            continue;
+        }
+        uint dst = atomicAdd(visibleCount, 1u);
+        if (dst < uOutputCapacity) {
+            visibleRoots[dst] = recordIndex;
+        }
+    }
+}

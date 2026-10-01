@@ -1,0 +1,80 @@
+#version 450 core
+
+layout(local_size_x = 256) in;
+
+const uint INVALID_EDGE = 0xffffffffu;
+
+struct StreamingEdgeLink {
+    uint globalEdgeId;
+    uint globalChildA;
+    uint globalChildB;
+    uint localChildA;
+    uint localChildB;
+    uint padding0;
+    uint padding1;
+    uint padding2;
+};
+
+layout(std430, binding = 0) readonly buffer StreamingLinks {
+    StreamingEdgeLink links[];
+};
+
+layout(std430, binding = 1) readonly buffer LeafEdges {
+    uint leafEdges[];
+};
+
+layout(std430, binding = 2) readonly buffer DrawCommand {
+    uint vertexCount;
+    uint instanceCount;
+    uint firstVertex;
+    uint baseInstance;
+};
+
+layout(std430, binding = 3) writeonly buffer Requests {
+    uvec2 requests[];
+};
+
+layout(std430, binding = 4) buffer RequestCounter {
+    uint requestCount;
+    uint droppedCount;
+};
+
+uniform uint uEdgeCapacity;
+uniform uint uRequestCapacity;
+
+void emitRequest(uint parentEdgeId, uint childEdgeId) {
+    if (parentEdgeId == INVALID_EDGE || childEdgeId == INVALID_EDGE) {
+        return;
+    }
+    uint index = atomicAdd(requestCount, 1u);
+    if (index < uRequestCapacity) {
+        requests[index] = uvec2(parentEdgeId, childEdgeId);
+    } else {
+        atomicAdd(droppedCount, 1u);
+    }
+}
+
+void main() {
+    uint leafIndex = gl_GlobalInvocationID.x;
+    uint leafCount = vertexCount / 2u;
+    if (leafIndex >= leafCount) {
+        return;
+    }
+
+    uint localEdge = leafEdges[leafIndex];
+    if (localEdge >= uEdgeCapacity) {
+        return;
+    }
+
+    StreamingEdgeLink link = links[localEdge];
+    if (link.globalChildA == INVALID_EDGE || link.globalChildB == INVALID_EDGE) {
+        return;
+    }
+
+    if (link.localChildA == INVALID_EDGE) {
+        emitRequest(link.globalEdgeId, link.globalChildA);
+    }
+    if (link.localChildB == INVALID_EDGE) {
+        emitRequest(link.globalEdgeId, link.globalChildB);
+    }
+}

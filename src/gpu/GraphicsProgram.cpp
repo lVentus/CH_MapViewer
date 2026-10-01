@@ -15,6 +15,12 @@ GraphicsProgram::GraphicsProgram(const std::filesystem::path& vertexShaderPath,
     Load(vertexShaderPath, fragmentShaderPath);
 }
 
+GraphicsProgram::GraphicsProgram(const std::filesystem::path& vertexShaderPath,
+                                 const std::filesystem::path& geometryShaderPath,
+                                 const std::filesystem::path& fragmentShaderPath) {
+    Load(vertexShaderPath, geometryShaderPath, fragmentShaderPath);
+}
+
 GraphicsProgram::~GraphicsProgram() {
     Reset();
 }
@@ -45,6 +51,41 @@ void GraphicsProgram::Load(const std::filesystem::path& vertexShaderPath,
     glLinkProgram(program_);
 
     glDeleteShader(vertexShader);
+    glDeleteShader(fragmentShader);
+
+    GLint linked = GL_FALSE;
+    glGetProgramiv(program_, GL_LINK_STATUS, &linked);
+    if (linked != GL_TRUE) {
+        GLint length = 0;
+        glGetProgramiv(program_, GL_INFO_LOG_LENGTH, &length);
+        std::vector<char> log(static_cast<std::size_t>(length));
+        glGetProgramInfoLog(program_, length, nullptr, log.data());
+        const auto message = std::string(log.data());
+        Reset();
+        throw std::runtime_error("graphics program link failed: " + message);
+    }
+}
+
+void GraphicsProgram::Load(const std::filesystem::path& vertexShaderPath,
+                           const std::filesystem::path& geometryShaderPath,
+                           const std::filesystem::path& fragmentShaderPath) {
+    Reset();
+
+    const auto vertexSource = ReadFile(vertexShaderPath);
+    const auto geometrySource = ReadFile(geometryShaderPath);
+    const auto fragmentSource = ReadFile(fragmentShaderPath);
+    const auto vertexShader = Compile(GL_VERTEX_SHADER, vertexSource);
+    const auto geometryShader = Compile(GL_GEOMETRY_SHADER, geometrySource);
+    const auto fragmentShader = Compile(GL_FRAGMENT_SHADER, fragmentSource);
+
+    program_ = glCreateProgram();
+    glAttachShader(program_, vertexShader);
+    glAttachShader(program_, geometryShader);
+    glAttachShader(program_, fragmentShader);
+    glLinkProgram(program_);
+
+    glDeleteShader(vertexShader);
+    glDeleteShader(geometryShader);
     glDeleteShader(fragmentShader);
 
     GLint linked = GL_FALSE;
