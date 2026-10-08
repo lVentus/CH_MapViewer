@@ -36,23 +36,54 @@ Traversal strategy and output management are kept separate. Atomic append and pr
 
 ### Linux
 
-Install a compiler, CMake, Ninja, OpenGL development files, and GLFW's X11 dependencies. On Ubuntu/Debian a typical setup is:
+The recommended Linux entry point is `build.sh`. It detects the distribution, makes sure the required system packages are installed, and then configures and builds the project with CMake + Ninja.
+
+For a Release build:
 
 ```bash
-sudo apt install build-essential cmake ninja-build libgl1-mesa-dev \
-    libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev
+./build.sh release
 ```
 
-Configure and build:
+For the default Debug build:
 
 ```bash
-cmake -S . -B build -G Ninja
-cmake --build build
+./build.sh
 ```
 
-CMake fetches GLFW, GLAD, and Dear ImGui during configuration.
+The script currently handles the main Linux paths as follows:
 
-Run the viewer and select a dataset from the Dear ImGui Dataset panel. During development, put uncompressed graph/range pairs under `assets/data/`, for example:
+- **NixOS / Nix shell:** uses the repository `flake.nix` through `nix develop`.
+- **Ubuntu / Debian and derivatives:** installs missing compiler, CMake/Ninja, OpenGL, X11, Wayland, Python/Jinja2 and Git packages with `apt-get`, then builds natively.
+- **Fedora / RHEL family:** installs the equivalent packages with `dnf`.
+- **Arch family:** installs the equivalent packages with `pacman`.
+- **openSUSE / SLES:** installs the equivalent packages with `zypper`.
+- On an otherwise unsupported distribution, the script falls back to `flake.nix` when Nix is available.
+
+System packages are only installed when they are missing. If installation requires elevated privileges, the script uses `sudo` (or runs the package manager directly when already root).
+
+The first full viewer configuration also needs Internet access because CMake fetches GLFW, GLAD and Dear ImGui from their upstream repositories.
+
+Other useful commands are:
+
+```bash
+./build.sh debug
+./build.sh rebuild
+./build.sh clean
+```
+
+The Linux viewer binary is written to:
+
+```text
+build-linux/CH_MapViewer
+```
+
+Run it with:
+
+```bash
+./build-linux/CH_MapViewer
+```
+
+During development, put uncompressed graph/range pairs under `assets/data/`, for example:
 
 ```text
 assets/data/bw/bw.sch
@@ -62,7 +93,27 @@ assets/data/bw/bw.sch.ranges
 Subdirectories are scanned recursively. Command-line graph/range paths are still supported when needed:
 
 ```bash
-./build/CH_MapViewer /path/to/bw.sch /path/to/bw.sch.ranges
+./build-linux/CH_MapViewer /path/to/bw.sch /path/to/bw.sch.ranges
+```
+
+For CI or a non-graphics/core-only build, the script also forwards the existing CMake options through environment variables:
+
+```bash
+CHMV_BUILD_APP=OFF ./build.sh release
+CHMV_BUILD_TESTS=OFF ./build.sh release
+```
+
+If you prefer to configure manually on Ubuntu/Debian, the equivalent full dependency set is:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y build-essential cmake ninja-build git pkg-config \
+    python3 python3-jinja2 libgl1-mesa-dev \
+    libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev \
+    libwayland-dev wayland-protocols libxkbcommon-dev
+
+cmake -S . -B build-linux -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build-linux --parallel
 ```
 
 ### Windows
