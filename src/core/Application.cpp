@@ -993,6 +993,11 @@ int Application::Run() {
             streamingStats->gpuRootCacheAllocationFailures =
                 persistent.rootCacheAllocationFailures;
             streamingStats->gpuBackingBlockEvictions = persistent.backingBlockEvictions;
+            streamingStats->gpuBackingBlockFirstUploads = persistent.backingBlockFirstUploads;
+            streamingStats->gpuBackingBlockReuploadsAfterEviction =
+                persistent.backingBlockReuploadsAfterEviction;
+            streamingStats->gpuBackingGraceFallbackEvictions =
+                persistent.backingGraceFallbackEvictions;
             streamingStats->gpuBackingCacheAllocationFailures =
                 persistent.backingCacheAllocationFailures;
             streamingStats->gpuBackingBlocksTouchedLastReadback =

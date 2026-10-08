@@ -219,6 +219,21 @@ struct GraphPageStreamingStats {
     std::uint64_t totalRefinementBlockEvictions = 0;
     std::uint64_t totalPageLoads = 0;
     std::uint64_t totalEvictions = 0;
+    // Root-page residency/I/O diagnostics. These counters make duplicate suppression,
+    // reload thrash and physical RootPayload batching visible without touching preprocess data.
+    std::uint64_t uniquePageLoads = 0;
+    std::uint64_t pageReloadsAfterEviction = 0;
+    std::uint64_t pageInFlightReuses = 0;
+    std::uint64_t pageQueueReprioritizations = 0;
+    std::uint64_t stalePageQueueEntriesSkipped = 0;
+    std::uint64_t stalePageLoadsDiscarded = 0;
+    std::uint64_t rootIoReadOperations = 0;
+    std::uint64_t rootIoBatchedReadOperations = 0;
+    std::uint64_t rootIoPagesRead = 0;
+    std::uint64_t rootIoBytesRead = 0;
+    double rootIoReadMilliseconds = 0.0;
+    std::uint32_t maxRootIoBatchPages = 0;
+    std::uint32_t recentlyDesiredResidentPageCount = 0;
     std::uint64_t pageCacheHits = 0;
     std::uint64_t pageCacheMisses = 0;
     std::uint64_t refinementBlockCacheHits = 0;
@@ -277,6 +292,9 @@ struct GraphPageStreamingStats {
     std::uint64_t gpuRootPageEvictions = 0;
     std::uint64_t gpuRootCacheAllocationFailures = 0;
     std::uint64_t gpuBackingBlockEvictions = 0;
+    std::uint64_t gpuBackingBlockFirstUploads = 0;
+    std::uint64_t gpuBackingBlockReuploadsAfterEviction = 0;
+    std::uint64_t gpuBackingGraceFallbackEvictions = 0;
     std::uint64_t gpuBackingCacheAllocationFailures = 0;
     std::uint32_t gpuBackingBlocksTouchedLastReadback = 0;
     std::uint64_t gpuIncrementalRootBytesUploaded = 0;
@@ -364,6 +382,12 @@ private:
         bool loadedFromSource = false;
     };
 
+    struct RootPageBatchLoadResult {
+        std::vector<ResidentGraphPage> pages;
+        std::uint64_t bytesRead = 0;
+        double ioMilliseconds = 0.0;
+    };
+
     struct NodeBlockCacheEntry {
         std::shared_ptr<const DecodedNodeBlock> block;
         std::uint64_t lastUse = 0;
@@ -401,6 +425,9 @@ private:
     struct CacheEntry {
         std::shared_ptr<ResidentGraphPage> page;
         std::uint64_t lastUse = 0;
+        // Last view generation that still wanted this page. Eviction gives recently-left
+        // pages a short grace period so small pan/zoom reversals do not immediately reread them.
+        std::uint64_t lastDesiredGeneration = 0;
         bool pinned = false;
     };
 
@@ -463,6 +490,8 @@ private:
         std::uint32_t pageId, std::ifstream& indexStream,
         analysis::detail::TextSourceScanner& graphScanner,
         analysis::detail::TextSourceScanner& rangeScanner);
+    [[nodiscard]] RootPageBatchLoadResult LoadRootPageBatch(
+        std::span<const std::uint32_t> pageIds, std::ifstream& indexStream);
     [[nodiscard]] ResidentRefinementBlock LoadRefinementBlock(
         std::uint32_t blockId, analysis::detail::TextSourceScanner& graphScanner);
     [[nodiscard]] std::uint64_t RefinementTileByteOffset(
@@ -486,6 +515,9 @@ private:
     // precomputed spatial bounds is O(alive-pages), not O(all 10M+ spatial refs). At local/detail
     // scales the fixed-grid lookup remains cheaper and is evaluated once then masked by LOD.
     std::vector<PageSpatialBounds> pageSpatialBounds_;
+    // One byte per logical root page is enough to distinguish first load from a reload after
+    // eviction. Even EUR has only tens of thousands of root pages, so this is negligible.
+    std::vector<std::uint8_t> pageEverLoaded_;
     std::vector<std::uint64_t> lodAlivePageBits_;
     std::vector<std::uint32_t> lodAlivePageCounts_;
     std::size_t lodAliveWordsPerLevel_ = 0;
@@ -586,6 +618,18 @@ private:
     std::uint64_t totalRefinementBlockEvictions_ = 0;
     std::uint64_t totalPageLoads_ = 0;
     std::uint64_t totalEvictions_ = 0;
+    std::uint64_t uniquePageLoads_ = 0;
+    std::uint64_t pageReloadsAfterEviction_ = 0;
+    std::uint64_t pageInFlightReuses_ = 0;
+    std::uint64_t pageQueueReprioritizations_ = 0;
+    std::uint64_t stalePageQueueEntriesSkipped_ = 0;
+    std::uint64_t stalePageLoadsDiscarded_ = 0;
+    std::uint64_t rootIoReadOperations_ = 0;
+    std::uint64_t rootIoBatchedReadOperations_ = 0;
+    std::uint64_t rootIoPagesRead_ = 0;
+    std::uint64_t rootIoBytesRead_ = 0;
+    double rootIoReadMilliseconds_ = 0.0;
+    std::uint32_t maxRootIoBatchPages_ = 0;
     std::uint64_t pageCacheHits_ = 0;
     std::uint64_t pageCacheMisses_ = 0;
     std::uint64_t refinementBlockCacheHits_ = 0;

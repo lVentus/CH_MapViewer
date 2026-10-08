@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <bit>
 #include <cmath>
+#include <cstddef>
 #include <fstream>
 #include <functional>
 #include <limits>
@@ -28,6 +29,14 @@ using analysis::detail::TextSourceScanner;
 constexpr double kPi = 3.14159265358979323846;
 constexpr std::uint64_t kMiB = 1024ull * 1024ull;
 constexpr std::uint64_t kGiB = 1024ull * kMiB;
+// RootPayload pages are dense in CHIDX. Workers opportunistically coalesce adjacent queued
+// pages into one physical read; the caps keep each batch small enough to preserve priority
+// responsiveness and bound transient copy memory.
+constexpr std::size_t kMaxRootIoBatchPages = 16u;
+constexpr std::uint64_t kMaxRootIoBatchBytes = 4ull * kMiB;
+// Two view generations of grace are enough to absorb small pan/zoom reversals without turning
+// RAM into a second permanent copy of the dataset. Under hard pressure grace can still be broken.
+constexpr std::uint64_t kEvictionHysteresisGenerations = 2u;
 
 std::uint32_t DecodeChild(std::int64_t value) {
     if (value < 0) {
@@ -319,6 +328,7 @@ GraphPageStreamer::GraphPageStreamer(index::CHIndexData index,
     // more selective dimension (LOD-first or spatial-first) without changing CHIDX/preprocess.
     const auto pageCount = index_.graphPages.size();
     pageSpatialBounds_.resize(pageCount);
+    pageEverLoaded_.assign(pageCount, 0u);
     const auto gridMax = index_.spatialGridSize == 0
                              ? std::uint64_t{0}
                              : static_cast<std::uint64_t>(index_.spatialGridSize) - 1u;
@@ -1030,6 +1040,7 @@ StreamingViewToken GraphPageStreamer::RequestView(const StreamingViewRequest& vi
         const auto found = cache_.find(pageId);
         if (found != cache_.end()) {
             found->second.lastUse = ++useCounter_;
+            found->second.lastDesiredGeneration = generation;
             if (changed) {
                 ++pageCacheHits_;
             }
@@ -1040,7 +1051,9 @@ StreamingViewToken GraphPageStreamer::RequestView(const StreamingViewRequest& vi
         }
 
         const bool alreadyInFlight = queuedPages_.contains(pageId) || loadingPages_.contains(pageId);
-        if (changed && !alreadyInFlight) {
+        if (changed && alreadyInFlight) {
+            ++pageInFlightReuses_;
+        } else if (changed) {
             ++pageCacheMisses_;
         }
         if (selection.required) {
@@ -1275,6 +1288,24 @@ GraphPageStreamingStats GraphPageStreamer::Snapshot() const {
     }
     stats.totalPageLoads = totalPageLoads_;
     stats.totalEvictions = totalEvictions_;
+    stats.uniquePageLoads = uniquePageLoads_;
+    stats.pageReloadsAfterEviction = pageReloadsAfterEviction_;
+    stats.pageInFlightReuses = pageInFlightReuses_;
+    stats.pageQueueReprioritizations = pageQueueReprioritizations_;
+    stats.stalePageQueueEntriesSkipped = stalePageQueueEntriesSkipped_;
+    stats.stalePageLoadsDiscarded = stalePageLoadsDiscarded_;
+    stats.rootIoReadOperations = rootIoReadOperations_;
+    stats.rootIoBatchedReadOperations = rootIoBatchedReadOperations_;
+    stats.rootIoPagesRead = rootIoPagesRead_;
+    stats.rootIoBytesRead = rootIoBytesRead_;
+    stats.rootIoReadMilliseconds = rootIoReadMilliseconds_;
+    stats.maxRootIoBatchPages = maxRootIoBatchPages_;
+    for (const auto& [pageId, entry] : cache_) {
+        if (!desiredPages_.contains(pageId) &&
+            generation_ <= entry.lastDesiredGeneration + kEvictionHysteresisGenerations) {
+            ++stats.recentlyDesiredResidentPageCount;
+        }
+    }
     stats.pageCacheHits = pageCacheHits_;
     stats.pageCacheMisses = pageCacheMisses_;
     stats.refinementBlockCacheHits = refinementBlockCacheHits_;
@@ -1452,6 +1483,7 @@ void GraphPageStreamer::QueuePageLocked(std::uint32_t pageId, std::uint32_t prio
         if (priority == found->second.priority) {
             return;
         }
+        ++pageQueueReprioritizations_;
     }
 
     const auto sequence = ++sequence_;
@@ -1541,10 +1573,16 @@ void GraphPageStreamer::Worker(std::stop_token stopToken) {
             throw std::runtime_error("could not open CH index for persistent root streaming");
         }
 
+        struct PageWork {
+            LoadRequest request{};
+            std::uint64_t estimate = 0;
+            bool required = false;
+        };
+
         while (!stopToken.stop_requested()) {
             LoadRequest request;
-            std::uint64_t estimate = 0;
-            bool requiredRoot = false;
+            std::uint64_t refinementEstimate = 0;
+            std::vector<PageWork> pageWork;
             {
                 std::unique_lock lock(mutex_);
                 condition_.wait(lock, stopToken, [&]() { return !queue_.empty(); });
@@ -1557,16 +1595,86 @@ void GraphPageStreamer::Worker(std::stop_token stopToken) {
                 if (request.kind == LoadKind::GraphPage) {
                     const auto queued = queuedPages_.find(request.id);
                     if (queued == queuedPages_.end() || queued->second.sequence != request.sequence) {
+                        ++stalePageQueueEntriesSkipped_;
                         continue; // stale heap record from cancellation/reprioritization
                     }
                     queuedPages_.erase(queued);
                     if (cache_.contains(request.id) || loadingPages_.contains(request.id) ||
                         !desiredPages_.contains(request.id)) {
+                        ++stalePageQueueEntriesSkipped_;
                         continue;
                     }
+
+                    const bool requiredRoot = requiredPages_.contains(request.id);
+                    const auto estimate = EstimatePageBytes(request.id);
                     loadingPages_.insert(request.id);
-                    requiredRoot = requiredPages_.contains(request.id);
-                    estimate = EstimatePageBytes(request.id);
+                    if (!ReserveForLoadLocked(estimate, requiredRoot)) {
+                        loadingPages_.erase(request.id);
+                        ++budgetRejectedLoads_;
+                        UpdateDemandReadyLocked();
+                        condition_.notify_all();
+                        continue;
+                    }
+                    pageWork.push_back({request, estimate, requiredRoot});
+
+                    // CHIDX RootPayload is one dense physical record stream. Once a worker owns a
+                    // queued page, opportunistically claim directly-following pages of the same
+                    // priority class and issue one contiguous read. Old heap records are left in
+                    // place and later rejected by the queuedPages_ sequence/state check.
+                    if (index_.HasRootPayload()) {
+                        auto batchBytes = static_cast<std::uint64_t>(
+                            index_.graphPages[request.id].edgeCount) *
+                            sizeof(index::CHIndexRootRecord);
+                        while (pageWork.size() < kMaxRootIoBatchPages) {
+                            const auto previousId = pageWork.back().request.id;
+                            if (previousId == std::numeric_limits<std::uint32_t>::max()) {
+                                break;
+                            }
+                            const auto nextId = previousId + 1u;
+                            if (nextId >= index_.graphPages.size()) {
+                                break;
+                            }
+                            auto nextQueued = queuedPages_.find(nextId);
+                            if (nextQueued == queuedPages_.end()) {
+                                break;
+                            }
+                            const auto nextState = nextQueued->second;
+                            if (nextState.priority != request.priority ||
+                                requiredPages_.contains(nextId) != requiredRoot ||
+                                cache_.contains(nextId) || loadingPages_.contains(nextId) ||
+                                !desiredPages_.contains(nextId)) {
+                                break;
+                            }
+
+                            const auto& previousDesc = index_.graphPages[previousId];
+                            const auto& nextDesc = index_.graphPages[nextId];
+                            if (previousDesc.rootPayloadRecordOffset + previousDesc.edgeCount !=
+                                nextDesc.rootPayloadRecordOffset) {
+                                break;
+                            }
+                            const auto nextPhysicalBytes = static_cast<std::uint64_t>(
+                                nextDesc.edgeCount) * sizeof(index::CHIndexRootRecord);
+                            if (batchBytes + nextPhysicalBytes > kMaxRootIoBatchBytes) {
+                                break;
+                            }
+
+                            const auto nextEstimate = EstimatePageBytes(nextId);
+                            if (!ReserveForLoadLocked(nextEstimate, requiredRoot)) {
+                                break;
+                            }
+                            const LoadRequest nextRequest{
+                                LoadKind::GraphPage,
+                                nextId,
+                                nextState.priority,
+                                nextState.generation,
+                                nextState.sequence,
+                            };
+                            queuedPages_.erase(nextQueued);
+                            loadingPages_.insert(nextId);
+                            pageWork.push_back({nextRequest, nextEstimate, requiredRoot});
+                            batchBytes += nextPhysicalBytes;
+                        }
+                    }
                 } else {
                     queuedRefinementBlocks_.erase(request.id);
                     if (refinementCache_.contains(request.id) ||
@@ -1577,79 +1685,115 @@ void GraphPageStreamer::Worker(std::stop_token stopToken) {
                         continue;
                     }
                     loadingRefinementBlocks_.insert(request.id);
-                    estimate = EstimateRefinementBlockBytes(request.id);
-                }
-
-                if (!ReserveForLoadLocked(estimate, requiredRoot)) {
-                    if (request.kind == LoadKind::GraphPage) {
-                        loadingPages_.erase(request.id);
-                    } else {
+                    refinementEstimate = EstimateRefinementBlockBytes(request.id);
+                    if (!ReserveForLoadLocked(refinementEstimate, false)) {
                         loadingRefinementBlocks_.erase(request.id);
+                        ++budgetRejectedLoads_;
+                        UpdateDemandReadyLocked();
+                        condition_.notify_all();
+                        continue;
                     }
-                    ++budgetRejectedLoads_;
-                    UpdateDemandReadyLocked();
-                    condition_.notify_all();
-                    continue;
                 }
             }
 
             try {
                 if (request.kind == LoadKind::GraphPage) {
-                    auto page = std::make_shared<ResidentGraphPage>(
-                        LoadPage(request.id, indexStream, graphScanner, rangeScanner));
+                    std::vector<ResidentGraphPage> loadedPages;
+                    RootPageBatchLoadResult rootBatch;
+                    if (index_.HasRootPayload()) {
+                        std::vector<std::uint32_t> pageIds;
+                        pageIds.reserve(pageWork.size());
+                        for (const auto& work : pageWork) {
+                            pageIds.push_back(work.request.id);
+                        }
+                        rootBatch = LoadRootPageBatch(pageIds, indexStream);
+                        loadedPages = std::move(rootBatch.pages);
+                    } else {
+                        loadedPages.push_back(
+                            LoadPage(pageWork.front().request.id, indexStream,
+                                     graphScanner, rangeScanner));
+                    }
+
+                    if (loadedPages.size() != pageWork.size()) {
+                        throw std::runtime_error("root page batch result count mismatch");
+                    }
+
                     std::unique_lock lock(mutex_);
-                    ReleaseReservationLocked(estimate);
-                    loadingPages_.erase(request.id);
-
-                    if (!desiredPages_.contains(request.id)) {
-                        UpdateDemandReadyLocked();
-                        condition_.notify_all();
-                        continue;
+                    if (index_.HasRootPayload()) {
+                        ++rootIoReadOperations_;
+                        rootIoPagesRead_ += loadedPages.size();
+                        rootIoBytesRead_ += rootBatch.bytesRead;
+                        rootIoReadMilliseconds_ += rootBatch.ioMilliseconds;
+                        maxRootIoBatchPages_ = std::max<std::uint32_t>(
+                            maxRootIoBatchPages_, static_cast<std::uint32_t>(loadedPages.size()));
+                        if (loadedPages.size() > 1u) {
+                            ++rootIoBatchedReadOperations_;
+                        }
                     }
 
-                    if (page->memoryBytes > dataCacheBudgetBytes_) {
-                        ++budgetRejectedLoads_;
-                        lastError_ = "single graph page exceeds the RAM cache budget";
-                        UpdateDemandReadyLocked();
-                        condition_.notify_all();
-                        continue;
-                    }
-                    if (residentBytes_ + reservedLoadBytes_ + page->memoryBytes >
-                        dataCacheBudgetBytes_) {
-                        const auto target =
-                            dataCacheBudgetBytes_ - page->memoryBytes - reservedLoadBytes_;
-                        EvictToLocked(target);
-                    }
-                    if (residentBytes_ + reservedLoadBytes_ + page->memoryBytes >
-                        dataCacheBudgetBytes_) {
-                        ++budgetRejectedLoads_;
-                        UpdateDemandReadyLocked();
-                        condition_.notify_all();
-                        continue;
-                    }
+                    for (std::size_t i = 0; i < pageWork.size(); ++i) {
+                        const auto& work = pageWork[i];
+                        auto page = std::make_shared<ResidentGraphPage>(std::move(loadedPages[i]));
+                        ReleaseReservationLocked(work.estimate);
+                        loadingPages_.erase(work.request.id);
 
-                    // In the fixed-world grid spatialLevel 0 is the finest/base cell, not a
-                    // whole-dataset ancestor. Do not permanently pin those pages; current-view
-                    // demand and LRU are sufficient and keep the bounded cache fully reusable.
-                    constexpr bool pin = false;
-                    cache_[request.id] = {page, ++useCounter_, pin};
-                    residentBytes_ += page->memoryBytes;
-                    UpdatePeakCpuCacheBytes();
-                    ++totalPageLoads_;
-                    totalPageLoadMs_ += page->loadMilliseconds;
-                    lastPageLoadMs_ = page->loadMilliseconds;
-                    maxPageLoadMs_ = std::max(maxPageLoadMs_, page->loadMilliseconds);
-                    estimatedSourceBytesRead_ += page->estimatedSourceBytesRead;
-                    edgeSourceBlocksRead_ += page->edgeSourceBlocksRead;
-                    nodeSourceBlocksRead_ += page->nodeSourceBlocksRead;
-                    lastError_.clear();
+                        if (!desiredPages_.contains(work.request.id)) {
+                            ++stalePageLoadsDiscarded_;
+                            continue;
+                        }
+
+                        if (page->memoryBytes > dataCacheBudgetBytes_) {
+                            ++budgetRejectedLoads_;
+                            lastError_ = "single graph page exceeds the RAM cache budget";
+                            continue;
+                        }
+                        if (residentBytes_ + reservedLoadBytes_ + page->memoryBytes >
+                            dataCacheBudgetBytes_) {
+                            const auto committed = reservedLoadBytes_ + page->memoryBytes;
+                            const auto target = committed < dataCacheBudgetBytes_
+                                                    ? dataCacheBudgetBytes_ - committed
+                                                    : 0ull;
+                            EvictToLocked(target);
+                        }
+                        if (residentBytes_ + reservedLoadBytes_ + page->memoryBytes >
+                            dataCacheBudgetBytes_) {
+                            ++budgetRejectedLoads_;
+                            continue;
+                        }
+
+                        // In the fixed-world grid spatialLevel 0 is the finest/base cell, not a
+                        // whole-dataset ancestor. Do not permanently pin those pages; current-view
+                        // demand, grace generations and LRU keep the bounded cache reusable.
+                        constexpr bool pin = false;
+                        cache_[work.request.id] = {
+                            page, ++useCounter_, generation_, pin};
+                        residentBytes_ += page->memoryBytes;
+                        UpdatePeakCpuCacheBytes();
+                        ++totalPageLoads_;
+                        if (work.request.id < pageEverLoaded_.size() &&
+                            pageEverLoaded_[work.request.id] != 0u) {
+                            ++pageReloadsAfterEviction_;
+                        } else {
+                            ++uniquePageLoads_;
+                            if (work.request.id < pageEverLoaded_.size()) {
+                                pageEverLoaded_[work.request.id] = 1u;
+                            }
+                        }
+                        totalPageLoadMs_ += page->loadMilliseconds;
+                        lastPageLoadMs_ = page->loadMilliseconds;
+                        maxPageLoadMs_ = std::max(maxPageLoadMs_, page->loadMilliseconds);
+                        estimatedSourceBytesRead_ += page->estimatedSourceBytesRead;
+                        edgeSourceBlocksRead_ += page->edgeSourceBlocksRead;
+                        nodeSourceBlocksRead_ += page->nodeSourceBlocksRead;
+                        lastError_.clear();
+                    }
                     UpdateDemandReadyLocked();
                     condition_.notify_all();
                 } else {
                     auto block = std::make_shared<ResidentRefinementBlock>(
                         LoadRefinementBlock(request.id, graphScanner));
                     std::unique_lock lock(mutex_);
-                    ReleaseReservationLocked(estimate);
+                    ReleaseReservationLocked(refinementEstimate);
                     loadingRefinementBlocks_.erase(request.id);
 
                     if (!desiredRefinementBlocks_.contains(request.id)) {
@@ -1665,8 +1809,10 @@ void GraphPageStreamer::Worker(std::stop_token stopToken) {
                     }
                     if (residentBytes_ + reservedLoadBytes_ + block->memoryBytes >
                         dataCacheBudgetBytes_) {
-                        const auto target =
-                            dataCacheBudgetBytes_ - block->memoryBytes - reservedLoadBytes_;
+                        const auto committed = reservedLoadBytes_ + block->memoryBytes;
+                        const auto target = committed < dataCacheBudgetBytes_
+                                                ? dataCacheBudgetBytes_ - committed
+                                                : 0ull;
                         EvictToLocked(target);
                     }
                     if (residentBytes_ + reservedLoadBytes_ + block->memoryBytes >
@@ -1691,13 +1837,18 @@ void GraphPageStreamer::Worker(std::stop_token stopToken) {
                 }
             } catch (const std::exception& error) {
                 std::unique_lock lock(mutex_);
-                ReleaseReservationLocked(estimate);
                 if (request.kind == LoadKind::GraphPage) {
-                    loadingPages_.erase(request.id);
-                    if (request.generation == generation_ || desiredPages_.contains(request.id)) {
+                    bool stillRelevant = false;
+                    for (const auto& work : pageWork) {
+                        ReleaseReservationLocked(work.estimate);
+                        loadingPages_.erase(work.request.id);
+                        stillRelevant = stillRelevant || desiredPages_.contains(work.request.id);
+                    }
+                    if (stillRelevant) {
                         lastError_ = error.what();
                     }
                 } else {
+                    ReleaseReservationLocked(refinementEstimate);
                     loadingRefinementBlocks_.erase(request.id);
                     if (desiredRefinementBlocks_.contains(request.id)) {
                         lastError_ = error.what();
@@ -1713,6 +1864,107 @@ void GraphPageStreamer::Worker(std::stop_token stopToken) {
         currentDemandReady_ = false;
         condition_.notify_all();
     }
+}
+
+GraphPageStreamer::RootPageBatchLoadResult GraphPageStreamer::LoadRootPageBatch(
+    std::span<const std::uint32_t> pageIds, std::ifstream& indexStream) {
+    if (pageIds.empty()) {
+        throw std::runtime_error("root page batch is empty");
+    }
+    if (!index_.HasRootPayload()) {
+        throw std::runtime_error("root page batch requires CHIDX RootPayload");
+    }
+
+    const auto batchBegin = std::chrono::steady_clock::now();
+    const auto firstPageId = pageIds.front();
+    if (firstPageId >= index_.graphPages.size()) {
+        throw std::runtime_error("root page batch id out of range");
+    }
+    const auto firstRecord = index_.graphPages[firstPageId].rootPayloadRecordOffset;
+    std::uint64_t totalRecords = 0;
+    for (const auto pageId : pageIds) {
+        if (pageId >= index_.graphPages.size()) {
+            throw std::runtime_error("root page batch id out of range");
+        }
+        const auto& page = index_.graphPages[pageId];
+        if (page.rootPayloadRecordOffset != firstRecord + totalRecords) {
+            throw std::runtime_error("root page batch is not physically contiguous");
+        }
+        totalRecords += page.edgeCount;
+    }
+    if (totalRecords == 0u) {
+        throw std::runtime_error("root page batch contains no records");
+    }
+
+    const auto byteOffset = index_.rootPayloadSectionOffset +
+        firstRecord * sizeof(index::CHIndexRootRecord);
+    const auto byteCount = totalRecords * sizeof(index::CHIndexRootRecord);
+    if (byteOffset > static_cast<std::uint64_t>(std::numeric_limits<std::streamoff>::max()) ||
+        byteCount > static_cast<std::uint64_t>(std::numeric_limits<std::streamsize>::max())) {
+        throw std::runtime_error("root payload batch exceeds stream range");
+    }
+
+    std::vector<index::CHIndexRootRecord> records(static_cast<std::size_t>(totalRecords));
+    const auto ioBegin = std::chrono::steady_clock::now();
+    indexStream.clear();
+    indexStream.seekg(static_cast<std::streamoff>(byteOffset), std::ios::beg);
+    if (!indexStream) {
+        throw std::runtime_error("could not seek CH index RootPayload batch");
+    }
+    indexStream.read(reinterpret_cast<char*>(records.data()),
+                     static_cast<std::streamsize>(byteCount));
+    if (!indexStream) {
+        throw std::runtime_error("truncated CH index RootPayload batch");
+    }
+    const auto ioMilliseconds = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - ioBegin).count();
+
+    RootPageBatchLoadResult result;
+    result.bytesRead = byteCount;
+    result.ioMilliseconds = ioMilliseconds;
+    result.pages.reserve(pageIds.size());
+
+    std::size_t cursor = 0;
+    for (const auto pageId : pageIds) {
+        const auto& pageDesc = index_.graphPages[pageId];
+        const auto count = static_cast<std::size_t>(pageDesc.edgeCount);
+        ResidentGraphPage page;
+        page.pageId = pageId;
+        page.rootRecords.assign(records.begin() + static_cast<std::ptrdiff_t>(cursor),
+                                records.begin() + static_cast<std::ptrdiff_t>(cursor + count));
+        cursor += count;
+
+        if (page.rootRecords.empty()) {
+            throw std::runtime_error("runtime graph page root payload count is invalid");
+        }
+        for (const auto& record : page.rootRecords) {
+            if (record.globalEdgeId >= index_.edgeCount || record.birthLevel < 0 ||
+                record.deathLevel < 0 || record.deathLevel > record.birthLevel) {
+                throw std::runtime_error("runtime graph page root payload record is invalid");
+            }
+        }
+        std::sort(page.rootRecords.begin(), page.rootRecords.end(),
+                  [](const auto& a, const auto& b) {
+                      if (a.birthLevel != b.birthLevel) {
+                          return a.birthLevel > b.birthLevel;
+                      }
+                      return a.globalEdgeId < b.globalEdgeId;
+                  });
+        page.memoryBytes = sizeof(page) +
+                           page.rootRecords.capacity() * sizeof(index::CHIndexRootRecord);
+        page.estimatedSourceBytesRead =
+            page.rootRecords.size() * sizeof(index::CHIndexRootRecord);
+        result.pages.push_back(std::move(page));
+    }
+
+    const auto totalMilliseconds = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - batchBegin).count();
+    const auto perPageMilliseconds = totalMilliseconds /
+        static_cast<double>(std::max<std::size_t>(result.pages.size(), 1u));
+    for (auto& page : result.pages) {
+        page.loadMilliseconds = perPageMilliseconds;
+    }
+    return result;
 }
 
 ResidentGraphPage GraphPageStreamer::LoadPage(
@@ -2361,25 +2613,48 @@ void GraphPageStreamer::ReleaseReservationLocked(std::uint64_t bytes) {
 void GraphPageStreamer::EvictToLocked(std::uint64_t targetBytes, bool allowCurrentDemand) {
     while (residentBytes_ > targetBytes) {
         auto pageCandidate = cache_.end();
+        std::uint32_t pageCandidateRank = std::numeric_limits<std::uint32_t>::max();
         for (auto it = cache_.begin(); it != cache_.end(); ++it) {
             if (it->second.pinned ||
                 (!allowCurrentDemand && requiredPages_.contains(it->first))) {
                 continue;
             }
-            if (pageCandidate == cache_.end() ||
-                it->second.lastUse < pageCandidate->second.lastUse) {
+
+            // Eviction tiers: stale/outside grace first, recently-left pages second, current
+            // speculative/render residency third, and required pages only during an explicit hard
+            // budget shrink. This turns the old pure LRU into a small residency hysteresis without
+            // making any page permanently unevictable.
+            std::uint32_t rank = 0u;
+            if (requiredPages_.contains(it->first)) {
+                rank = 3u;
+            } else if (desiredPages_.contains(it->first)) {
+                rank = 2u;
+            } else if (generation_ <=
+                       it->second.lastDesiredGeneration + kEvictionHysteresisGenerations) {
+                rank = 1u;
+            }
+
+            if (pageCandidate == cache_.end() || rank < pageCandidateRank ||
+                (rank == pageCandidateRank &&
+                 it->second.lastUse < pageCandidate->second.lastUse)) {
                 pageCandidate = it;
+                pageCandidateRank = rank;
             }
         }
 
         auto refinementCandidate = refinementCache_.end();
+        std::uint32_t refinementCandidateRank = std::numeric_limits<std::uint32_t>::max();
         for (auto it = refinementCache_.begin(); it != refinementCache_.end(); ++it) {
             if (!allowCurrentDemand && desiredRefinementBlocks_.contains(it->first)) {
                 continue;
             }
+            const auto rank = desiredRefinementBlocks_.contains(it->first) ? 2u : 0u;
             if (refinementCandidate == refinementCache_.end() ||
-                it->second.lastUse < refinementCandidate->second.lastUse) {
+                rank < refinementCandidateRank ||
+                (rank == refinementCandidateRank &&
+                 it->second.lastUse < refinementCandidate->second.lastUse)) {
                 refinementCandidate = it;
+                refinementCandidateRank = rank;
             }
         }
 
@@ -2389,8 +2664,11 @@ void GraphPageStreamer::EvictToLocked(std::uint64_t targetBytes, bool allowCurre
             return;
         }
 
-        if (haveRefinement &&
-            (!havePage || refinementCandidate->second.lastUse < pageCandidate->second.lastUse)) {
+        const bool evictRefinement = haveRefinement &&
+            (!havePage || refinementCandidateRank < pageCandidateRank ||
+             (refinementCandidateRank == pageCandidateRank &&
+              refinementCandidate->second.lastUse < pageCandidate->second.lastUse));
+        if (evictRefinement) {
             residentBytes_ -= refinementCandidate->second.block->memoryBytes;
             refinementCache_.erase(refinementCandidate);
             ++totalRefinementBlockEvictions_;

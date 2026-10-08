@@ -67,6 +67,9 @@ struct PersistentStreamingStats {
     std::uint64_t rootPageEvictions = 0;
     std::uint64_t rootCacheAllocationFailures = 0;
     std::uint64_t backingBlockEvictions = 0;
+    std::uint64_t backingBlockFirstUploads = 0;
+    std::uint64_t backingBlockReuploadsAfterEviction = 0;
+    std::uint64_t backingGraceFallbackEvictions = 0;
     std::uint64_t backingCacheAllocationFailures = 0;
     std::uint32_t backingBlocksTouchedLastReadback = 0;
     std::uint64_t incrementalRootBytesUploaded = 0;
@@ -151,6 +154,9 @@ private:
     struct BackingSlot {
         std::uint32_t blockId = 0xffffffffu;
         std::uint64_t lastUse = 0;
+        // Newly uploaded blocks need a few frames before asynchronous GPU use readback can
+        // refresh lastUse. During this short window they are soft-protected from LRU eviction.
+        std::uint64_t uploadedFrame = 0;
     };
 
     [[nodiscard]] std::uint32_t AllocateRootRange(std::uint32_t count);
@@ -179,6 +185,11 @@ private:
     static constexpr std::uint32_t MaxLeafArenaCapacity = 1u << 22u;
     static constexpr std::uint32_t RefinementBankCount = 8u;
     static constexpr std::uint32_t RefinementBankReuseDelayFrames = 8u;
+    // Readback uses a 3-slot asynchronous ring. Four frames of upload grace prevents a newly
+    // installed backing block from being evicted before the first GPU-use feedback can arrive.
+    // This is deliberately soft: if every unpinned slot is still young, LRU falls back to the
+    // oldest young slot rather than failing an allocation.
+    static constexpr std::uint32_t BackingUploadGraceFrames = 4u;
     static constexpr std::size_t ReadbackRingSize = 3u;
 
     ComputeProgram fullScanFilterProgram_;
@@ -253,6 +264,9 @@ private:
     std::array<std::uint32_t, RefinementBankCount> latestRefinementBankOverflow_{};
     std::array<std::uint32_t, RefinementBankCount> latestRefinementBankLastUse_{};
     std::uint64_t useCounter_ = 0;
+    // Monotonic process-frame serial for backing upload grace. Unlike frameId_ this is not reset
+    // when the refinement geometry cache is reset, because backing residency survives that reset.
+    std::uint64_t backingFrameSerial_ = 1;
 
     std::vector<FreeRange> rootFreeRanges_;
     std::unordered_map<std::uint32_t, RootPageAllocation> rootPages_;
@@ -263,6 +277,10 @@ private:
     std::vector<std::uint32_t> freeBackingSlots_;
     std::unordered_map<std::uint32_t, std::uint32_t> backingBlockToSlot_;
     std::unordered_set<std::uint32_t> pinnedBackingBlocks_;
+    // One byte per physical backing block (~tens of KiB for current datasets). This is only
+    // diagnostic state and lets telemetry distinguish first uploads from true re-uploads after
+    // GPU eviction without keeping any extra edge payload resident.
+    std::vector<std::uint8_t> backingBlockEverUploaded_;
 
     PersistentStreamingStats stats_{};
 };

@@ -24,10 +24,15 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdio>
+#include <ctime>
 #include <fstream>
+#include <iomanip>
 #include <limits>
+#include <sstream>
 #include <stdexcept>
+#include <system_error>
 #include <vector>
 
 namespace chmv::ui {
@@ -43,6 +48,44 @@ const char* ProcessingModeName(pipeline::ProcessingMode mode) {
         return "Validation";
     }
     return "Unknown";
+}
+
+constexpr auto kOocTelemetryActiveSampleInterval = std::chrono::seconds(1);
+constexpr auto kOocTelemetryIdleSampleInterval = std::chrono::seconds(5);
+constexpr auto kOocTelemetryWriterFlushInterval = std::chrono::seconds(5);
+constexpr auto kOocTelemetryBurstIdleGrace = std::chrono::milliseconds(250);
+constexpr std::size_t kOocTelemetryWriterBatchBytes = 64u * 1024u;
+constexpr std::uint32_t kOocTelemetryBacklogHighWatermark = 128u;
+constexpr std::uint32_t kOocTelemetryBacklogLowWatermark = 32u;
+constexpr double kBytesPerMiB = 1024.0 * 1024.0;
+
+std::tm LocalTime(std::time_t value) {
+    std::tm result{};
+#if defined(_WIN32)
+    localtime_s(&result, &value);
+#else
+    localtime_r(&value, &result);
+#endif
+    return result;
+}
+
+std::string WallClockStamp(std::chrono::system_clock::time_point now, bool fileName) {
+    const auto wholeSeconds = std::chrono::time_point_cast<std::chrono::seconds>(now);
+    const auto milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(
+        now - wholeSeconds).count();
+    const auto timeValue = std::chrono::system_clock::to_time_t(now);
+    const auto local = LocalTime(timeValue);
+    std::ostringstream out;
+    out << std::put_time(&local, fileName ? "%Y-%m-%d_%H-%M-%S" : "%Y-%m-%d %H:%M:%S");
+    if (!fileName) {
+        out << '.' << std::setfill('0') << std::setw(3) << milliseconds;
+    }
+    return out.str();
+}
+
+template <class T>
+T CounterDelta(T current, T previous) {
+    return current >= previous ? current - previous : current;
 }
 
 const char* DatasetLoadPhaseName(data::DatasetLoadPhase phase) {
@@ -110,6 +153,7 @@ DebugUI::DebugUI(const core::Window& window) {
 }
 
 DebugUI::~DebugUI() {
+    StopOocTelemetry();
     if (roadTypeDiagnosticWorker_.joinable()) {
         roadTypeDiagnosticWorker_.request_stop();
         roadTypeDiagnosticWorker_.join();
@@ -117,6 +161,493 @@ DebugUI::~DebugUI() {
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();
     ImGui::DestroyContext();
+}
+
+DebugUI::OocTelemetryCounters DebugUI::CaptureOocTelemetryCounters(
+    const streaming::runtime::GraphPageStreamingStats& stats) {
+    OocTelemetryCounters counters;
+    counters.pageCacheHits = stats.pageCacheHits;
+    counters.pageCacheMisses = stats.pageCacheMisses;
+    counters.uniquePageLoads = stats.uniquePageLoads;
+    counters.pageReloadsAfterEviction = stats.pageReloadsAfterEviction;
+    counters.pageInFlightReuses = stats.pageInFlightReuses;
+    counters.pageQueueReprioritizations = stats.pageQueueReprioritizations;
+    counters.stalePageQueueEntriesSkipped = stats.stalePageQueueEntriesSkipped;
+    counters.stalePageLoadsDiscarded = stats.stalePageLoadsDiscarded;
+    counters.rootIoReadOperations = stats.rootIoReadOperations;
+    counters.rootIoBatchedReadOperations = stats.rootIoBatchedReadOperations;
+    counters.rootIoPagesRead = stats.rootIoPagesRead;
+    counters.rootIoBytesRead = stats.rootIoBytesRead;
+    counters.rootIoReadMilliseconds = stats.rootIoReadMilliseconds;
+    counters.totalEvictions = stats.totalEvictions;
+    counters.totalRefinementBlockLoads = stats.totalRefinementBlockLoads;
+    counters.totalRefinementBlockEvictions = stats.totalRefinementBlockEvictions;
+    counters.nodeBlockCacheHits = stats.nodeBlockCacheHits;
+    counters.nodeBlockCacheMisses = stats.nodeBlockCacheMisses;
+    counters.nodeBlockCacheEvictions = stats.nodeBlockCacheEvictions;
+    counters.rootPlannerRebuilds = stats.rootPlannerRebuilds;
+    counters.rootPlannerCacheReuses = stats.rootPlannerCacheReuses;
+    counters.gpuIncrementalRootBytesUploaded = stats.gpuIncrementalRootBytesUploaded;
+    counters.gpuIncrementalBackingBytesUploaded = stats.gpuIncrementalBackingBytesUploaded;
+    counters.gpuRootPageEvictions = stats.gpuRootPageEvictions;
+    counters.gpuBackingBlockEvictions = stats.gpuBackingBlockEvictions;
+    counters.gpuBackingBlockFirstUploads = stats.gpuBackingBlockFirstUploads;
+    counters.gpuBackingBlockReuploadsAfterEviction =
+        stats.gpuBackingBlockReuploadsAfterEviction;
+    counters.gpuBackingGraceFallbackEvictions = stats.gpuBackingGraceFallbackEvictions;
+    counters.gpuRootCacheAllocationFailures = stats.gpuRootCacheAllocationFailures;
+    counters.gpuBackingCacheAllocationFailures = stats.gpuBackingCacheAllocationFailures;
+    return counters;
+}
+
+void DebugUI::QueueOocTelemetryRecord(std::string payload,
+                                      std::chrono::steady_clock::time_point now) {
+    const auto elapsed = std::chrono::duration<double>(now - oocTelemetryStartTime_).count();
+    std::ostringstream line;
+    line << '[' << WallClockStamp(std::chrono::system_clock::now(), false) << ']'
+         << "[t=" << std::fixed << std::setprecision(3) << elapsed << "s] " << payload;
+
+    auto record = line.str();
+    bool wakeWriter = false;
+    {
+        std::lock_guard lock(oocTelemetryWriterMutex_);
+        oocTelemetryPendingBytes_ += record.size() + 1u;
+        oocTelemetryPendingLines_.push_back(std::move(record));
+        wakeWriter = oocTelemetryPendingBytes_ >= kOocTelemetryWriterBatchBytes;
+    }
+    if (wakeWriter) {
+        oocTelemetryWriterCondition_.notify_one();
+    }
+}
+
+void DebugUI::OocTelemetryWriterMain(std::stop_token stopToken, std::filesystem::path path) {
+    std::ofstream output(path, std::ios::app);
+    if (!output) {
+        return;
+    }
+
+    for (;;) {
+        std::deque<std::string> batch;
+        {
+            std::unique_lock lock(oocTelemetryWriterMutex_);
+            oocTelemetryWriterCondition_.wait_for(
+                lock, kOocTelemetryWriterFlushInterval, [&] {
+                    return stopToken.stop_requested() ||
+                           oocTelemetryPendingBytes_ >= kOocTelemetryWriterBatchBytes;
+                });
+            batch.swap(oocTelemetryPendingLines_);
+            oocTelemetryPendingBytes_ = 0u;
+        }
+
+        for (const auto& line : batch) {
+            output << line << '\n';
+        }
+        if (!batch.empty()) {
+            output.flush();
+        }
+
+        if (stopToken.stop_requested()) {
+            std::lock_guard lock(oocTelemetryWriterMutex_);
+            if (oocTelemetryPendingLines_.empty()) {
+                break;
+            }
+        }
+    }
+
+    std::deque<std::string> tail;
+    {
+        std::lock_guard lock(oocTelemetryWriterMutex_);
+        tail.swap(oocTelemetryPendingLines_);
+        oocTelemetryPendingBytes_ = 0u;
+    }
+    for (const auto& line : tail) {
+        output << line << '\n';
+    }
+    output.flush();
+}
+
+bool DebugUI::StartOocTelemetry(
+    const streaming::runtime::GraphPageStreamingStats& stats,
+    const renderer::MapCamera2D* camera) {
+    if (oocTelemetryEnabled_) {
+        return true;
+    }
+
+    oocTelemetryError_.clear();
+    oocTelemetryDeleteMessage_.clear();
+    std::error_code ec;
+    oocTelemetryDirectory_ = std::filesystem::current_path(ec) / "logs";
+    if (ec) {
+        oocTelemetryError_ = "Could not resolve current directory: " + ec.message();
+        return false;
+    }
+    std::filesystem::create_directories(oocTelemetryDirectory_, ec);
+    if (ec) {
+        oocTelemetryError_ = "Could not create log directory: " + ec.message();
+        return false;
+    }
+
+    const auto wallNow = std::chrono::system_clock::now();
+    const auto baseName = std::string("ooc_") + WallClockStamp(wallNow, true);
+    oocTelemetryCurrentPath_ = oocTelemetryDirectory_ / (baseName + ".log");
+    for (std::uint32_t suffix = 1u; std::filesystem::exists(oocTelemetryCurrentPath_, ec); ++suffix) {
+        ec.clear();
+        oocTelemetryCurrentPath_ =
+            oocTelemetryDirectory_ / (baseName + "_" + std::to_string(suffix) + ".log");
+    }
+
+    {
+        std::ofstream probe(oocTelemetryCurrentPath_, std::ios::trunc);
+        if (!probe) {
+            oocTelemetryError_ = "Could not create telemetry log: " +
+                                 oocTelemetryCurrentPath_.string();
+            return false;
+        }
+        probe << "# CH_MapViewer Out-of-Core telemetry\n"
+              << "# Active sampling: 1 s; idle heartbeat: 5 s; disk writes: background batches <= every 5 s\n"
+              << "# Per-page events are aggregated into counters; logging is disabled by default.\n"
+              << "# LOD changes are sampled, not emitted per level; backing first/re-upload counters diagnose GPU cache churn.\n";
+    }
+
+    {
+        std::lock_guard lock(oocTelemetryWriterMutex_);
+        oocTelemetryPendingLines_.clear();
+        oocTelemetryPendingBytes_ = 0u;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    oocTelemetryStartTime_ = now;
+    oocTelemetryLastSampleTime_ = now;
+    oocTelemetryLastReloadEventTime_ = now - std::chrono::seconds(2);
+    oocTelemetryBurstIdleSince_.reset();
+    oocTelemetryLastSampleCounters_ = CaptureOocTelemetryCounters(stats);
+    oocTelemetryBurstStartCounters_ = oocTelemetryLastSampleCounters_;
+    oocTelemetryLastObservedReloads_ = stats.pageReloadsAfterEviction;
+    oocTelemetryPendingReloadEvents_ = 0u;
+    oocTelemetryBurstActive_ = false;
+    oocTelemetryBacklogHigh_ = false;
+    oocTelemetryEnabled_ = true;
+
+    oocTelemetryWriter_ = std::jthread(
+        [this, path = oocTelemetryCurrentPath_](std::stop_token stopToken) {
+            OocTelemetryWriterMain(stopToken, path);
+        });
+
+    std::ostringstream start;
+    start << "EVENT SESSION_BEGIN"
+          << " targetLod=" << stats.targetLodLevel
+          << " displayLod=" << stats.displayLodLevel
+          << " residentPages=" << stats.residentPageCount
+          << " cpuCacheMiB=" << std::fixed << std::setprecision(2)
+          << static_cast<double>(stats.totalCpuCacheBytes) / kBytesPerMiB;
+    if (camera) {
+        start << " zoom=" << camera->ZoomFactor()
+              << " centerX=" << camera->CenterX()
+              << " centerY=" << camera->CenterY();
+    }
+    QueueOocTelemetryRecord(start.str(), now);
+    return true;
+}
+
+void DebugUI::StopOocTelemetry() {
+    if (!oocTelemetryEnabled_ && !oocTelemetryWriter_.joinable()) {
+        return;
+    }
+
+    if (oocTelemetryEnabled_) {
+        QueueOocTelemetryRecord("EVENT SESSION_END", std::chrono::steady_clock::now());
+    }
+    oocTelemetryEnabled_ = false;
+
+    if (oocTelemetryWriter_.joinable()) {
+        oocTelemetryWriter_.request_stop();
+        oocTelemetryWriterCondition_.notify_all();
+        oocTelemetryWriter_.join();
+    }
+}
+
+void DebugUI::DeleteOocTelemetryLogs() {
+    if (oocTelemetryEnabled_) {
+        oocTelemetryDeleteMessage_ = "Disable telemetry before deleting logs.";
+        return;
+    }
+
+    std::error_code ec;
+    auto directory = oocTelemetryDirectory_;
+    if (directory.empty()) {
+        directory = std::filesystem::current_path(ec) / "logs";
+    }
+    if (ec || !std::filesystem::exists(directory, ec)) {
+        oocTelemetryDeleteMessage_ = "No OOC telemetry logs found.";
+        return;
+    }
+
+    std::uint32_t removed = 0u;
+    for (std::filesystem::directory_iterator it(directory, ec), end; !ec && it != end;
+         it.increment(ec)) {
+        const auto path = it->path();
+        std::error_code entryEc;
+        if (!it->is_regular_file(entryEc)) {
+            continue;
+        }
+        const auto name = path.filename().string();
+        if (name.starts_with("ooc_") && path.extension() == ".log") {
+            std::filesystem::remove(path, ec);
+            if (!ec) {
+                ++removed;
+            } else {
+                break;
+            }
+        }
+    }
+
+    if (ec) {
+        oocTelemetryDeleteMessage_ = "Failed to delete logs: " + ec.message();
+    } else {
+        oocTelemetryDeleteMessage_ = "Deleted " + std::to_string(removed) + " OOC log(s).";
+        oocTelemetryCurrentPath_.clear();
+    }
+}
+
+void DebugUI::UpdateOocTelemetry(
+    const streaming::runtime::GraphPageStreamingStats& stats,
+    const renderer::MapCamera2D* camera) {
+    if (!oocTelemetryEnabled_) {
+        return;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    const auto current = CaptureOocTelemetryCounters(stats);
+
+    const bool countersReset =
+        current.pageCacheHits < oocTelemetryLastSampleCounters_.pageCacheHits ||
+        current.pageCacheMisses < oocTelemetryLastSampleCounters_.pageCacheMisses ||
+        current.uniquePageLoads < oocTelemetryLastSampleCounters_.uniquePageLoads ||
+        current.rootIoReadOperations < oocTelemetryLastSampleCounters_.rootIoReadOperations ||
+        current.gpuIncrementalRootBytesUploaded <
+            oocTelemetryLastSampleCounters_.gpuIncrementalRootBytesUploaded;
+    if (countersReset) {
+        QueueOocTelemetryRecord("EVENT COUNTERS_RESET streamer_or_dataset_replaced=1", now);
+        oocTelemetryLastSampleCounters_ = current;
+        oocTelemetryBurstStartCounters_ = current;
+        oocTelemetryLastObservedReloads_ = current.pageReloadsAfterEviction;
+        oocTelemetryPendingReloadEvents_ = 0u;
+        oocTelemetryLastSampleTime_ = now;
+        oocTelemetryBurstActive_ = false;
+        oocTelemetryBurstIdleSince_.reset();
+    }
+
+    const auto queued = stats.queuedPageCount + stats.queuedRefinementBlockCount;
+    const auto loading = stats.loadingPageCount + stats.loadingRefinementBlockCount;
+    const bool streamingActive = queued != 0u || loading != 0u ||
+                                 stats.lodTransitionPending || !stats.currentDemandReady;
+
+    if (streamingActive) {
+        oocTelemetryBurstIdleSince_.reset();
+        if (!oocTelemetryBurstActive_) {
+            oocTelemetryBurstActive_ = true;
+            oocTelemetryBurstStartTime_ = now;
+            oocTelemetryBurstStartCounters_ = current;
+            std::ostringstream event;
+            event << "EVENT STREAM_BURST_BEGIN queued=" << queued
+                  << " loading=" << loading
+                  << " targetLod=" << stats.targetLodLevel
+                  << " displayLod=" << stats.displayLodLevel;
+            QueueOocTelemetryRecord(event.str(), now);
+        }
+    } else if (oocTelemetryBurstActive_) {
+        if (!oocTelemetryBurstIdleSince_) {
+            oocTelemetryBurstIdleSince_ = now;
+        } else if (now - *oocTelemetryBurstIdleSince_ >= kOocTelemetryBurstIdleGrace) {
+            const auto duration =
+                std::chrono::duration<double>(now - oocTelemetryBurstStartTime_).count();
+            std::ostringstream event;
+            event << "EVENT STREAM_BURST_END durationSec=" << std::fixed
+                  << std::setprecision(3) << duration
+                  << " uniqueLoads="
+                  << CounterDelta(current.uniquePageLoads,
+                                  oocTelemetryBurstStartCounters_.uniquePageLoads)
+                  << " reads="
+                  << CounterDelta(current.rootIoReadOperations,
+                                  oocTelemetryBurstStartCounters_.rootIoReadOperations)
+                  << " pagesRead="
+                  << CounterDelta(current.rootIoPagesRead,
+                                  oocTelemetryBurstStartCounters_.rootIoPagesRead)
+                  << " reloads="
+                  << CounterDelta(current.pageReloadsAfterEviction,
+                                  oocTelemetryBurstStartCounters_.pageReloadsAfterEviction)
+                  << " evictions="
+                  << CounterDelta(current.totalEvictions,
+                                  oocTelemetryBurstStartCounters_.totalEvictions);
+            QueueOocTelemetryRecord(event.str(), now);
+            oocTelemetryBurstActive_ = false;
+            oocTelemetryBurstIdleSince_.reset();
+        }
+    }
+
+    if (!oocTelemetryBacklogHigh_ && queued >= kOocTelemetryBacklogHighWatermark) {
+        oocTelemetryBacklogHigh_ = true;
+        std::ostringstream event;
+        event << "EVENT QUEUE_BACKLOG_HIGH queued=" << queued
+              << " loading=" << loading;
+        QueueOocTelemetryRecord(event.str(), now);
+    } else if (oocTelemetryBacklogHigh_ && queued <= kOocTelemetryBacklogLowWatermark) {
+        oocTelemetryBacklogHigh_ = false;
+        std::ostringstream event;
+        event << "EVENT QUEUE_BACKLOG_RECOVER queued=" << queued
+              << " loading=" << loading;
+        QueueOocTelemetryRecord(event.str(), now);
+    }
+
+    if (current.pageReloadsAfterEviction < oocTelemetryLastObservedReloads_) {
+        oocTelemetryLastObservedReloads_ = current.pageReloadsAfterEviction;
+        oocTelemetryPendingReloadEvents_ = 0u;
+    } else if (current.pageReloadsAfterEviction > oocTelemetryLastObservedReloads_) {
+        oocTelemetryPendingReloadEvents_ +=
+            current.pageReloadsAfterEviction - oocTelemetryLastObservedReloads_;
+        oocTelemetryLastObservedReloads_ = current.pageReloadsAfterEviction;
+    }
+    if (oocTelemetryPendingReloadEvents_ != 0u &&
+        now - oocTelemetryLastReloadEventTime_ >= std::chrono::seconds(1)) {
+        std::ostringstream event;
+        event << "EVENT RELOAD_AFTER_EVICT_ACTIVITY count="
+              << oocTelemetryPendingReloadEvents_
+              << " total=" << current.pageReloadsAfterEviction;
+        QueueOocTelemetryRecord(event.str(), now);
+        oocTelemetryPendingReloadEvents_ = 0u;
+        oocTelemetryLastReloadEventTime_ = now;
+    }
+
+    const auto sampleInterval = streamingActive ? kOocTelemetryActiveSampleInterval
+                                                : kOocTelemetryIdleSampleInterval;
+    if (now - oocTelemetryLastSampleTime_ < sampleInterval) {
+        return;
+    }
+
+    const auto intervalSeconds =
+        std::max(std::chrono::duration<double>(now - oocTelemetryLastSampleTime_).count(), 1e-6);
+    const auto dHits = CounterDelta(current.pageCacheHits,
+                                    oocTelemetryLastSampleCounters_.pageCacheHits);
+    const auto dMisses = CounterDelta(current.pageCacheMisses,
+                                      oocTelemetryLastSampleCounters_.pageCacheMisses);
+    const auto dReads = CounterDelta(current.rootIoReadOperations,
+                                     oocTelemetryLastSampleCounters_.rootIoReadOperations);
+    const auto dBatchedReads = CounterDelta(
+        current.rootIoBatchedReadOperations,
+        oocTelemetryLastSampleCounters_.rootIoBatchedReadOperations);
+    const auto dPagesRead = CounterDelta(current.rootIoPagesRead,
+                                         oocTelemetryLastSampleCounters_.rootIoPagesRead);
+    const auto dBytesRead = CounterDelta(current.rootIoBytesRead,
+                                         oocTelemetryLastSampleCounters_.rootIoBytesRead);
+    const auto dIoMs = CounterDelta(current.rootIoReadMilliseconds,
+                                    oocTelemetryLastSampleCounters_.rootIoReadMilliseconds);
+    const auto dUploadRoot = CounterDelta(
+        current.gpuIncrementalRootBytesUploaded,
+        oocTelemetryLastSampleCounters_.gpuIncrementalRootBytesUploaded);
+    const auto dUploadBacking = CounterDelta(
+        current.gpuIncrementalBackingBytesUploaded,
+        oocTelemetryLastSampleCounters_.gpuIncrementalBackingBytesUploaded);
+    const auto readMiB = static_cast<double>(dBytesRead) / kBytesPerMiB;
+    const auto wallReadMiBps = readMiB / intervalSeconds;
+    const auto serviceReadMiBps = dIoMs > 0.0 ? readMiB * 1000.0 / dIoMs : 0.0;
+    const auto pagesPerRead = dReads != 0u
+                                  ? static_cast<double>(dPagesRead) /
+                                        static_cast<double>(dReads)
+                                  : 0.0;
+
+    std::ostringstream sample;
+    sample << "SAMPLE intervalSec=" << std::fixed << std::setprecision(3) << intervalSeconds
+           << " targetLod=" << stats.targetLodLevel
+           << " displayLod=" << stats.displayLodLevel
+           << " targetFloat=" << std::setprecision(2) << stats.targetLodLevelFloat
+           << " displayFloat=" << stats.displayLodLevelFloat;
+    if (camera) {
+        sample << " zoom=" << camera->ZoomFactor()
+               << " targetZoom=" << camera->TargetZoomFactor()
+               << " centerX=" << camera->CenterX()
+               << " centerY=" << camera->CenterY();
+    }
+    sample << " resident=" << stats.residentPageCount
+           << " desired=" << stats.desiredPageCount
+           << " required=" << stats.requiredPageCount
+           << " queued=" << stats.queuedPageCount
+           << " loading=" << stats.loadingPageCount
+           << " refinementResident=" << stats.residentRefinementBlockCount
+           << " refinementQueued=" << stats.queuedRefinementBlockCount
+           << " refinementLoading=" << stats.loadingRefinementBlockCount
+           << " cpuCacheMiB=" << std::setprecision(2)
+           << static_cast<double>(stats.totalCpuCacheBytes) / kBytesPerMiB
+           << " gpuMiB=" << static_cast<double>(stats.gpuAllocatedBytes) / kBytesPerMiB
+           << " hit=" << dHits
+           << " miss=" << dMisses
+           << " unique=" << CounterDelta(
+                  current.uniquePageLoads, oocTelemetryLastSampleCounters_.uniquePageLoads)
+           << " reuse=" << CounterDelta(
+                  current.pageInFlightReuses, oocTelemetryLastSampleCounters_.pageInFlightReuses)
+           << " reprio=" << CounterDelta(
+                  current.pageQueueReprioritizations,
+                  oocTelemetryLastSampleCounters_.pageQueueReprioritizations)
+           << " reads=" << dReads
+           << " batchedReads=" << dBatchedReads
+           << " pagesRead=" << dPagesRead
+           << " pagesPerRead=" << pagesPerRead
+           << " readMiB=" << readMiB
+           << " wallReadMiBps=" << wallReadMiBps
+           << " serviceReadMiBps=" << serviceReadMiBps
+           << " evict=" << CounterDelta(
+                  current.totalEvictions, oocTelemetryLastSampleCounters_.totalEvictions)
+           << " reload=" << CounterDelta(
+                  current.pageReloadsAfterEviction,
+                  oocTelemetryLastSampleCounters_.pageReloadsAfterEviction)
+           << " staleQueue=" << CounterDelta(
+                  current.stalePageQueueEntriesSkipped,
+                  oocTelemetryLastSampleCounters_.stalePageQueueEntriesSkipped)
+           << " staleIo=" << CounterDelta(
+                  current.stalePageLoadsDiscarded,
+                  oocTelemetryLastSampleCounters_.stalePageLoadsDiscarded)
+           << " refinementLoads=" << CounterDelta(
+                  current.totalRefinementBlockLoads,
+                  oocTelemetryLastSampleCounters_.totalRefinementBlockLoads)
+           << " refinementEvict=" << CounterDelta(
+                  current.totalRefinementBlockEvictions,
+                  oocTelemetryLastSampleCounters_.totalRefinementBlockEvictions)
+           << " planner=" << CounterDelta(
+                  current.rootPlannerRebuilds, oocTelemetryLastSampleCounters_.rootPlannerRebuilds)
+           << " plannerReuse=" << CounterDelta(
+                  current.rootPlannerCacheReuses,
+                  oocTelemetryLastSampleCounters_.rootPlannerCacheReuses)
+           << " gpuUploadMiB="
+           << static_cast<double>(dUploadRoot + dUploadBacking) / kBytesPerMiB
+           << " gpuRootEvict=" << CounterDelta(
+                  current.gpuRootPageEvictions,
+                  oocTelemetryLastSampleCounters_.gpuRootPageEvictions)
+           << " gpuBackingEvict=" << CounterDelta(
+                  current.gpuBackingBlockEvictions,
+                  oocTelemetryLastSampleCounters_.gpuBackingBlockEvictions)
+           << " gpuBackingFirst=" << CounterDelta(
+                  current.gpuBackingBlockFirstUploads,
+                  oocTelemetryLastSampleCounters_.gpuBackingBlockFirstUploads)
+           << " gpuBackingReupload=" << CounterDelta(
+                  current.gpuBackingBlockReuploadsAfterEviction,
+                  oocTelemetryLastSampleCounters_.gpuBackingBlockReuploadsAfterEviction)
+           << " gpuBackingGraceFallback=" << CounterDelta(
+                  current.gpuBackingGraceFallbackEvictions,
+                  oocTelemetryLastSampleCounters_.gpuBackingGraceFallbackEvictions)
+           << " gpuRootAllocFail=" << CounterDelta(
+                  current.gpuRootCacheAllocationFailures,
+                  oocTelemetryLastSampleCounters_.gpuRootCacheAllocationFailures)
+           << " gpuBackingAllocFail=" << CounterDelta(
+                  current.gpuBackingCacheAllocationFailures,
+                  oocTelemetryLastSampleCounters_.gpuBackingCacheAllocationFailures)
+           << " gpuRootCached=" << stats.gpuPersistentRootPagesCached
+           << " gpuRootActive=" << stats.gpuPersistentRootPagesActive
+           << " gpuBackingResident=" << stats.gpuPersistentBackingBlocks
+           << " gpuMissingBacking=" << stats.gpuMissingBlockRequests
+           << " demandReady=" << (stats.currentDemandReady ? 1 : 0);
+
+    QueueOocTelemetryRecord(sample.str(), now);
+    oocTelemetryLastSampleCounters_ = current;
+    oocTelemetryLastSampleTime_ = now;
 }
 
 void DebugUI::StartRoadTypeDiagnostic(std::filesystem::path graphPath,
@@ -710,10 +1241,43 @@ DebugUIActions DebugUI::Draw(
         }
     }
 
+    if (!streamingStats && oocTelemetryEnabled_) {
+        StopOocTelemetry();
+    }
+
     if (streamingStats) {
         ImGui::Separator();
         ImGui::TextUnformatted("Runtime page streaming");
-        ImGui::TextDisabled("Out-of-core cache budgets");
+
+        ImGui::SeparatorText("OOC telemetry log");
+        bool requestedTelemetry = oocTelemetryEnabled_;
+        if (ImGui::Checkbox("Enable OOC telemetry", &requestedTelemetry)) {
+            if (requestedTelemetry) {
+                StartOocTelemetry(*streamingStats, camera);
+            } else {
+                StopOocTelemetry();
+            }
+        }
+        if (oocTelemetryEnabled_) {
+            UpdateOocTelemetry(*streamingStats, camera);
+            ImGui::Text("Recording: %s", oocTelemetryCurrentPath_.filename().string().c_str());
+            ImGui::TextDisabled("1 s while streaming, 5 s while idle; page events are aggregated; file writes happen on a background thread in <=5 s batches.");
+            ImGui::TextDisabled("Disable telemetry to remove even the small sampling/formatting overhead.");
+        } else {
+            ImGui::TextDisabled("OFF by default: no telemetry sampling, formatting, or log file I/O.");
+            if (ImGui::Button("Delete OOC telemetry logs")) {
+                DeleteOocTelemetryLogs();
+            }
+        }
+        if (!oocTelemetryError_.empty()) {
+            ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.35f, 1.0f), "%s",
+                               oocTelemetryError_.c_str());
+        }
+        if (!oocTelemetryDeleteMessage_.empty()) {
+            ImGui::TextDisabled("%s", oocTelemetryDeleteMessage_.c_str());
+        }
+
+        ImGui::SeparatorText("Out-of-core cache budgets");
         ImGui::SliderInt("CPU cache budget (MiB, 0=Auto)", &streamingRamBudgetMiB_, 0, 15360);
         ImGui::SliderInt("GPU cache budget (MiB)", &streamingGpuBudgetMiB_, 128, 2048);
         if (ImGui::Button("Apply budgets")) {
@@ -795,6 +1359,31 @@ DebugUIActions DebugUI::Draw(
                     static_cast<unsigned long long>(streamingStats->pageCacheMisses),
                     static_cast<unsigned long long>(streamingStats->totalPageLoads),
                     static_cast<unsigned long long>(streamingStats->totalEvictions));
+        ImGui::Text("Unique page loads / reloads after eviction: %llu / %llu",
+                    static_cast<unsigned long long>(streamingStats->uniquePageLoads),
+                    static_cast<unsigned long long>(streamingStats->pageReloadsAfterEviction));
+        ImGui::Text("In-flight reuse / reprioritize: %llu / %llu | stale queue / completed I/O: %llu / %llu",
+                    static_cast<unsigned long long>(streamingStats->pageInFlightReuses),
+                    static_cast<unsigned long long>(streamingStats->pageQueueReprioritizations),
+                    static_cast<unsigned long long>(streamingStats->stalePageQueueEntriesSkipped),
+                    static_cast<unsigned long long>(streamingStats->stalePageLoadsDiscarded));
+        ImGui::Text("Residency grace pages: %u | Root I/O reads / batched: %llu / %llu",
+                    streamingStats->recentlyDesiredResidentPageCount,
+                    static_cast<unsigned long long>(streamingStats->rootIoReadOperations),
+                    static_cast<unsigned long long>(streamingStats->rootIoBatchedReadOperations));
+        const auto rootIoPagesPerRead = streamingStats->rootIoReadOperations == 0u
+                                            ? 0.0
+                                            : static_cast<double>(streamingStats->rootIoPagesRead) /
+                                                  static_cast<double>(streamingStats->rootIoReadOperations);
+        const auto rootIoMiB = static_cast<double>(streamingStats->rootIoBytesRead) /
+                               (1024.0 * 1024.0);
+        const auto rootIoMiBPerSecond = streamingStats->rootIoReadMilliseconds > 0.0
+                                            ? rootIoMiB * 1000.0 /
+                                                  streamingStats->rootIoReadMilliseconds
+                                            : 0.0;
+        ImGui::Text("Root I/O: %.2f pages/read (max %u) | %.1f MiB | %.1f MiB/s service rate",
+                    rootIoPagesPerRead, streamingStats->maxRootIoBatchPages, rootIoMiB,
+                    rootIoMiBPerSecond);
         ImGui::Text("Backing RAM cache hit / miss | evictions: %llu / %llu | %llu",
                     static_cast<unsigned long long>(streamingStats->refinementBlockCacheHits),
                     static_cast<unsigned long long>(streamingStats->refinementBlockCacheMisses),
@@ -860,6 +1449,13 @@ DebugUIActions DebugUI::Draw(
         ImGui::Text("GPU root/backing evictions: %llu / %llu",
                     static_cast<unsigned long long>(streamingStats->gpuRootPageEvictions),
                     static_cast<unsigned long long>(streamingStats->gpuBackingBlockEvictions));
+        ImGui::Text("Backing uploads first / re-upload: %llu / %llu | grace fallback evict: %llu",
+                    static_cast<unsigned long long>(
+                        streamingStats->gpuBackingBlockFirstUploads),
+                    static_cast<unsigned long long>(
+                        streamingStats->gpuBackingBlockReuploadsAfterEviction),
+                    static_cast<unsigned long long>(
+                        streamingStats->gpuBackingGraceFallbackEvictions));
         ImGui::Text("GPU cache pressure root/backing: %llu / %llu | touched blocks: %u",
                     static_cast<unsigned long long>(
                         streamingStats->gpuRootCacheAllocationFailures),

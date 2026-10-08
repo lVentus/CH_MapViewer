@@ -339,6 +339,7 @@ void PersistentStreamingPipeline::Initialize(
 
     rootFreeRanges_.push_back({0u, rootRecordCapacity_});
     backingSlots_.resize(backingBlockCapacity_);
+    backingBlockEverUploaded_.assign(backingBlockCount_, 0u);
     freeBackingSlots_.reserve(backingBlockCapacity_);
     for (std::uint32_t slot = backingBlockCapacity_; slot-- > 0;) {
         freeBackingSlots_.push_back(slot);
@@ -396,6 +397,7 @@ void PersistentStreamingPipeline::Reset() {
     latestRefinementBankOverflow_.fill(0u);
     latestRefinementBankLastUse_.fill(0u);
     useCounter_ = 0;
+    backingFrameSerial_ = 1;
     rootFreeRanges_.clear();
     rootPages_.clear();
     activePageIds_.clear();
@@ -404,6 +406,7 @@ void PersistentStreamingPipeline::Reset() {
     freeBackingSlots_.clear();
     backingBlockToSlot_.clear();
     pinnedBackingBlocks_.clear();
+    backingBlockEverUploaded_.clear();
     stats_ = {};
 }
 
@@ -612,15 +615,38 @@ void PersistentStreamingPipeline::SetPageTableEntry(std::uint32_t blockId,
 }
 
 bool PersistentStreamingPipeline::EvictOneUnpinnedBackingBlock() {
-    auto candidate = backingBlockToSlot_.end();
+    auto matureCandidate = backingBlockToSlot_.end();
+    auto fallbackCandidate = backingBlockToSlot_.end();
     for (auto it = backingBlockToSlot_.begin(); it != backingBlockToSlot_.end(); ++it) {
         if (pinnedBackingBlocks_.contains(it->first)) {
             continue;
         }
         const auto& slot = backingSlots_[it->second];
-        if (candidate == backingBlockToSlot_.end() ||
-            slot.lastUse < backingSlots_[candidate->second].lastUse) {
-            candidate = it;
+        if (fallbackCandidate == backingBlockToSlot_.end() ||
+            slot.lastUse < backingSlots_[fallbackCandidate->second].lastUse) {
+            fallbackCandidate = it;
+        }
+
+        // GPU block-use feedback is asynchronous. Avoid throwing out a block during the few
+        // Process() calls between upload and its first readback-visible use.
+        const auto ageFrames = backingFrameSerial_ - slot.uploadedFrame;
+        if (ageFrames < BackingUploadGraceFrames) {
+            continue;
+        }
+        if (matureCandidate == backingBlockToSlot_.end() ||
+            slot.lastUse < backingSlots_[matureCandidate->second].lastUse) {
+            matureCandidate = it;
+        }
+    }
+
+    auto candidate = matureCandidate;
+    if (candidate == backingBlockToSlot_.end()) {
+        candidate = fallbackCandidate;
+        if (candidate != backingBlockToSlot_.end()) {
+            // Soft grace must never turn cache pressure into an allocation failure. Count the
+            // fallback so telemetry can tell whether the configured GPU budget is too tight for
+            // even the readback-latency window.
+            ++stats_.backingGraceFallbackEvictions;
         }
     }
     if (candidate == backingBlockToSlot_.end()) {
@@ -703,9 +729,18 @@ bool PersistentStreamingPipeline::UploadBackingBlock(
                                     roadTypes.size() * sizeof(std::uint32_t), roadTypes.data());
     }
 
-    backingSlots_[slot] = {block.blockId, ++useCounter_};
+    backingSlots_[slot] = {block.blockId, ++useCounter_, backingFrameSerial_};
     backingBlockToSlot_[block.blockId] = slot;
     SetPageTableEntry(block.blockId, slot + 1u);
+
+    if (block.blockId < backingBlockEverUploaded_.size()) {
+        if (backingBlockEverUploaded_[block.blockId] != 0u) {
+            ++stats_.backingBlockReuploadsAfterEviction;
+        } else {
+            backingBlockEverUploaded_[block.blockId] = 1u;
+            ++stats_.backingBlockFirstUploads;
+        }
+    }
     glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT | GL_SHADER_STORAGE_BARRIER_BIT);
 
     stats_.incrementalBackingBytesUploaded +=
@@ -1030,6 +1065,7 @@ void PersistentStreamingPipeline::Process(
     if (frameId_ == 0u) {
         frameId_ = 1u;
     }
+    ++backingFrameSerial_;
 
     if (const auto value = filterTimer_.LastMilliseconds()) {
         stats_.gpuFilterCullMs = *value;
