@@ -5,7 +5,7 @@ uniform uint uRoadStyleDisabled;
 uniform uint uRoadStyleConfigValid;
 uniform vec4 uRoadColors[64];
 layout(location = 0) in float gLodAlpha;
-flat in uint gRoadType;
+layout(location = 1) flat in uint gRoadType;
 layout(location = 0) out vec4 outColor;
 
 vec3 hueToRgb(float h) {

@@ -23,7 +23,8 @@ uniform float uAspectScale;
 uniform float uViewScale;
 uniform float uViewOffsetX;
 
-flat out uint vRoadType;
+layout(location = 0) out float vLodAlpha;
+layout(location = 1) flat out uint vRoadType;
 
 void main() {
     uint edgeId = visibleEdgeIds[uint(gl_VertexID) >> 1u];
@@ -34,5 +35,6 @@ void main() {
     position *= uViewScale;
     position.x += uViewOffsetX;
     gl_Position = vec4(position, 0.0, 1.0);
+    vLodAlpha = 1.0;
     vRoadType = uint(edge.levels.w) & 63u;
 }

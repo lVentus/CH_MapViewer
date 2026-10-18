@@ -24,7 +24,7 @@ layout(std430, binding = 5) readonly buffer DrawAlphas { float drawAlphas[]; };
 layout(std430, binding = 6) readonly buffer RefinedRoadTypes { uint cachedRoadTypeWords[]; };
 
 layout(location = 0) out float vLodAlpha;
-flat out uint vRoadType;
+layout(location = 1) flat out uint vRoadType;
 
 uniform uint uBlockRecordCount;
 uniform float uCameraCenterX;

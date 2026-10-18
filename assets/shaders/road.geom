@@ -4,9 +4,9 @@ layout(lines) in;
 layout(triangle_strip, max_vertices = 4) out;
 
 layout(location = 0) in float vLodAlpha[];
-flat in uint vRoadType[];
+layout(location = 1) flat in uint vRoadType[];
 layout(location = 0) out float gLodAlpha;
-flat out uint gRoadType;
+layout(location = 1) flat out uint gRoadType;
 
 uniform vec2 uViewportSize;
 uniform uint uRoadStyleDisabled;
