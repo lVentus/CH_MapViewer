@@ -1155,7 +1155,8 @@ DebugUIActions DebugUI::Draw(
                     const bool adaptiveStreamingSupported =
                         !streamingIndex ||
                         (streamingIndex->HasRootPayload() &&
-                         streamingIndex->edgeSpatialBoundsCount == streamingIndex->edgeCount);
+                         (streamingIndex->HasRuntimeBinary() ||
+                          streamingIndex->edgeSpatialBoundsCount == streamingIndex->edgeCount));
                     const bool supported =
                         strategies[i]->Mode() != geometry::RefinementMode::Adaptive ||
                         adaptiveStreamingSupported;
@@ -1182,7 +1183,8 @@ DebugUIActions DebugUI::Draw(
             ImGui::TextDisabled(
                 "Full DFS remains an exhaustive correctness/stress mode and can request a very large hierarchy working set.");
             if (!streamingIndex->HasRootPayload() ||
-                streamingIndex->edgeSpatialBoundsCount != streamingIndex->edgeCount) {
+                (!streamingIndex->HasRuntimeBinary() &&
+                 streamingIndex->edgeSpatialBoundsCount != streamingIndex->edgeCount)) {
                 ImGui::TextDisabled(
                     "Adaptive requires the current preprocessed CHIDX root payload and per-edge spatial bounds.");
             }
@@ -1279,14 +1281,16 @@ DebugUIActions DebugUI::Draw(
 
         ImGui::SeparatorText("Out-of-core cache budgets");
         ImGui::SliderInt("CPU cache budget (MiB, 0=Auto)", &streamingRamBudgetMiB_, 0, 15360);
-        ImGui::SliderInt("GPU cache budget (MiB)", &streamingGpuBudgetMiB_, 128, 2048);
+        ImGui::SliderInt("GPU cache budget (MiB, 0=Auto)", &streamingGpuBudgetMiB_, 0, 8192);
         if (ImGui::Button("Apply budgets")) {
             actions.applyStreamingBudgets = true;
             actions.streamingRamBudgetMiB = streamingRamBudgetMiB_ <= 0
                                                  ? 0u
                                                  : static_cast<std::uint32_t>(streamingRamBudgetMiB_);
-            actions.streamingGpuBudgetMiB =
-                static_cast<std::uint32_t>(std::max(streamingGpuBudgetMiB_, 128));
+            actions.streamingGpuBudgetMiB = streamingGpuBudgetMiB_ <= 0
+                                                 ? 0u
+                                                 : static_cast<std::uint32_t>(
+                                                       std::max(streamingGpuBudgetMiB_, 128));
         }
         ImGui::SameLine();
         if (ImGui::Button("Stress preset")) {
@@ -1297,7 +1301,7 @@ DebugUIActions DebugUI::Draw(
             actions.streamingGpuBudgetMiB = 192;
         }
         ImGui::TextDisabled(
-            "CPU 0 = automatic from currently available RAM (up to 15 GiB). Applying keeps .sch/.ranges/.chidx; only runtime caches are reset.");
+            "CPU 0 = automatic from currently available RAM (up to 15 GiB). GPU 0 = automatic: dedicated GPUs use free VRAM; UMA/iGPUs share one system-memory envelope with the CPU cache. Only runtime caches are reset.");
         ImGui::Text("Required pages: %u / %u resident", streamingStats->requiredResidentCount,
                     streamingStats->requiredPageCount);
         ImGui::Text("RAM candidates: %u / %u resident | LOD-window pages: %u | GPU-warm: %u",
@@ -1407,6 +1411,59 @@ DebugUIActions DebugUI::Draw(
         ImGui::Text("GPU allocated / hard budget: %.2f / %.2f MiB",
                     static_cast<double>(streamingStats->gpuAllocatedBytes) / (1024.0 * 1024.0),
                     static_cast<double>(streamingStats->gpuBudgetBytes) / (1024.0 * 1024.0));
+        if (streamingStats->gpuBudgetWasAuto) {
+            if (streamingStats->gpuReportedAvailableBytes != 0u) {
+                const auto freeMiB = static_cast<double>(streamingStats->gpuReportedAvailableBytes) /
+                                     (1024.0 * 1024.0);
+                const auto totalMiB = static_cast<double>(streamingStats->gpuReportedTotalBytes) /
+                                      (1024.0 * 1024.0);
+                const auto reserveMiB = static_cast<double>(streamingStats->gpuAutoReservedBytes) /
+                                        (1024.0 * 1024.0);
+                if (streamingStats->gpuReportedTotalBytes != 0u) {
+                    ImGui::Text(
+                        "GPU budget mode: Auto | free/total at init: %.2f / %.2f MiB | reserve: %.2f MiB",
+                        freeMiB, totalMiB, reserveMiB);
+                } else {
+                    ImGui::Text(
+                        "GPU budget mode: Auto | driver-reported free VRAM at init: %.2f MiB | reserve: %.2f MiB",
+                        freeMiB, reserveMiB);
+                }
+            } else {
+                ImGui::TextUnformatted(
+                    "GPU budget mode: Auto | driver exposes no portable VRAM query (safe fallback used)");
+            }
+        } else {
+            ImGui::TextUnformatted("GPU budget mode: Manual");
+        }
+        const char* gpuMemoryArchitecture = "Unknown";
+        if (streamingStats->gpuMemoryArchitecture == 1u) {
+            gpuMemoryArchitecture = "Dedicated";
+        } else if (streamingStats->gpuMemoryArchitecture == 2u) {
+            gpuMemoryArchitecture = "Unified / UMA";
+        }
+        ImGui::Text("GPU memory architecture: %s", gpuMemoryArchitecture);
+        if (streamingStats->gpuMemoryArchitecture == 2u) {
+            if (streamingStats->gpuHostSharedBuffersEnabled) {
+                ImGui::Text(
+                    "UMA host-shared SSBO: enabled | persistent mapped cache: %.2f MiB",
+                    static_cast<double>(streamingStats->gpuHostSharedBufferBytes) /
+                        (1024.0 * 1024.0));
+                ImGui::TextUnformatted(
+                    "CPU producers write the same GL storage consumed by the iGPU; no glBufferSubData staging copy for root/backing payloads.");
+            } else if (streamingStats->gpuHostSharedStorageSupported) {
+                ImGui::TextUnformatted(
+                    "UMA host-shared SSBO: supported but inactive (device-managed upload fallback).");
+            } else {
+                ImGui::TextUnformatted(
+                    "UMA host-shared SSBO: ARB_buffer_storage unavailable; device-managed upload fallback.");
+            }
+            if (streamingStats->sharedGpuReservationBytes != 0u) {
+                ImGui::Text(
+                    "Shared-DRAM GPU reservation used by preload planner: %.2f MiB",
+                    static_cast<double>(streamingStats->sharedGpuReservationBytes) /
+                        (1024.0 * 1024.0));
+            }
+        }
         ImGui::Text("Root records required / transition / capacity: %llu / %llu / %u",
                     static_cast<unsigned long long>(streamingStats->gpuRequiredRootRecords),
                     static_cast<unsigned long long>(streamingStats->gpuTransitionRootRecords),
@@ -1442,13 +1499,16 @@ DebugUIActions DebugUI::Draw(
                     streamingStats->gpuRefinementGeometryUsed,
                     streamingStats->gpuRefinementGeometryCapacity,
                     streamingStats->gpuRefinementGeometryOverflows);
-        ImGui::Text("Refinement geometry banks: write %u | used %u / 8 | recycles: %llu",
+        ImGui::Text("Refinement geometry banks: write %u | used %u / 8 | recycles: %llu | forced stale-GC: %llu",
                     streamingStats->gpuRefinementWriteBank,
                     streamingStats->gpuRefinementBanksUsed,
-                    static_cast<unsigned long long>(streamingStats->gpuRefinementBankRecycles));
-        ImGui::Text("GPU root/backing evictions: %llu / %llu",
+                    static_cast<unsigned long long>(streamingStats->gpuRefinementBankRecycles),
+                    static_cast<unsigned long long>(
+                        streamingStats->gpuRefinementForcedBankRecycles));
+        ImGui::Text("GPU root/backing evictions: %llu / %llu | root rebases: %llu",
                     static_cast<unsigned long long>(streamingStats->gpuRootPageEvictions),
-                    static_cast<unsigned long long>(streamingStats->gpuBackingBlockEvictions));
+                    static_cast<unsigned long long>(streamingStats->gpuBackingBlockEvictions),
+                    static_cast<unsigned long long>(streamingStats->gpuRootWorkingSetRebases));
         ImGui::Text("Backing uploads first / re-upload: %llu / %llu | grace fallback evict: %llu",
                     static_cast<unsigned long long>(
                         streamingStats->gpuBackingBlockFirstUploads),

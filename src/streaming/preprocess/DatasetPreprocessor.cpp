@@ -2,6 +2,7 @@
 #include "streaming/preprocess/ExternalPreprocess.h"
 
 #include "streaming/index/CHIndex.h"
+#include "streaming/runtime/RuntimeData.h"
 
 #include <algorithm>
 #include <cmath>
@@ -22,7 +23,7 @@
 namespace chmv::streaming::preprocess {
 namespace {
 
-constexpr std::uint32_t kManifestVersion = 7;
+constexpr std::uint32_t kManifestVersion = 8;
 constexpr std::uint64_t kMiB = 1024ull * 1024ull;
 constexpr std::uint64_t kGiB = 1024ull * kMiB;
 
@@ -129,7 +130,10 @@ void WriteFastPreprocessReport(
                              (static_cast<double>(indexData.graphPages.size()) *
                               static_cast<double>(index::kRuntimeRootTileTargetEdges)))
                << "%\n";
-        output << "Spatial cell->page refs: " << indexData.spatialPageRefs.size() << '\n';
+        output << "Spatial cell->page refs: "
+               << (indexData.HasSpatialDirectory() ? indexData.spatialPageIds.size()
+                                                   : indexData.spatialPageRefs.size())
+               << '\n';
         output << "RootPayload storage: dense contiguous LOD-group Morton stream\n";
         output << "Runtime residency: fine-grained logical root tiles (no payload rewrite)\n";
         output << "Fixed base cell: " << std::fixed << std::setprecision(3)
@@ -239,8 +243,9 @@ void RequirePreprocessDiskSpace(const std::filesystem::path& sourceGraphPath,
         return;
     }
 
-    // The new direct-grid path no longer writes one temporary copy per spatial depth,
-    // but it still keeps compact mapped metadata/remap arrays while writing the new text pair.
+    // The source pair remains untouched. Reserve enough space for the binary runtime image,
+    // the compact index and preprocessing scratch files. The text source size is deliberately
+    // used as a conservative upper bound for the compact runtime output.
     const auto margin = std::max<std::uint64_t>(2ull * kGiB, sourceBytes / 3u);
     const auto requiredBytes = sourceBytes + margin;
     if (space.available < requiredBytes) {
@@ -248,40 +253,6 @@ void RequirePreprocessDiskSpace(const std::filesystem::path& sourceGraphPath,
             "not enough free disk space for preprocessing: need about " +
             std::to_string(requiredBytes / kMiB) + " MiB free, but only " +
             std::to_string(space.available / kMiB) + " MiB is available");
-    }
-}
-
-std::pair<std::filesystem::path, std::filesystem::path> AuthoritativeSourcePaths(
-    const PreprocessPaths& paths) {
-    const bool graphBackup = std::filesystem::is_regular_file(paths.originalGraphPath);
-    const bool rangesBackup = std::filesystem::is_regular_file(paths.originalRangesPath);
-    if (graphBackup != rangesBackup) {
-        throw std::runtime_error(
-            "preprocess source backup is incomplete; expected both .sch.org and .sch.ranges.org");
-    }
-    if (graphBackup) {
-        return {paths.originalGraphPath, paths.originalRangesPath};
-    }
-    return {paths.graphPath, paths.rangesPath};
-}
-
-void BackupOriginalSources(const PreprocessPaths& paths) {
-    if (std::filesystem::is_regular_file(paths.originalGraphPath) &&
-        std::filesystem::is_regular_file(paths.originalRangesPath)) {
-        return;
-    }
-    if (std::filesystem::exists(paths.originalGraphPath) ||
-        std::filesystem::exists(paths.originalRangesPath)) {
-        throw std::runtime_error(
-            "cannot create preprocess backup because an incomplete .org pair exists");
-    }
-
-    std::filesystem::rename(paths.graphPath, paths.originalGraphPath);
-    try {
-        std::filesystem::rename(paths.rangesPath, paths.originalRangesPath);
-    } catch (...) {
-        std::filesystem::rename(paths.originalGraphPath, paths.graphPath);
-        throw;
     }
 }
 
@@ -313,23 +284,23 @@ void WriteManifest(const PreprocessPaths& paths,
                    const analysis::DatasetLayoutAnalysisConfig& config,
                    std::uint64_t nodeCount, std::uint64_t edgeCount,
                    const std::filesystem::path& outputPath) {
-    const auto sourceGraphStamp = GetFileStamp(paths.originalGraphPath);
-    const auto sourceRangesStamp = GetFileStamp(paths.originalRangesPath);
-    const auto graphStamp = GetFileStamp(paths.graphPath);
-    const auto rangesStamp = GetFileStamp(paths.rangesPath);
+    const auto sourceGraphStamp = GetFileStamp(paths.graphPath);
+    const auto sourceRangesStamp = GetFileStamp(paths.rangesPath);
+    const auto runtimeStamp = GetFileStamp(paths.runtimeDataPath);
+    const auto indexStamp = GetFileStamp(paths.indexPath);
     std::ofstream output(outputPath, std::ios::trunc);
     if (!output) {
         throw std::runtime_error("could not write preprocess manifest: " + outputPath.string());
     }
     output << "format_version=" << kManifestVersion << '\n';
-    output << "source_graph=" << paths.originalGraphPath.filename().generic_string() << '|'
+    output << "source_graph=" << paths.graphPath.filename().generic_string() << '|'
            << sourceGraphStamp.size << '|' << sourceGraphStamp.writeTime << '\n';
-    output << "source_ranges=" << paths.originalRangesPath.filename().generic_string() << '|'
+    output << "source_ranges=" << paths.rangesPath.filename().generic_string() << '|'
            << sourceRangesStamp.size << '|' << sourceRangesStamp.writeTime << '\n';
-    output << "preprocessed_graph=" << paths.graphPath.filename().generic_string() << '|'
-           << graphStamp.size << '|' << graphStamp.writeTime << '\n';
-    output << "preprocessed_ranges=" << paths.rangesPath.filename().generic_string() << '|'
-           << rangesStamp.size << '|' << rangesStamp.writeTime << '\n';
+    output << "runtime_data=" << paths.runtimeDataPath.filename().generic_string() << '|'
+           << runtimeStamp.size << '|' << runtimeStamp.writeTime << '\n';
+    output << "runtime_index=" << paths.indexPath.filename().generic_string() << '|'
+           << indexStamp.size << '|' << indexStamp.writeTime << '\n';
     output << "node_count=" << nodeCount << '\n';
     output << "edge_count=" << edgeCount << '\n';
     output << std::setprecision(17);
@@ -349,22 +320,19 @@ bool ManifestMatches(const PreprocessPaths& paths,
     if (!std::filesystem::is_regular_file(paths.manifestPath) ||
         !std::filesystem::is_regular_file(paths.graphPath) ||
         !std::filesystem::is_regular_file(paths.rangesPath) ||
-        !std::filesystem::is_regular_file(paths.originalGraphPath) ||
-        !std::filesystem::is_regular_file(paths.originalRangesPath) ||
+        !std::filesystem::is_regular_file(paths.runtimeDataPath) ||
         !std::filesystem::is_regular_file(paths.indexPath)) {
         return false;
     }
 
     std::ifstream input(paths.manifestPath);
-    if (!input) {
-        return false;
-    }
+    if (!input) return false;
 
     bool version = false;
     bool sourceGraph = false;
     bool sourceRanges = false;
-    bool graph = false;
-    bool ranges = false;
+    bool runtimeData = false;
+    bool runtimeIndex = false;
     bool cellSize = false;
     bool band = false;
     bool nodeBlock = false;
@@ -375,13 +343,13 @@ bool ManifestMatches(const PreprocessPaths& paths,
         if (line == "format_version=" + std::to_string(kManifestVersion)) {
             version = true;
         } else if (line.starts_with("source_graph=")) {
-            sourceGraph = ParseStampedLine(line, "source_graph", paths.originalGraphPath);
+            sourceGraph = ParseStampedLine(line, "source_graph", paths.graphPath);
         } else if (line.starts_with("source_ranges=")) {
-            sourceRanges = ParseStampedLine(line, "source_ranges", paths.originalRangesPath);
-        } else if (line.starts_with("preprocessed_graph=")) {
-            graph = ParseStampedLine(line, "preprocessed_graph", paths.graphPath);
-        } else if (line.starts_with("preprocessed_ranges=")) {
-            ranges = ParseStampedLine(line, "preprocessed_ranges", paths.rangesPath);
+            sourceRanges = ParseStampedLine(line, "source_ranges", paths.rangesPath);
+        } else if (line.starts_with("runtime_data=")) {
+            runtimeData = ParseStampedLine(line, "runtime_data", paths.runtimeDataPath);
+        } else if (line.starts_with("runtime_index=")) {
+            runtimeIndex = ParseStampedLine(line, "runtime_index", paths.indexPath);
         } else if (line.starts_with("spatial_cell_meters=")) {
             try {
                 const auto value = std::stod(line.substr(std::string("spatial_cell_meters=").size()));
@@ -404,12 +372,10 @@ bool ManifestMatches(const PreprocessPaths& paths,
         }
     }
 
-    const bool manifestMatches = version && sourceGraph && sourceRanges && graph && ranges &&
-                                 cellSize && band && nodeBlock && edgeBlock && pageEdges;
-    if (!manifestMatches) {
+    if (!(version && sourceGraph && sourceRanges && runtimeData && runtimeIndex &&
+          cellSize && band && nodeBlock && edgeBlock && pageEdges)) {
         return false;
     }
-
     return index::CHIndex::IsValid(paths.indexPath, paths.graphPath, paths.rangesPath, config);
 }
 
@@ -422,13 +388,15 @@ PreprocessPaths DatasetPreprocessor::DefaultPaths(
     paths.directory = sourceGraphPath.parent_path();
     paths.graphPath = sourceGraphPath;
     paths.rangesPath = sourceRangesPath;
+    paths.runtimeDataPath = runtime::RuntimeData::DefaultPath(paths.graphPath);
     paths.indexPath = index::CHIndex::DefaultPath(paths.graphPath);
     const auto baseName = sourceGraphPath.extension() == ".sch"
                               ? sourceGraphPath.stem().string()
                               : sourceGraphPath.filename().string();
     paths.manifestPath = paths.directory / (baseName + ".preprocess_manifest");
-    paths.originalGraphPath = std::filesystem::path(sourceGraphPath.string() + ".org");
-    paths.originalRangesPath = std::filesystem::path(sourceRangesPath.string() + ".org");
+    // v8+ never renames or mutates the source pair. These legacy fields intentionally remain empty.
+    paths.originalGraphPath.clear();
+    paths.originalRangesPath.clear();
     return paths;
 }
 
@@ -477,20 +445,16 @@ PreprocessResult DatasetPreprocessor::Run(
         return {paths, indexData.nodeCount, indexData.edgeCount, true};
     }
 
-    const auto [authoritativeGraphPath, authoritativeRangesPath] =
-        AuthoritativeSourcePaths(paths);
-    if (!std::filesystem::is_regular_file(authoritativeGraphPath) ||
-        !std::filesystem::is_regular_file(authoritativeRangesPath)) {
+    if (!std::filesystem::is_regular_file(paths.graphPath) ||
+        !std::filesystem::is_regular_file(paths.rangesPath)) {
         throw std::runtime_error("preprocess requires an existing .sch/.ranges source pair");
     }
 
-    RequirePreprocessDiskSpace(authoritativeGraphPath, authoritativeRangesPath, paths.directory);
-    const auto graphTemporary = TemporaryPath(paths.graphPath);
-    const auto rangesTemporary = TemporaryPath(paths.rangesPath);
+    RequirePreprocessDiskSpace(paths.graphPath, paths.rangesPath, paths.directory);
+    const auto runtimeTemporary = TemporaryPath(paths.runtimeDataPath);
     const auto indexTemporary = TemporaryPath(paths.indexPath);
     const auto manifestTemporary = TemporaryPath(paths.manifestPath);
-    RemoveIfExists(graphTemporary);
-    RemoveIfExists(rangesTemporary);
+    RemoveIfExists(runtimeTemporary);
     RemoveIfExists(indexTemporary);
     RemoveIfExists(manifestTemporary);
 
@@ -507,17 +471,14 @@ PreprocessResult DatasetPreprocessor::Run(
                           ? " (auto from currently available RAM)\n"
                           : " (explicit override)\n");
         const auto result = detail::RunExternalPreprocess(
-            authoritativeGraphPath, authoritativeRangesPath, graphTemporary, rangesTemporary,
-            indexTemporary, config, memoryBudgetBytes, tempRoot,
-            options.strictOutputValidation, progressCallback);
+            paths.graphPath, paths.rangesPath, runtimeTemporary, indexTemporary, config,
+            memoryBudgetBytes, tempRoot, options.strictOutputValidation, progressCallback);
 
-        BackupOriginalSources(paths);
-        CommitTemporaryFile(graphTemporary, paths.graphPath);
-        CommitTemporaryFile(rangesTemporary, paths.rangesPath);
+        CommitTemporaryFile(runtimeTemporary, paths.runtimeDataPath);
         CommitTemporaryFile(indexTemporary, paths.indexPath);
         if (!index::CHIndex::IsValid(paths.indexPath, paths.graphPath, paths.rangesPath, config)) {
             throw std::runtime_error(
-                "committed preprocess index does not match the preprocessed dataset");
+                "committed preprocess index/runtime data do not match the source dataset");
         }
 
         WriteManifest(paths, config, result.nodeCount, result.edgeCount, manifestTemporary);
@@ -541,8 +502,7 @@ PreprocessResult DatasetPreprocessor::Run(
         }
         return {paths, result.nodeCount, result.edgeCount, false};
     } catch (...) {
-        RemoveIfExists(graphTemporary);
-        RemoveIfExists(rangesTemporary);
+        RemoveIfExists(runtimeTemporary);
         RemoveIfExists(indexTemporary);
         RemoveIfExists(manifestTemporary);
         throw;

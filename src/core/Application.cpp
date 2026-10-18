@@ -185,28 +185,77 @@ void Application::InstallStreamingDataset(data::StreamingDataset dataset) {
     }
     processingMode_ = pipeline::ProcessingMode::GPUDriven;
 
-    std::cout << "Starting out-of-core runtime with " << dataset.index.graphPages.size()
+    std::cout << "Starting binary virtual-map runtime with " << dataset.index.graphPages.size()
               << " indexed graph pages\n";
     streaming::runtime::GraphPageStreamerConfig streamerConfig;
+    const auto systemMemory = streaming::runtime::QuerySystemMemoryInfo();
     if (streamingRamBudgetAuto_ || streamingRamBudgetMiB_ == 0u) {
-        const auto memory = streaming::runtime::QuerySystemMemoryInfo();
-        const auto budget = streaming::runtime::RecommendGraphPageCacheBudget(memory);
+        const auto budget = streaming::runtime::RecommendGraphPageCacheBudget(systemMemory);
         streamingRamBudgetMiB_ = static_cast<std::uint32_t>(budget / (1024ull * 1024ull));
         streamingRamBudgetAuto_ = true;
-        std::cout << "Automatic out-of-core RAM cache budget: " << streamingRamBudgetMiB_
-                  << " MiB (available " << (memory.availablePhysicalBytes / (1024ull * 1024ull))
+        std::cout << "Automatic virtual-map RAM cache budget: " << streamingRamBudgetMiB_
+                  << " MiB (available "
+                  << (systemMemory.availablePhysicalBytes / (1024ull * 1024ull))
                   << " MiB)\n";
     }
     streamerConfig.ramBudgetBytes =
         static_cast<std::uint64_t>(streamingRamBudgetMiB_) * 1024ull * 1024ull;
+
+    const auto gpuMemory = gpu::streaming::QueryGpuMemoryInfo();
+    const auto requestedGpuBudget =
+        static_cast<std::uint64_t>(streamingGpuBudgetMiB_) * 1024ull * 1024ull;
+    std::uint64_t plannedGpuBudget = requestedGpuBudget;
+    if (plannedGpuBudget == 0u) {
+        plannedGpuBudget = gpu::streaming::RecommendPersistentGpuBudget(
+            gpuMemory, systemMemory, streamerConfig.ramBudgetBytes);
+    }
+    if (gpuMemory.architecture == gpu::streaming::GPUMemoryArchitecture::Unified) {
+        streamerConfig.sharedGpuReservationBytes = plannedGpuBudget;
+    }
+
     pageStreamer_ = std::make_unique<streaming::runtime::GraphPageStreamer>(
         std::move(dataset.index), std::move(dataset.graphPath), std::move(dataset.rangesPath),
         streamerConfig);
 
     gpu::streaming::PersistentStreamingConfig gpuStreamingConfig;
-    gpuStreamingConfig.gpuBudgetBytes =
-        static_cast<std::uint64_t>(streamingGpuBudgetMiB_) * 1024ull * 1024ull;
+    gpuStreamingConfig.gpuBudgetBytes = requestedGpuBudget;
+    gpuStreamingConfig.cpuCacheBudgetBytes = streamerConfig.ramBudgetBytes;
+    gpuStreamingConfig.memoryArchitecture = gpuMemory.architecture;
     persistentStreamingPipeline_.Initialize(pageStreamer_->Index(), gpuStreamingConfig);
+    {
+        const auto persistent = persistentStreamingPipeline_.Stats();
+        std::cout << "Persistent GPU cache budget: "
+                  << (persistent.gpuBudgetBytes / (1024ull * 1024ull)) << " MiB"
+                  << (persistent.gpuBudgetWasAuto ? " (auto)" : " (manual)");
+        if (persistent.gpuReportedAvailableBytes != 0u) {
+            std::cout << ", driver free VRAM at init "
+                      << (persistent.gpuReportedAvailableBytes / (1024ull * 1024ull)) << " MiB";
+            if (persistent.gpuReportedTotalBytes != 0u) {
+                std::cout << ", total "
+                          << (persistent.gpuReportedTotalBytes / (1024ull * 1024ull)) << " MiB";
+            }
+            if (persistent.gpuAutoReservedBytes != 0u) {
+                std::cout << ", reserved "
+                          << (persistent.gpuAutoReservedBytes / (1024ull * 1024ull)) << " MiB";
+            }
+        }
+        const char* memoryArchitecture = "unknown";
+        if (persistent.gpuMemoryArchitecture == gpu::streaming::GPUMemoryArchitecture::Dedicated) {
+            memoryArchitecture = "dedicated";
+        } else if (persistent.gpuMemoryArchitecture ==
+                   gpu::streaming::GPUMemoryArchitecture::Unified) {
+            memoryArchitecture = "unified/UMA";
+        }
+        std::cout << ", memory " << memoryArchitecture;
+        if (persistent.gpuHostSharedBuffersEnabled) {
+            std::cout << ", host-shared persistent SSBO "
+                      << (persistent.gpuHostSharedBufferBytes / (1024ull * 1024ull)) << " MiB";
+        } else if (persistent.gpuMemoryArchitecture ==
+                   gpu::streaming::GPUMemoryArchitecture::Unified) {
+            std::cout << ", host-shared SSBO unavailable (device-managed fallback)";
+        }
+        std::cout << "\n";
+    }
     // Let the first rendered frame initialize directly from the physical camera scale. BW and EUR
     // now reset to different numeric zoom values because they cover different metre extents.
     streamingDisplayLod_ = -1;
@@ -495,14 +544,41 @@ void Application::UpdateStreamingRuntime(int framebufferWidth, int framebufferHe
     protectedRootPages.erase(
         std::unique(protectedRootPages.begin(), protectedRootPages.end()),
         protectedRootPages.end());
-    // Protecting the union also prevents a too-large transition from thrashing staged pages in
-    // and out. If an extreme old+new union exceeds capacity, the new snapshot simply remains
-    // pending while the camera stays responsive; normal nearby zoom/pan transitions overlap heavily
-    // and fit the cache.
+    const auto transitionRootRecords = rootRecordsForPages(protectedRootPages);
+    const bool transitionFitsRootCache =
+        rootCapacity != 0u && transitionRootRecords <= rootCapacity;
+
+    // Protecting the full union gives a genuinely atomic nearby handoff. For a large jump the old
+    // implementation protected an impossible old+new union forever, so no amount of waiting could
+    // ever commit the new LOD/view. In that case protect only the currently displayed snapshot
+    // while CPU streaming finishes the new one; once every required page is in RAM, rebase the GPU
+    // root cache in one bounded upload below.
     if (protectedRootPages.empty()) {
         protectedRootPages = requiredPageIds;
+    } else if (!transitionFitsRootCache) {
+        protectedRootPages = streamingCommittedRequiredPages_;
     }
     persistentStreamingPipeline_.SetProtectedRootPages(protectedRootPages);
+
+    const bool stagedPlanAvailable = streamingLastConsumedViewSequence_ != 0u;
+    const bool requiredCpuResident = !transitionFitsRootCache && requiredFitsRootCache &&
+                                     stagedPlanAvailable && std::all_of(
+        requiredPageIds.begin(), requiredPageIds.end(), [this](std::uint32_t pageId) {
+            return static_cast<bool>(pageStreamer_->FindResidentPage(pageId));
+        });
+    if (!transitionFitsRootCache && requiredCpuResident &&
+        !streamingCommittedRequiredPages_.empty()) {
+        persistentStreamingPipeline_.ClearRootCache();
+        persistentStreamingPipeline_.SetProtectedRootPages(requiredPageIds);
+        for (const auto pageId : requiredPageIds) {
+            auto page = pageStreamer_->FindResidentPage(pageId);
+            if (!page) {
+                continue;
+            }
+            (void)persistentStreamingPipeline_.UploadRootPage(
+                *page, pageStreamer_->Index().edgeSpatialBounds, false);
+        }
+    }
 
     const bool requiredMissingAtFrameStart = std::any_of(
         requiredPageIds.begin(), requiredPageIds.end(), [this](std::uint32_t pageId) {
@@ -514,7 +590,7 @@ void Application::UpdateStreamingRuntime(int framebufferWidth, int framebufferHe
     const auto frameHeadroomMs = std::clamp(kTargetFrameMs - previousFrameMs, 0.0, 4.0);
     const auto rootUploadBudgetMs = requiredMissingAtFrameStart
                                         ? std::clamp(0.35 + frameHeadroomMs * 0.75, 0.35, 3.0)
-                                        : std::clamp(frameHeadroomMs * 0.5, 0.0, 1.5);
+                                        : std::clamp(0.20 + frameHeadroomMs * 0.5, 0.20, 1.5);
     double rootUploadSpentMs = 0.0;
     bool uploadedAnyRequiredRoot = false;
 
@@ -548,7 +624,7 @@ void Application::UpdateStreamingRuntime(int framebufferWidth, int framebufferHe
 
         const auto before = persistentStreamingPipeline_.Stats();
         if (!persistentStreamingPipeline_.UploadRootPage(
-                *page, pageStreamer_->Index().edgeSpatialBounds)) {
+                *page, pageStreamer_->Index().edgeSpatialBounds, required)) {
             continue;
         }
         const auto after = persistentStreamingPipeline_.Stats();
@@ -564,7 +640,6 @@ void Application::UpdateStreamingRuntime(int framebufferWidth, int framebufferHe
         uploadedAnyRequiredRoot = uploadedAnyRequiredRoot || required;
     }
 
-    const bool stagedPlanAvailable = streamingLastConsumedViewSequence_ != 0u;
     const bool requiredReady = stagedPlanAvailable && requiredFitsRootCache && std::all_of(
         requiredPageIds.begin(), requiredPageIds.end(), [this](std::uint32_t pageId) {
             return persistentStreamingPipeline_.HasRootPage(pageId);
@@ -611,7 +686,8 @@ void Application::UpdateStreamingRuntime(int framebufferWidth, int framebufferHe
     auto refinementMode = strategyManager_.Current().Mode();
     const bool adaptiveSupported =
         pageStreamer_->Index().HasRootPayload() &&
-        pageStreamer_->Index().edgeSpatialBoundsCount == pageStreamer_->Index().edgeCount;
+        (pageStreamer_->Index().HasRuntimeBinary() ||
+         pageStreamer_->Index().edgeSpatialBoundsCount == pageStreamer_->Index().edgeCount);
     if (refinementMode == geometry::RefinementMode::Adaptive && !adaptiveSupported) {
         refinementMode = geometry::RefinementMode::None;
     }
@@ -722,7 +798,9 @@ void Application::ApplyStreamingBudgets(std::uint32_t ramBudgetMiB,
     } else {
         streamingRamBudgetMiB_ = std::clamp<std::uint32_t>(ramBudgetMiB, 64u, 15360u);
     }
-    streamingGpuBudgetMiB_ = std::clamp<std::uint32_t>(gpuBudgetMiB, 128u, 2048u);
+    streamingGpuBudgetMiB_ = gpuBudgetMiB == 0u
+                                 ? 0u
+                                 : std::clamp<std::uint32_t>(gpuBudgetMiB, 128u, 32768u);
     streamingMemoryBudgetPollSeconds_ = 0.0f;
     if (!pageStreamer_) {
         return;
@@ -734,6 +812,9 @@ void Application::ApplyStreamingBudgets(std::uint32_t ramBudgetMiB,
     gpu::streaming::PersistentStreamingConfig gpuStreamingConfig;
     gpuStreamingConfig.gpuBudgetBytes =
         static_cast<std::uint64_t>(streamingGpuBudgetMiB_) * 1024ull * 1024ull;
+    gpuStreamingConfig.cpuCacheBudgetBytes =
+        static_cast<std::uint64_t>(streamingRamBudgetMiB_) * 1024ull * 1024ull;
+    gpuStreamingConfig.memoryArchitecture = gpu::streaming::QueryGpuMemoryInfo().architecture;
     persistentStreamingPipeline_.Initialize(pageStreamer_->Index(), gpuStreamingConfig);
     streamingDisplayLod_ = -1;
     streamingDisplayLodFloat_ = -1.0f;
@@ -768,9 +849,11 @@ void Application::ApplyStreamingBudgets(std::uint32_t ramBudgetMiB,
     streamingLodPrefetchPageSet_.clear();
     streamingCommittedActivePages_.clear();
     lastStreamingRefinementMode_ = geometry::RefinementMode::None;
+    const auto appliedGpu = persistentStreamingPipeline_.Stats();
     std::cout << "Applied out-of-core budgets: RAM " << streamingRamBudgetMiB_
               << " MiB" << (streamingRamBudgetAuto_ ? " (auto)" : " (manual)")
-              << ", GPU " << streamingGpuBudgetMiB_ << " MiB\n";
+              << ", GPU " << (appliedGpu.gpuBudgetBytes / (1024ull * 1024ull)) << " MiB"
+              << (appliedGpu.gpuBudgetWasAuto ? " (auto)" : " (manual)") << "\n";
 }
 
 int Application::Run() {
@@ -845,8 +928,8 @@ int Application::Run() {
                 }
                 if (streamingRefinement.mode == geometry::RefinementMode::Adaptive &&
                     (!pageStreamer_->Index().HasRootPayload() ||
-                     pageStreamer_->Index().edgeSpatialBoundsCount !=
-                         pageStreamer_->Index().edgeCount)) {
+                     (!pageStreamer_->Index().HasRuntimeBinary() &&
+                      pageStreamer_->Index().edgeSpatialBoundsCount != pageStreamer_->Index().edgeCount))) {
                     streamingRefinement.mode = geometry::RefinementMode::None;
                 }
                 const auto displayLod = streamingDisplayLodFloat_ >= 0.0f
@@ -939,6 +1022,17 @@ int Application::Run() {
             streamingStats->lodTransitionPending = streamingLodTransitionPending_;
             streamingStats->gpuBudgetBytes = persistent.gpuBudgetBytes;
             streamingStats->gpuAllocatedBytes = persistent.gpuAllocatedBytes;
+            streamingStats->gpuReportedAvailableBytes = persistent.gpuReportedAvailableBytes;
+            streamingStats->gpuReportedTotalBytes = persistent.gpuReportedTotalBytes;
+            streamingStats->gpuAutoReservedBytes = persistent.gpuAutoReservedBytes;
+            streamingStats->gpuBudgetWasAuto = persistent.gpuBudgetWasAuto;
+            streamingStats->gpuMemoryArchitecture =
+                static_cast<std::uint8_t>(persistent.gpuMemoryArchitecture);
+            streamingStats->gpuHostSharedStorageSupported =
+                persistent.gpuHostSharedStorageSupported;
+            streamingStats->gpuHostSharedBuffersEnabled =
+                persistent.gpuHostSharedBuffersEnabled;
+            streamingStats->gpuHostSharedBufferBytes = persistent.gpuHostSharedBufferBytes;
             streamingStats->gpuRootRecordCapacity = persistent.gpuRootRecordCapacity;
             {
                 const auto required = pageStreamer_->RequiredPageIds();
@@ -989,7 +1083,10 @@ int Application::Run() {
             streamingStats->gpuRefinementWriteBank = persistent.refinementWriteBank;
             streamingStats->gpuRefinementBanksUsed = persistent.refinementBanksUsed;
             streamingStats->gpuRefinementBankRecycles = persistent.refinementBankRecycles;
+            streamingStats->gpuRefinementForcedBankRecycles =
+                persistent.refinementForcedBankRecycles;
             streamingStats->gpuRootPageEvictions = persistent.rootPageEvictions;
+            streamingStats->gpuRootWorkingSetRebases = persistent.rootWorkingSetRebases;
             streamingStats->gpuRootCacheAllocationFailures =
                 persistent.rootCacheAllocationFailures;
             streamingStats->gpuBackingBlockEvictions = persistent.backingBlockEvictions;

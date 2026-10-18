@@ -140,7 +140,7 @@ private:
         return ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r';
     }
 
-    static constexpr std::size_t BufferSize = 8u << 20u;
+    static constexpr std::size_t BufferSize = 64u << 20u;
     std::FILE* file_ = nullptr;
     std::vector<char> buffer_;
     std::array<char, 128> tokenBuffer_{};

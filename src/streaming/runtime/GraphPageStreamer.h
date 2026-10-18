@@ -1,6 +1,7 @@
 #pragma once
 
 #include "streaming/index/CHIndex.h"
+#include "streaming/runtime/RuntimeData.h"
 #include "streaming/analysis/TextSourceScanner.h"
 
 #include <array>
@@ -8,6 +9,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstddef>
 #include <limits>
 #include <filesystem>
 #include <fstream>
@@ -112,6 +114,10 @@ struct GraphPageStreamerConfig {
     // Decoded spatial node blocks are shared across pages. Zero chooses an automatic
     // bounded cache (about 1/5 of the total RAM budget, up to 4 GiB).
     std::uint64_t nodeBlockCacheBudgetBytes = 0;
+    // On UMA/iGPU systems GPU buffers consume the same physical DRAM. Startup full-runtime
+    // preloading accounts for this reservation so .chbin + CPU cache + shared GPU cache cannot
+    // silently overcommit system memory. Zero for dedicated GPUs.
+    std::uint64_t sharedGpuReservationBytes = 0;
     // Spatial prefetch is measured in fixed base-grid cells. Radius 3 means the viewport
     // plus a three-cell border, i.e. a 7x7 neighborhood when the viewport occupies one cell.
     std::uint32_t spatialPrefetchRadius = 3;
@@ -119,10 +125,14 @@ struct GraphPageStreamerConfig {
     // predicted LOD interval; nearby future levels get a one-cell spatial guard while farther
     // levels preload only the strict viewport. This keeps a wide LOD window affordable.
     std::uint32_t lodPrefetchNearSpatialRadius = 1;
-    std::uint32_t lodPrefetchNearDistance = 2;
+    std::uint32_t lodPrefetchNearDistance = 3;
     // Wide LOD prediction is primarily a RAM cache. Only levels close to either the visible
     // LOD or the predicted focus are proactively uploaded into the bounded GPU root cache.
-    std::uint32_t lodPrefetchGpuWarmDistance = 2;
+    std::uint32_t lodPrefetchGpuWarmDistance = 8;
+    // If the complete immutable runtime binary fits comfortably beside the normal decoded
+    // caches, load it once into RAM. Subsequent root/refinement/node faults become RAM copies
+    // and never touch the SSD.
+    bool preloadRuntimeDataWhenPossible = true;
     // Lower-LOD drawable pages are not guessed for geometry refinement. Actual shortcut
     // misses request preprocessed edge source blocks instead.
     bool prefetchLodChildren = false;
@@ -182,6 +192,11 @@ struct GraphPageStreamingStats {
     std::uint64_t ramBudgetBytes = 0;
     std::uint64_t dataCacheBudgetBytes = 0;
     std::uint64_t softBudgetBytes = 0;
+    std::uint64_t runtimeDataFileBytes = 0;
+    std::uint64_t runtimeDataResidentBytes = 0;
+    bool runtimeDataPreloadEligible = false;
+    bool runtimeDataPreloadActive = false;
+    bool runtimeDataFullyResident = false;
     std::uint64_t residentBytes = 0;
     std::uint64_t totalCpuCacheBytes = 0;
     std::uint64_t peakCpuCacheBytes = 0;
@@ -247,6 +262,10 @@ struct GraphPageStreamingStats {
     std::uint64_t nodeBlockCacheEvictions = 0;
     std::uint64_t nodeBlockCacheBytes = 0;
     std::uint64_t nodeBlockCacheBudgetBytes = 0;
+    // On UMA/iGPU systems GPU buffers consume the same physical DRAM. Startup full-runtime
+    // preloading accounts for this reservation so .chbin + CPU cache + shared GPU cache cannot
+    // silently overcommit system memory. Zero for dedicated GPUs.
+    std::uint64_t sharedGpuReservationBytes = 0;
     double lastPageLoadMs = 0.0;
     double meanPageLoadMs = 0.0;
     double maxPageLoadMs = 0.0;
@@ -264,6 +283,14 @@ struct GraphPageStreamingStats {
     std::uint32_t gpuWorkingSetRefinementBlockCount = 0;
     std::uint64_t gpuBudgetBytes = 0;
     std::uint64_t gpuAllocatedBytes = 0;
+    std::uint64_t gpuReportedAvailableBytes = 0;
+    std::uint64_t gpuReportedTotalBytes = 0;
+    std::uint64_t gpuAutoReservedBytes = 0;
+    bool gpuBudgetWasAuto = false;
+    std::uint8_t gpuMemoryArchitecture = 0; // 0 unknown, 1 dedicated, 2 unified
+    bool gpuHostSharedStorageSupported = false;
+    bool gpuHostSharedBuffersEnabled = false;
+    std::uint64_t gpuHostSharedBufferBytes = 0;
     std::uint32_t gpuRootRecordCapacity = 0;
     std::uint64_t gpuRequiredRootRecords = 0;
     std::uint64_t gpuTransitionRootRecords = 0;
@@ -289,7 +316,9 @@ struct GraphPageStreamingStats {
     std::uint32_t gpuRefinementWriteBank = 0;
     std::uint32_t gpuRefinementBanksUsed = 0;
     std::uint64_t gpuRefinementBankRecycles = 0;
+    std::uint64_t gpuRefinementForcedBankRecycles = 0;
     std::uint64_t gpuRootPageEvictions = 0;
+    std::uint64_t gpuRootWorkingSetRebases = 0;
     std::uint64_t gpuRootCacheAllocationFailures = 0;
     std::uint64_t gpuBackingBlockEvictions = 0;
     std::uint64_t gpuBackingBlockFirstUploads = 0;
@@ -386,6 +415,7 @@ private:
         std::vector<ResidentGraphPage> pages;
         std::uint64_t bytesRead = 0;
         double ioMilliseconds = 0.0;
+        bool fromDisk = true;
     };
 
     struct NodeBlockCacheEntry {
@@ -489,16 +519,24 @@ private:
     [[nodiscard]] ResidentGraphPage LoadPage(
         std::uint32_t pageId, std::ifstream& indexStream,
         analysis::detail::TextSourceScanner& graphScanner,
-        analysis::detail::TextSourceScanner& rangeScanner);
+        analysis::detail::TextSourceScanner& rangeScanner,
+        std::ifstream& runtimeStream);
     [[nodiscard]] RootPageBatchLoadResult LoadRootPageBatch(
-        std::span<const std::uint32_t> pageIds, std::ifstream& indexStream);
+        std::span<const std::uint32_t> pageIds, std::ifstream& indexStream,
+        std::ifstream& runtimeStream);
     [[nodiscard]] ResidentRefinementBlock LoadRefinementBlock(
-        std::uint32_t blockId, analysis::detail::TextSourceScanner& graphScanner);
+        std::uint32_t blockId, analysis::detail::TextSourceScanner* graphScanner,
+        std::ifstream& runtimeStream);
     [[nodiscard]] std::uint64_t RefinementTileByteOffset(
         std::uint32_t tileId, analysis::detail::TextSourceScanner& graphScanner,
         bool& builtPhysicalOffsetTable);
     [[nodiscard]] NodeBlockAccess AcquireNodeBlock(
-        std::uint32_t blockId, analysis::detail::TextSourceScanner& graphScanner);
+        std::uint32_t blockId, analysis::detail::TextSourceScanner* graphScanner,
+        std::ifstream& runtimeStream);
+    [[nodiscard]] bool ReadRuntimeBytes(std::ifstream& runtimeStream,
+                                        std::uint64_t byteOffset, void* destination,
+                                        std::size_t byteCount) const;
+    void PreloadRuntimeData(std::stop_token stopToken);
     void EvictNodeBlocksLocked(std::uint64_t targetBytes);
     [[nodiscard]] bool ReserveForLoadLocked(std::uint64_t bytes, bool required);
     void ReleaseReservationLocked(std::uint64_t bytes);
@@ -536,7 +574,13 @@ private:
     std::uint64_t appliedQueryCacheRevision_ = std::numeric_limits<std::uint64_t>::max();
     std::filesystem::path graphPath_;
     std::filesystem::path rangesPath_;
+    std::filesystem::path runtimeDataPath_;
     GraphPageStreamerConfig config_;
+    std::atomic<std::shared_ptr<const std::vector<std::byte>>> runtimeResidentImage_;
+    std::jthread runtimePreloadWorker_;
+    std::atomic<std::uint64_t> runtimeDataResidentBytes_{0};
+    bool runtimeDataPreloadEligible_ = false;
+    std::atomic<bool> runtimeDataPreloadActive_{false};
     // The decoded-node cache is a sub-budget of ramBudgetBytes. residentBytes_ and
     // reservedLoadBytes_ are constrained by dataCacheBudgetBytes_ so the combined
     // runtime cache cannot silently exceed the configured RAM budget.

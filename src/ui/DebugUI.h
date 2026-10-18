@@ -169,7 +169,7 @@ private:
     bool streamDataset_ = true;
     bool splitScreenValidation_ = true;
     int streamingRamBudgetMiB_ = 0;
-    int streamingGpuBudgetMiB_ = 384;
+    int streamingGpuBudgetMiB_ = 0;
     int selectedRoadStyleType_ = 0;
 
     std::jthread roadTypeDiagnosticWorker_;

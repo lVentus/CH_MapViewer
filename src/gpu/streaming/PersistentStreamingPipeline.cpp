@@ -10,9 +10,14 @@
 #include <bit>
 #include <chrono>
 #include <cmath>
+#include <cctype>
 #include <cstring>
+#include <cstdlib>
+#include <initializer_list>
 #include <limits>
 #include <stdexcept>
+#include <string>
+#include <string_view>
 
 namespace chmv::gpu::streaming {
 namespace {
@@ -65,6 +70,7 @@ struct DispatchIndirectCommand {
 };
 
 static_assert(sizeof(GPURootRecord) == 48);
+static_assert(sizeof(chmv::streaming::index::CHIndexRootRecord) == sizeof(GPURootRecord));
 static_assert(sizeof(GPUActivePageDescriptor) == 16);
 static_assert(sizeof(GPUBackingEndpoint) == 16);
 static_assert(sizeof(GPUBackingChildren) == 8);
@@ -83,12 +89,171 @@ std::uint32_t FloorPowerOfTwo(std::uint64_t value) {
     if (value == 0u) {
         return 0u;
     }
+    value = std::min<std::uint64_t>(value, std::numeric_limits<std::uint32_t>::max());
     return static_cast<std::uint32_t>(std::bit_floor(value));
 }
 
 constexpr std::uint64_t kMiB = 1024ull * 1024ull;
+constexpr std::uint64_t kGiB = 1024ull * kMiB;
+
+bool HasGlExtension(std::string_view name) {
+    GLint extensionCount = 0;
+    glGetIntegerv(GL_NUM_EXTENSIONS, &extensionCount);
+    for (GLint i = 0; i < extensionCount; ++i) {
+        const auto* extension = reinterpret_cast<const char*>(
+            glGetStringi(GL_EXTENSIONS, static_cast<GLuint>(i)));
+        if (extension != nullptr && name == extension) {
+            return true;
+        }
+    }
+    return false;
+}
+
+[[nodiscard]] std::string LowerAscii(const char* value) {
+    if (value == nullptr) return {};
+    std::string result(value);
+    std::transform(result.begin(), result.end(), result.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return result;
+}
+
+[[nodiscard]] bool ContainsAny(std::string_view value,
+                               std::initializer_list<std::string_view> needles) {
+    for (const auto needle : needles) {
+        if (value.find(needle) != std::string_view::npos) return true;
+    }
+    return false;
+}
+
+[[nodiscard]] GPUMemoryArchitecture DetectMemoryArchitecture(std::string_view vendor,
+                                                               std::string_view renderer) {
+    if (const auto* overrideValue = std::getenv("CHMV_GPU_MEMORY_ARCH")) {
+        const auto overrideText = LowerAscii(overrideValue);
+        if (overrideText == "unified" || overrideText == "uma" || overrideText == "integrated") {
+            return GPUMemoryArchitecture::Unified;
+        }
+        if (overrideText == "dedicated" || overrideText == "discrete") {
+            return GPUMemoryArchitecture::Dedicated;
+        }
+    }
+
+    if (vendor.find("intel") != std::string_view::npos ||
+        renderer.find("intel") != std::string_view::npos ||
+        ContainsAny(renderer, {"llvmpipe", "softpipe", "swiftshader"})) {
+        return GPUMemoryArchitecture::Unified;
+    }
+    if (vendor.find("nvidia") != std::string_view::npos) {
+        return GPUMemoryArchitecture::Dedicated;
+    }
+    if (vendor.find("amd") != std::string_view::npos ||
+        vendor.find("ati") != std::string_view::npos ||
+        renderer.find("radeon") != std::string_view::npos) {
+        // AMD exposes the same OpenGL vendor string for APUs and discrete boards. Dedicated
+        // product names are usually explicit, while current APUs commonly use generic "Radeon
+        // Graphics" or mobile iGPU names. Ambiguous systems can force the correct policy through
+        // CHMV_GPU_MEMORY_ARCH without recompiling.
+        if (ContainsAny(renderer, {" radeon rx ", "radeon rx", "radeon pro", "firepro",
+                                   "instinct", "w6800", "w7800", "w7900"})) {
+            return GPUMemoryArchitecture::Dedicated;
+        }
+        if (ContainsAny(renderer, {"radeon(tm) graphics", "radeon graphics", "780m", "760m",
+                                   "680m", "660m", "890m", "880m", "vega 3", "vega 6",
+                                   "vega 7", "vega 8", "vega 10", "vega 11"})) {
+            return GPUMemoryArchitecture::Unified;
+        }
+        return GPUMemoryArchitecture::Dedicated;
+    }
+    return GPUMemoryArchitecture::Unknown;
+}
 
 } // namespace
+
+GPUMemoryInfo QueryGpuMemoryInfo() {
+    GPUMemoryInfo result;
+    const auto vendor = LowerAscii(reinterpret_cast<const char*>(glGetString(GL_VENDOR)));
+    const auto renderer = LowerAscii(reinterpret_cast<const char*>(glGetString(GL_RENDERER)));
+    result.architecture = DetectMemoryArchitecture(vendor, renderer);
+    result.hostSharedBufferStorageSupported = GPUBuffer::HostSharedStorageSupported();
+
+    constexpr GLenum kNvxTotalAvailableMemory = 0x9048;
+    constexpr GLenum kNvxCurrentAvailableVidmem = 0x9049;
+    if (HasGlExtension("GL_NVX_gpu_memory_info")) {
+        GLint totalKiB = 0;
+        GLint availableKiB = 0;
+        glGetIntegerv(kNvxTotalAvailableMemory, &totalKiB);
+        glGetIntegerv(kNvxCurrentAvailableVidmem, &availableKiB);
+        result.reportedTotalBytes =
+            static_cast<std::uint64_t>(std::max(totalKiB, 0)) * 1024ull;
+        result.reportedAvailableBytes =
+            static_cast<std::uint64_t>(std::max(availableKiB, 0)) * 1024ull;
+        return result;
+    }
+
+    constexpr GLenum kAtiTextureFreeMemory = 0x87FC;
+    if (HasGlExtension("GL_ATI_meminfo")) {
+        GLint freeKiB[4] = {};
+        glGetIntegerv(kAtiTextureFreeMemory, freeKiB);
+        result.reportedAvailableBytes =
+            static_cast<std::uint64_t>(std::max(freeKiB[0], 0)) * 1024ull;
+    }
+    return result;
+}
+
+std::uint64_t RecommendPersistentGpuBudget(
+    const GPUMemoryInfo& gpu,
+    const chmv::streaming::runtime::SystemMemoryInfo& systemMemory,
+    std::uint64_t cpuCacheBudgetBytes,
+    std::uint64_t* reservedBytes) {
+    std::uint64_t reserve = 0u;
+    std::uint64_t budget = 1ull * kGiB;
+
+    if (gpu.architecture == GPUMemoryArchitecture::Unified) {
+        // CPU caches and GPU buffers consume the same physical DRAM on UMA. Build one shared
+        // CH_MapViewer envelope instead of independently spending "RAM budget + VRAM budget".
+        // Keep at least 25% / 4 GiB for the OS, desktop and unrelated allocations, then let all
+        // CHMV CPU+GPU caches use at most 75% of what remains. GPU receives the remainder after
+        // the configured CPU cache. This intentionally makes an iGPU slower before it swaps.
+        const auto available = systemMemory.availablePhysicalBytes;
+        if (available != 0u) {
+            reserve = std::max<std::uint64_t>(4ull * kGiB,
+                                              systemMemory.totalPhysicalBytes / 4u);
+            const auto afterReserve = available > reserve
+                                          ? available - reserve
+                                          : available * 2u / 3u;
+            const auto sharedEnvelope = afterReserve * 3u / 4u;
+            if (sharedEnvelope > cpuCacheBudgetBytes + 384ull * kMiB) {
+                budget = sharedEnvelope - cpuCacheBudgetBytes;
+            } else {
+                budget = std::max<std::uint64_t>(384ull * kMiB, sharedEnvelope / 3u);
+            }
+            // A single OpenGL cache should not dominate shared memory even if CPU cache was set
+            // manually very small.
+            budget = std::min<std::uint64_t>(budget, afterReserve / 2u);
+        } else {
+            budget = 768ull * kMiB;
+        }
+    } else if (gpu.reportedAvailableBytes != 0u) {
+        const auto available = gpu.reportedAvailableBytes;
+        if (gpu.reportedTotalBytes != 0u) {
+            const auto proportionalReserve = gpu.reportedTotalBytes * 15u / 100u;
+            reserve = std::max<std::uint64_t>(2ull * kGiB, proportionalReserve);
+            const auto afterReserve = available > reserve
+                                          ? available - reserve
+                                          : available * 3u / 4u;
+            budget = std::min(afterReserve, gpu.reportedTotalBytes * 4u / 5u);
+        } else {
+            reserve = std::max<std::uint64_t>(1ull * kGiB, available / 8u);
+            const auto afterReserve = available > reserve
+                                          ? available - reserve
+                                          : available * 3u / 4u;
+            budget = std::min<std::uint64_t>(afterReserve, available * 4u / 5u);
+        }
+    }
+
+    if (reservedBytes != nullptr) *reservedBytes = reserve;
+    return std::max<std::uint64_t>(budget, 384ull * kMiB);
+}
 
 PersistentStreamingPipeline::PersistentStreamingPipeline(
     const std::filesystem::path& shaderDirectory)
@@ -118,7 +283,24 @@ void PersistentStreamingPipeline::Initialize(
     Reset();
     index_ = &index;
     config_ = config;
+    const bool automaticGpuBudget = config_.gpuBudgetBytes == 0u;
+    const auto gpuMemory = QueryGpuMemoryInfo();
+    if (config_.memoryArchitecture == GPUMemoryArchitecture::Unknown) {
+        config_.memoryArchitecture = gpuMemory.architecture;
+    }
+    std::uint64_t automaticReservedBytes = 0u;
+    if (automaticGpuBudget) {
+        auto effectiveGpuMemory = gpuMemory;
+        effectiveGpuMemory.architecture = config_.memoryArchitecture;
+        config_.gpuBudgetBytes = RecommendPersistentGpuBudget(
+            effectiveGpuMemory, chmv::streaming::runtime::QuerySystemMemoryInfo(),
+            config_.cpuCacheBudgetBytes, &automaticReservedBytes);
+    }
     config_.gpuBudgetBytes = std::max<std::uint64_t>(config_.gpuBudgetBytes, 128ull * kMiB);
+    useUnifiedHostSharedBuffers_ =
+        config_.memoryArchitecture == GPUMemoryArchitecture::Unified &&
+        config_.enableUnifiedHostSharedBuffers && gpuMemory.hostSharedBufferStorageSupported;
+    hostSharedBufferBytes_ = 0u;
     if (index.edgeBlockRecordCount == 0 || index.graphEdgeBlocks.empty()) {
         throw std::runtime_error("persistent streaming requires a non-empty preprocessed edge-block index");
     }
@@ -135,45 +317,51 @@ void PersistentStreamingPipeline::Initialize(
     const auto maxBlockSize = static_cast<std::uint64_t>(
         std::max<GLint64>(maxBlockSizeSigned, 1));
 
-    // Root residency is correctness-critical: if the strict current-view set almost fits, it
-    // must not churn simply because the automatic partition stopped a few MiB short. At the
-    // default 384 MiB budget, 104 MiB reaches the hard 2^21-record root cap exactly while
-    // preserving most of the previous backing-cache budget. Smaller budgets scale down.
+    // Root residency is correctness-critical. The previous 104 MiB / 2^21 ceiling could leave a
+    // perfectly valid view permanently stuck at an older LOD by only a few thousand records.
+    // Give root residency a substantial share and let the actual SSBO limit be the ceiling.
     const auto rootBudget = config_.rootCacheBudgetBytes != 0
                                 ? config_.rootCacheBudgetBytes
                                 : std::clamp<std::uint64_t>(
-                                      (config_.gpuBudgetBytes * 13u) / 48u,
-                                      32ull * kMiB, 104ull * kMiB);
+                                      config_.gpuBudgetBytes * 3u / 10u,
+                                      32ull * kMiB, 768ull * kMiB);
     const auto geometryBudget = config_.refinementGeometryBudgetBytes != 0
                                     ? config_.refinementGeometryBudgetBytes
                                     : std::clamp<std::uint64_t>(
-                                          config_.gpuBudgetBytes / 6u, 16ull * kMiB, 64ull * kMiB);
+                                          config_.gpuBudgetBytes / 4u,
+                                          16ull * kMiB, 1ull * kGiB);
     const auto hashBudget = config_.refinementHashBudgetBytes != 0
                                 ? config_.refinementHashBudgetBytes
                                 : std::clamp<std::uint64_t>(
-                                      config_.gpuBudgetBytes / 24u, 4ull * kMiB, 16ull * kMiB);
+                                      config_.gpuBudgetBytes / 24u,
+                                      4ull * kMiB, 128ull * kMiB);
     // Final draw items are correctness output, not a cache. Give them enough room for the
     // observed multi-million-segment refined views without consuming the much larger theoretical
     // root+leaf worst case from the backing cache. Overflow remains explicitly reported below.
     const auto drawBudget = std::clamp<std::uint64_t>(
-        config_.gpuBudgetBytes / 12u, 8ull * kMiB, 32ull * kMiB);
+        config_.gpuBudgetBytes / 12u, 8ull * kMiB, 256ull * kMiB);
     const auto rootByBudget = rootBudget / (sizeof(GPURootRecord) + sizeof(std::uint32_t));
     const auto rootBySsbo = std::min<std::uint64_t>(
         maxBlockSize / sizeof(GPURootRecord), maxBlockSize / sizeof(std::uint32_t));
-    rootRecordCapacity_ = static_cast<std::uint32_t>(std::clamp<std::uint64_t>(
-        std::min<std::uint64_t>({MaxRootRecordCapacity, rootByBudget, rootBySsbo}),
-        65536u, MaxRootRecordCapacity));
+    const auto rootUpper = std::min<std::uint64_t>(
+        {rootByBudget, rootBySsbo, std::numeric_limits<std::uint32_t>::max()});
+    if (rootUpper < 65536u) {
+        throw std::runtime_error("persistent GPU budget cannot hold the minimum root cache");
+    }
+    rootRecordCapacity_ = static_cast<std::uint32_t>(rootUpper);
 
     const auto hashEntriesByBudget = hashBudget / (4u * sizeof(std::uint32_t));
     const auto hashEntriesBySsbo = maxBlockSize / (4u * sizeof(std::uint32_t));
     refinementHashCapacity_ = FloorPowerOfTwo(std::min<std::uint64_t>(
-        {MaxRefinementHashCapacity, hashEntriesByBudget, hashEntriesBySsbo}));
+        {hashEntriesByBudget, hashEntriesBySsbo,
+         static_cast<std::uint64_t>(std::numeric_limits<std::uint32_t>::max())}));
     refinementHashCapacity_ = std::max<std::uint32_t>(refinementHashCapacity_, 65536u);
 
     const auto leafByBudget = geometryBudget / sizeof(GPUBackingEndpoint);
     const auto leafBySsbo = maxBlockSize / sizeof(GPUBackingEndpoint);
     leafArenaCapacity_ = static_cast<std::uint32_t>(std::min<std::uint64_t>(
-        {MaxLeafArenaCapacity, leafByBudget, leafBySsbo}));
+        {leafByBudget, leafBySsbo,
+         static_cast<std::uint64_t>(std::numeric_limits<std::uint32_t>::max())}));
     leafArenaCapacity_ = std::max<std::uint32_t>(
         (leafArenaCapacity_ / RefinementBankCount) * RefinementBankCount,
         RefinementBankCount * 32768u);
@@ -185,7 +373,8 @@ void PersistentStreamingPipeline::Initialize(
     const auto drawByBudget = drawBudget / (sizeof(std::uint32_t) + sizeof(float));
     const auto drawBySsbo = maxBlockSize / sizeof(std::uint32_t);
     drawCapacity_ = static_cast<std::uint32_t>(std::min<std::uint64_t>(
-        {static_cast<std::uint64_t>(MaxLeafArenaCapacity), drawByBudget, drawBySsbo}));
+        {drawByBudget, drawBySsbo,
+         static_cast<std::uint64_t>(std::numeric_limits<std::uint32_t>::max())}));
     drawCapacity_ = std::max<std::uint32_t>(drawCapacity_, rootRecordCapacity_);
 
     requestWordCount_ = (backingBlockCount_ + 31u) / 32u;
@@ -258,8 +447,8 @@ void PersistentStreamingPipeline::Initialize(
     const auto slotsByRoadTypeSsbo =
         packedRoadTypeBytesPerSlot == 0u ? 0u : maxBlockSize / packedRoadTypeBytesPerSlot;
     backingBlockCapacity_ = static_cast<std::uint32_t>(std::min<std::uint64_t>(
-        {MaxBackingBlockCapacity, static_cast<std::uint64_t>(backingBlockCount_),
-         slotsByBudget, slotsByEndpointSsbo, slotsByChildSsbo, slotsByErrorSsbo,
+        {static_cast<std::uint64_t>(backingBlockCount_), slotsByBudget,
+         slotsByEndpointSsbo, slotsByChildSsbo, slotsByErrorSsbo,
          slotsByRoadTypeSsbo}));
     if (backingBlockCapacity_ < 16u) {
         throw std::runtime_error(
@@ -289,17 +478,31 @@ void PersistentStreamingPipeline::Initialize(
     CheckBufferSize(drawBytes, "persistent draw edge list");
     CheckBufferSize(drawAlphaBytes, "persistent draw alpha list");
 
-    rootRecordBuffer_.Allocate(rootBytes, nullptr, GL_DYNAMIC_DRAW);
+    auto allocateCpuProducedBuffer = [&](GPUBuffer& buffer, std::size_t bytes) {
+        if (useUnifiedHostSharedBuffers_) {
+            if (buffer.AllocateHostShared(bytes, nullptr)) {
+                hostSharedBufferBytes_ += bytes;
+            }
+            return;
+        }
+        buffer.Allocate(bytes, nullptr, GL_DYNAMIC_DRAW);
+    };
+
+    // Root and refinement-backing payloads are CPU-produced and GPU-read-only between cache
+    // updates. On UMA use persistently mapped client storage so the producer writes the same GL
+    // allocation consumed by compute shaders instead of feeding glBufferSubData through a second
+    // driver upload allocation. GPU-written/transient buffers remain device-managed.
+    allocateCpuProducedBuffer(rootRecordBuffer_, rootBytes);
     visibleRootBuffer_.Allocate(visibleRootBytes, nullptr, GL_DYNAMIC_DRAW);
     activePageDescriptorBuffer_.Allocate(activeDescriptorBytes, nullptr, GL_DYNAMIC_DRAW);
 
     const std::uint32_t zero = 0;
     visibleRootCounterBuffer_.Allocate(sizeof(zero), &zero, GL_DYNAMIC_DRAW);
 
-    blockEndpointBuffer_.Allocate(endpointBytes, nullptr, GL_DYNAMIC_DRAW);
-    blockChildBuffer_.Allocate(childBytes, nullptr, GL_DYNAMIC_DRAW);
-    blockGeometryErrorBuffer_.Allocate(geometryErrorBytes, nullptr, GL_DYNAMIC_DRAW);
-    blockRoadTypeBuffer_.Allocate(roadTypeBytes, nullptr, GL_DYNAMIC_DRAW);
+    allocateCpuProducedBuffer(blockEndpointBuffer_, endpointBytes);
+    allocateCpuProducedBuffer(blockChildBuffer_, childBytes);
+    allocateCpuProducedBuffer(blockGeometryErrorBuffer_, geometryErrorBytes);
+    allocateCpuProducedBuffer(blockRoadTypeBuffer_, roadTypeBytes);
     std::vector<std::uint32_t> emptyPageTable(backingBlockCount_, 0u);
     blockPageTableBuffer_.Allocate(pageTableBytes, emptyPageTable.data(), GL_DYNAMIC_DRAW);
 
@@ -353,6 +556,14 @@ void PersistentStreamingPipeline::Initialize(
 
     stats_.gpuBudgetBytes = config_.gpuBudgetBytes;
     stats_.gpuAllocatedBytes = allocatedGpuBytes_;
+    stats_.gpuReportedAvailableBytes = gpuMemory.reportedAvailableBytes;
+    stats_.gpuReportedTotalBytes = gpuMemory.reportedTotalBytes;
+    stats_.gpuAutoReservedBytes = automaticReservedBytes;
+    stats_.gpuBudgetWasAuto = automaticGpuBudget;
+    stats_.gpuMemoryArchitecture = config_.memoryArchitecture;
+    stats_.gpuHostSharedStorageSupported = gpuMemory.hostSharedBufferStorageSupported;
+    stats_.gpuHostSharedBuffersEnabled = useUnifiedHostSharedBuffers_ && hostSharedBufferBytes_ != 0u;
+    stats_.gpuHostSharedBufferBytes = hostSharedBufferBytes_;
     stats_.gpuRootRecordCapacity = rootRecordCapacity_;
     stats_.drawCapacity = drawCapacity_;
     stats_.gpuBackingBlockCapacity = backingBlockCapacity_;
@@ -376,6 +587,8 @@ void PersistentStreamingPipeline::Reset() {
     index_ = nullptr;
     config_ = {};
     allocatedGpuBytes_ = 0;
+    useUnifiedHostSharedBuffers_ = false;
+    hostSharedBufferBytes_ = 0;
     rootRecordCapacity_ = 0;
     activeDescriptorCapacity_ = 0;
     activePageCount_ = 0;
@@ -393,6 +606,7 @@ void PersistentStreamingPipeline::Reset() {
     lastAdaptiveDecisionScale_ = 0.0f;
     lastBackingReadbackWasFresh_ = false;
     refinementBankRecycleCount_ = 0;
+    refinementForcedBankRecycleCount_ = 0;
     latestRefinementBankUsed_.fill(0u);
     latestRefinementBankOverflow_.fill(0u);
     latestRefinementBankLastUse_.fill(0u);
@@ -414,7 +628,26 @@ bool PersistentStreamingPipeline::HasRootPage(std::uint32_t pageId) const {
     return rootPages_.contains(pageId);
 }
 
-std::uint32_t PersistentStreamingPipeline::AllocateRootRange(std::uint32_t count) {
+void PersistentStreamingPipeline::ClearRootCache() {
+    // Rebase is rare. In host-shared mode make sure no previous compute dispatch can still read a
+    // range before every range becomes immediately reusable by the CPU.
+    if (useUnifiedHostSharedBuffers_ && !rootPages_.empty()) {
+        glFinish();
+    }
+    rootPages_.clear();
+    rootFreeRanges_.clear();
+    if (rootRecordCapacity_ != 0u) {
+        rootFreeRanges_.push_back({0u, rootRecordCapacity_});
+    }
+    protectedRootPageIds_.clear();
+    activePageIds_.clear();
+    activePageCount_ = 0u;
+    stats_.gpuRootPagesCached = 0u;
+    stats_.gpuRootPagesActive = 0u;
+    ++stats_.rootWorkingSetRebases;
+}
+
+std::uint32_t PersistentStreamingPipeline::AllocateRootRange(std::uint32_t count, bool allowEviction) {
     if (count == 0 || count > rootRecordCapacity_) {
         return InvalidId;
     }
@@ -432,7 +665,7 @@ std::uint32_t PersistentStreamingPipeline::AllocateRootRange(std::uint32_t count
             }
             return offset;
         }
-        if (!EvictOneInactiveRootPage()) {
+        if (!allowEviction || !EvictOneInactiveRootPage()) {
             return InvalidId;
         }
     }
@@ -464,6 +697,10 @@ bool PersistentStreamingPipeline::EvictOneInactiveRootPage() {
         if (protectedRootPageIds_.contains(it->first)) {
             continue;
         }
+        if (useUnifiedHostSharedBuffers_ && it->second.lastGpuUseFrame != 0u &&
+            backingFrameSerial_ - it->second.lastGpuUseFrame < HostSharedReuseDelayFrames) {
+            continue;
+        }
         if (candidate == rootPages_.end() || it->second.lastUse < candidate->second.lastUse) {
             candidate = it;
         }
@@ -480,7 +717,8 @@ bool PersistentStreamingPipeline::EvictOneInactiveRootPage() {
 
 bool PersistentStreamingPipeline::UploadRootPage(
     const chmv::streaming::runtime::ResidentGraphPage& page,
-    std::span<const std::uint64_t> edgeSpatialBounds) {
+    std::span<const std::uint64_t> edgeSpatialBounds,
+    bool allowEviction) {
     if (!index_ || (page.rootRecords.empty() && page.edges.empty())) {
         return false;
     }
@@ -493,24 +731,50 @@ bool PersistentStreamingPipeline::UploadRootPage(
         throw std::runtime_error("root page edge count exceeds uint32");
     }
     const auto count = static_cast<std::uint32_t>(recordCount);
-    const auto offset = AllocateRootRange(count);
+    const auto offset = AllocateRootRange(count, allowEviction);
     if (offset == InvalidId) {
-        ++stats_.rootCacheAllocationFailures;
+        if (allowEviction) {
+            ++stats_.rootCacheAllocationFailures;
+        }
         return false;
     }
 
     const auto begin = std::chrono::steady_clock::now();
-    std::vector<GPURootRecord> records;
-    records.reserve(recordCount);
+    const auto destinationOffset = static_cast<std::size_t>(offset) * sizeof(GPURootRecord);
     if (!page.rootRecords.empty()) {
-        for (const auto& root : page.rootRecords) {
-            records.push_back({
-                root.globalEdgeId, root.birthLevel, root.deathLevel,
-                root.boundsLo, root.boundsHi, root.childA, root.childB, root.geometryError,
-                root.sourceX, root.sourceY, root.targetX, root.targetY,
-            });
+        // CHIDX v8 root payload intentionally has the exact GPU byte layout. Avoid the old
+        // per-record repack and write it directly into the persistent cache. On UMA this memcpy
+        // targets the persistently mapped SSBO itself.
+        rootRecordBuffer_.Update(destinationOffset,
+                                 page.rootRecords.size() * sizeof(GPURootRecord),
+                                 page.rootRecords.data());
+    } else if (auto* mapped = static_cast<GPURootRecord*>(
+                   rootRecordBuffer_.MappedData(destinationOffset))) {
+        for (std::size_t i = 0; i < page.edges.size(); ++i) {
+            const auto& edge = page.edges[i];
+            if (edge.globalEdgeId >= edgeSpatialBounds.size()) {
+                FreeRootRange(offset, count);
+                throw std::runtime_error("root page edge is missing preprocessed spatial bounds");
+            }
+            if (edge.sourceLocal >= page.nodes.size() || edge.targetLocal >= page.nodes.size()) {
+                FreeRootRange(offset, count);
+                throw std::runtime_error(
+                    "root page edge endpoint is outside the resident page node table");
+            }
+            const auto packed = edgeSpatialBounds[edge.globalEdgeId];
+            auto boundsLo = static_cast<std::uint32_t>(packed & 0xffffffffull);
+            auto boundsHi = static_cast<std::uint32_t>(packed >> 32u);
+            chmv::streaming::index::EncodeRootRoadStyle(boundsLo, boundsHi, edge.roadStyleType);
+            const auto& source = page.nodes[edge.sourceLocal];
+            const auto& target = page.nodes[edge.targetLocal];
+            mapped[i] = {edge.globalEdgeId, edge.birthLevel, edge.deathLevel,
+                         boundsLo, boundsHi, edge.childA, edge.childB, 0.0f,
+                         source.x, source.y, target.x, target.y};
         }
+        rootRecordBuffer_.CommitHostWrites();
     } else {
+        std::vector<GPURootRecord> records;
+        records.reserve(recordCount);
         for (const auto& edge : page.edges) {
             if (edge.globalEdgeId >= edgeSpatialBounds.size()) {
                 FreeRootRange(offset, count);
@@ -524,22 +788,19 @@ bool PersistentStreamingPipeline::UploadRootPage(
             const auto packed = edgeSpatialBounds[edge.globalEdgeId];
             auto boundsLo = static_cast<std::uint32_t>(packed & 0xffffffffull);
             auto boundsHi = static_cast<std::uint32_t>(packed >> 32u);
-            chmv::streaming::index::EncodeRootRoadStyle(
-                boundsLo, boundsHi, edge.roadStyleType);
+            chmv::streaming::index::EncodeRootRoadStyle(boundsLo, boundsHi, edge.roadStyleType);
             const auto& source = page.nodes[edge.sourceLocal];
             const auto& target = page.nodes[edge.targetLocal];
-            records.push_back({
-                edge.globalEdgeId, edge.birthLevel, edge.deathLevel,
-                boundsLo, boundsHi, edge.childA, edge.childB, 0.0f,
-                source.x, source.y, target.x, target.y,
-            });
+            records.push_back({edge.globalEdgeId, edge.birthLevel, edge.deathLevel,
+                               boundsLo, boundsHi, edge.childA, edge.childB, 0.0f,
+                               source.x, source.y, target.x, target.y});
         }
+        rootRecordBuffer_.Update(destinationOffset, records.size() * sizeof(GPURootRecord),
+                                 records.data());
     }
-    rootRecordBuffer_.Update(static_cast<std::size_t>(offset) * sizeof(GPURootRecord),
-                             records.size() * sizeof(GPURootRecord), records.data());
-    rootPages_[page.pageId] = {offset, count, ++useCounter_};
+    rootPages_[page.pageId] = {offset, count, ++useCounter_, 0u};
 
-    stats_.incrementalRootBytesUploaded += records.size() * sizeof(GPURootRecord);
+    stats_.incrementalRootBytesUploaded += recordCount * sizeof(GPURootRecord);
     stats_.lastRootUploadMs = std::chrono::duration<double, std::milli>(
                                   std::chrono::steady_clock::now() - begin)
                                   .count();
@@ -582,6 +843,7 @@ void PersistentStreamingPipeline::SetActiveRootPages(
             continue;
         }
         found->second.lastUse = ++useCounter_;
+        found->second.lastGpuUseFrame = backingFrameSerial_;
         descriptors.push_back({found->second.offset, found->second.count, pageId, 0u});
         installed.push_back(pageId);
     }
@@ -628,9 +890,14 @@ bool PersistentStreamingPipeline::EvictOneUnpinnedBackingBlock() {
         }
 
         // GPU block-use feedback is asynchronous. Avoid throwing out a block during the few
-        // Process() calls between upload and its first readback-visible use.
+        // Process() calls between upload and its first readback-visible use. Persistently mapped
+        // UMA storage also must not be overwritten while an older GPU dispatch can still read it.
         const auto ageFrames = backingFrameSerial_ - slot.uploadedFrame;
         if (ageFrames < BackingUploadGraceFrames) {
+            continue;
+        }
+        if (useUnifiedHostSharedBuffers_ && slot.lastGpuUseFrame != 0u &&
+            backingFrameSerial_ - slot.lastGpuUseFrame < HostSharedReuseDelayFrames) {
             continue;
         }
         if (matureCandidate == backingBlockToSlot_.end() ||
@@ -640,12 +907,11 @@ bool PersistentStreamingPipeline::EvictOneUnpinnedBackingBlock() {
     }
 
     auto candidate = matureCandidate;
-    if (candidate == backingBlockToSlot_.end()) {
+    if (candidate == backingBlockToSlot_.end() && !useUnifiedHostSharedBuffers_) {
         candidate = fallbackCandidate;
         if (candidate != backingBlockToSlot_.end()) {
-            // Soft grace must never turn cache pressure into an allocation failure. Count the
-            // fallback so telemetry can tell whether the configured GPU budget is too tight for
-            // even the readback-latency window.
+            // Device-local glBufferSubData can let the driver synchronize a young overwrite. The
+            // host-shared path cannot safely do that, so UMA waits for a mature slot instead.
             ++stats_.backingGraceFallbackEvictions;
         }
     }
@@ -683,53 +949,90 @@ bool PersistentStreamingPipeline::UploadBackingBlock(
     freeBackingSlots_.pop_back();
     const auto begin = std::chrono::steady_clock::now();
 
-    std::vector<GPUBackingEndpoint> endpoints;
-    std::vector<GPUBackingChildren> children;
-    std::vector<float> geometryErrors;
     const auto packedRoadTypeWordsPerSlot =
         (static_cast<std::size_t>(backingBlockRecordCount_) + 3u) / 4u;
-    std::vector<std::uint32_t> roadTypes((block.edges.size() + 3u) / 4u, 0u);
-    endpoints.reserve(block.edges.size());
-    children.reserve(block.edges.size());
-    geometryErrors.reserve(block.edges.size());
-    std::size_t edgeIndex = 0u;
-    for (const auto& edge : block.edges) {
-        if (edge.sourceLocal >= block.nodes.size() || edge.targetLocal >= block.nodes.size()) {
-            freeBackingSlots_.push_back(slot);
-            throw std::runtime_error("refinement block contains invalid local node indices");
-        }
-        const auto& source = block.nodes[edge.sourceLocal];
-        const auto& target = block.nodes[edge.targetLocal];
-        endpoints.push_back({source.x, source.y, target.x, target.y});
-        children.push_back({edge.childA, edge.childB});
-        geometryErrors.push_back(edge.geometryError);
-        const auto shift = static_cast<std::uint32_t>((edgeIndex & 3u) * 8u);
-        roadTypes[edgeIndex >> 2u] |= (edge.roadStyleType & 0x3fu) << shift;
-        ++edgeIndex;
-    }
-
     if (block.edges.size() > backingBlockRecordCount_) {
         freeBackingSlots_.push_back(slot);
         throw std::runtime_error("refinement runtime tile exceeds GPU backing-slot capacity");
     }
-    const auto baseRecord =
-        static_cast<std::size_t>(slot) * backingBlockRecordCount_;
-    if (!endpoints.empty()) {
-        blockEndpointBuffer_.Update(baseRecord * sizeof(GPUBackingEndpoint),
-                                    endpoints.size() * sizeof(GPUBackingEndpoint),
-                                    endpoints.data());
-        blockChildBuffer_.Update(baseRecord * sizeof(GPUBackingChildren),
-                                 children.size() * sizeof(GPUBackingChildren), children.data());
-        blockGeometryErrorBuffer_.Update(baseRecord * sizeof(float),
-                                         geometryErrors.size() * sizeof(float),
-                                         geometryErrors.data());
-        const auto baseRoadTypeWord =
-            static_cast<std::size_t>(slot) * packedRoadTypeWordsPerSlot;
-        blockRoadTypeBuffer_.Update(baseRoadTypeWord * sizeof(std::uint32_t),
-                                    roadTypes.size() * sizeof(std::uint32_t), roadTypes.data());
+
+    const auto baseRecord = static_cast<std::size_t>(slot) * backingBlockRecordCount_;
+    const auto baseRoadTypeWord = static_cast<std::size_t>(slot) * packedRoadTypeWordsPerSlot;
+    const auto roadTypeWordCount = (block.edges.size() + 3u) / 4u;
+    const bool directSharedWrite =
+        blockEndpointBuffer_.IsHostShared() && blockChildBuffer_.IsHostShared() &&
+        blockGeometryErrorBuffer_.IsHostShared() && blockRoadTypeBuffer_.IsHostShared();
+
+    if (directSharedWrite) {
+        auto* endpoints = static_cast<GPUBackingEndpoint*>(
+            blockEndpointBuffer_.MappedData(baseRecord * sizeof(GPUBackingEndpoint)));
+        auto* children = static_cast<GPUBackingChildren*>(
+            blockChildBuffer_.MappedData(baseRecord * sizeof(GPUBackingChildren)));
+        auto* geometryErrors = static_cast<float*>(
+            blockGeometryErrorBuffer_.MappedData(baseRecord * sizeof(float)));
+        auto* roadTypes = static_cast<std::uint32_t*>(
+            blockRoadTypeBuffer_.MappedData(baseRoadTypeWord * sizeof(std::uint32_t)));
+        if (endpoints == nullptr || children == nullptr || geometryErrors == nullptr ||
+            roadTypes == nullptr) {
+            freeBackingSlots_.push_back(slot);
+            throw std::runtime_error("UMA shared backing mapping unexpectedly unavailable");
+        }
+        if (roadTypeWordCount != 0u) {
+            std::memset(roadTypes, 0, roadTypeWordCount * sizeof(std::uint32_t));
+        }
+        for (std::size_t edgeIndex = 0; edgeIndex < block.edges.size(); ++edgeIndex) {
+            const auto& edge = block.edges[edgeIndex];
+            if (edge.sourceLocal >= block.nodes.size() || edge.targetLocal >= block.nodes.size()) {
+                freeBackingSlots_.push_back(slot);
+                throw std::runtime_error("refinement block contains invalid local node indices");
+            }
+            const auto& source = block.nodes[edge.sourceLocal];
+            const auto& target = block.nodes[edge.targetLocal];
+            endpoints[edgeIndex] = {source.x, source.y, target.x, target.y};
+            children[edgeIndex] = {edge.childA, edge.childB};
+            geometryErrors[edgeIndex] = edge.geometryError;
+            const auto shift = static_cast<std::uint32_t>((edgeIndex & 3u) * 8u);
+            roadTypes[edgeIndex >> 2u] |= (edge.roadStyleType & 0x3fu) << shift;
+        }
+        blockEndpointBuffer_.CommitHostWrites();
+    } else {
+        std::vector<GPUBackingEndpoint> endpoints;
+        std::vector<GPUBackingChildren> children;
+        std::vector<float> geometryErrors;
+        std::vector<std::uint32_t> roadTypes(roadTypeWordCount, 0u);
+        endpoints.reserve(block.edges.size());
+        children.reserve(block.edges.size());
+        geometryErrors.reserve(block.edges.size());
+        std::size_t edgeIndex = 0u;
+        for (const auto& edge : block.edges) {
+            if (edge.sourceLocal >= block.nodes.size() || edge.targetLocal >= block.nodes.size()) {
+                freeBackingSlots_.push_back(slot);
+                throw std::runtime_error("refinement block contains invalid local node indices");
+            }
+            const auto& source = block.nodes[edge.sourceLocal];
+            const auto& target = block.nodes[edge.targetLocal];
+            endpoints.push_back({source.x, source.y, target.x, target.y});
+            children.push_back({edge.childA, edge.childB});
+            geometryErrors.push_back(edge.geometryError);
+            const auto shift = static_cast<std::uint32_t>((edgeIndex & 3u) * 8u);
+            roadTypes[edgeIndex >> 2u] |= (edge.roadStyleType & 0x3fu) << shift;
+            ++edgeIndex;
+        }
+        if (!endpoints.empty()) {
+            blockEndpointBuffer_.Update(baseRecord * sizeof(GPUBackingEndpoint),
+                                        endpoints.size() * sizeof(GPUBackingEndpoint),
+                                        endpoints.data());
+            blockChildBuffer_.Update(baseRecord * sizeof(GPUBackingChildren),
+                                     children.size() * sizeof(GPUBackingChildren), children.data());
+            blockGeometryErrorBuffer_.Update(baseRecord * sizeof(float),
+                                             geometryErrors.size() * sizeof(float),
+                                             geometryErrors.data());
+            blockRoadTypeBuffer_.Update(baseRoadTypeWord * sizeof(std::uint32_t),
+                                        roadTypes.size() * sizeof(std::uint32_t), roadTypes.data());
+        }
     }
 
-    backingSlots_[slot] = {block.blockId, ++useCounter_, backingFrameSerial_};
+    backingSlots_[slot] = {block.blockId, ++useCounter_, backingFrameSerial_, 0u};
     backingBlockToSlot_[block.blockId] = slot;
     SetPageTableEntry(block.blockId, slot + 1u);
 
@@ -744,10 +1047,8 @@ bool PersistentStreamingPipeline::UploadBackingBlock(
     glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT | GL_SHADER_STORAGE_BARRIER_BIT);
 
     stats_.incrementalBackingBytesUploaded +=
-        endpoints.size() * sizeof(GPUBackingEndpoint) +
-        children.size() * sizeof(GPUBackingChildren) +
-        geometryErrors.size() * sizeof(float) +
-        roadTypes.size() * sizeof(std::uint32_t);
+        block.edges.size() * (sizeof(GPUBackingEndpoint) + sizeof(GPUBackingChildren) + sizeof(float)) +
+        roadTypeWordCount * sizeof(std::uint32_t);
     stats_.lastBackingUploadMs = std::chrono::duration<double, std::milli>(
                                      std::chrono::steady_clock::now() - begin)
                                      .count();
@@ -875,6 +1176,41 @@ void PersistentStreamingPipeline::RotateRefinementBankIfNeeded() {
     }
     if (candidate != InvalidId) {
         RecycleRefinementBank(candidate);
+        return;
+    }
+
+    // If all banks are technically "hot" but the cache contains far more historical roots than
+    // the current visible working set, refusing to recycle forever is worse than a brief fallback
+    // of a small subset of roots. That was the old failure mode: all eight banks stayed pinned by
+    // a handful of visible roots while hundreds of thousands of stale roots occupied almost all
+    // geometry, so overflow could never recover. Recycle the least-recently-used non-write bank;
+    // visible roots from that bank fall back to their self-contained root segment and are rebuilt
+    // into the current generation on following frames. If the current view itself genuinely fills
+    // the arena, do not force a recycle loop -- larger/auto VRAM capacity handles that case.
+    const auto visible = std::max<std::uint32_t>(stats_.visibleRootCount, 1u);
+    const auto staleThreshold = std::max<std::uint64_t>(
+        static_cast<std::uint64_t>(visible) * 4u,
+        static_cast<std::uint64_t>(visible) + 4096u);
+    if (stats_.cachedRefinedRoots <= staleThreshold) {
+        return;
+    }
+
+    candidate = InvalidId;
+    oldestUse = std::numeric_limits<std::uint32_t>::max();
+    for (std::uint32_t bank = 0; bank < RefinementBankCount; ++bank) {
+        if (bank == refinementWriteBank_ || latestRefinementBankUsed_[bank] == 0u) {
+            continue;
+        }
+        const auto lastUse = latestRefinementBankLastUse_[bank];
+        if (candidate == InvalidId || lastUse < oldestUse) {
+            candidate = bank;
+            oldestUse = lastUse;
+        }
+    }
+    if (candidate != InvalidId) {
+        RecycleRefinementBank(candidate);
+        ++refinementForcedBankRecycleCount_;
+        stats_.refinementForcedBankRecycles = refinementForcedBankRecycleCount_;
     }
 }
 
@@ -1219,6 +1555,7 @@ std::vector<std::uint32_t> PersistentStreamingPipeline::ReadMissingBackingBlocks
             if (const auto found = backingBlockToSlot_.find(blockId);
                 found != backingBlockToSlot_.end()) {
                 backingSlots_[found->second].lastUse = ++useCounter_;
+                backingSlots_[found->second].lastGpuUseFrame = backingFrameSerial_;
                 ++touchedBlocks;
             }
             bits &= bits - 1u;

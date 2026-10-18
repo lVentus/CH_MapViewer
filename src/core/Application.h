@@ -80,7 +80,8 @@ private:
     bool streamingRamBudgetAuto_ = true;
     std::uint32_t streamingRamBudgetMiB_ = 0;
     float streamingMemoryBudgetPollSeconds_ = 0.0f;
-    std::uint32_t streamingGpuBudgetMiB_ = 384;
+    // Zero means automatic VRAM-aware budget selection inside PersistentStreamingPipeline.
+    std::uint32_t streamingGpuBudgetMiB_ = 0;
     // The camera may cross an automatic LOD threshold before the next root-page set has arrived.
     // Keep drawing the last complete LOD and atomically commit the new one once its strict
     // viewport pages are GPU-resident; this prevents partial-road zoom transitions.

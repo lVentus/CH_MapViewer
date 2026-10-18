@@ -30,6 +30,7 @@ struct PreprocessPaths {
     std::filesystem::path directory;
     std::filesystem::path graphPath;
     std::filesystem::path rangesPath;
+    std::filesystem::path runtimeDataPath;
     std::filesystem::path indexPath;
     std::filesystem::path manifestPath;
     std::filesystem::path originalGraphPath;

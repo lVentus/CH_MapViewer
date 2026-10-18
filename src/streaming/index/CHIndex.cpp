@@ -1,4 +1,5 @@
 #include "streaming/index/CHIndex.h"
+#include "streaming/runtime/RuntimeData.h"
 
 #include <algorithm>
 #include <array>
@@ -16,9 +17,11 @@ namespace {
 constexpr std::array<char, 8> kMagicV5{'C', 'H', 'M', 'V', 'I', 'D', 'X', '5'};
 constexpr std::array<char, 8> kMagicV6{'C', 'H', 'M', 'V', 'I', 'D', 'X', '6'};
 constexpr std::array<char, 8> kMagicV7{'C', 'H', 'M', 'V', 'I', 'D', 'X', '7'};
+constexpr std::array<char, 8> kMagicV8{'C', 'H', 'M', 'V', 'I', 'D', 'X', '8'};
 constexpr std::uint32_t kFormatVersionV5 = 5;
 constexpr std::uint32_t kFormatVersionV6 = 6;
-constexpr std::uint32_t kFormatVersion = 7;
+constexpr std::uint32_t kLegacyFormatVersion = 7;
+constexpr std::uint32_t kFormatVersion = 8;
 constexpr std::uint32_t kEndianTag = 0x01020304u;
 
 struct FileStamp {
@@ -72,9 +75,32 @@ struct Header {
     std::uint64_t membershipOffset = 0;
     std::uint64_t edgeSpatialBoundsOffset = 0;
     std::uint64_t rootPayloadOffset = 0;
+
+    // v8: source text remains untouched; runtime payload and query accelerators live separately.
+    FileStamp runtimeData;
+    std::uint64_t runtimeNodeSectionOffset = 0;
+    std::uint64_t runtimeEdgeSectionOffset = 0;
+    std::uint64_t runtimeRootSectionOffset = 0;
+    std::uint64_t runtimeDataFileBytes = 0;
+    std::uint32_t lodAliveWordsPerLevel = 0;
+    std::uint64_t spatialLevelCount = 0;
+    std::uint64_t spatialRowCount = 0;
+    std::uint64_t spatialCellCount = 0;
+    std::uint64_t spatialPageIdCount = 0;
+    std::uint64_t pageSpatialBoundsCount = 0;
+    std::uint64_t lodAliveBitWordCount = 0;
+    std::uint64_t lodAliveCountCount = 0;
+    std::uint64_t spatialLevelsOffset = 0;
+    std::uint64_t spatialRowsOffset = 0;
+    std::uint64_t spatialCellsOffset = 0;
+    std::uint64_t spatialPageIdsOffset = 0;
+    std::uint64_t pageSpatialBoundsOffset = 0;
+    std::uint64_t lodAliveBitsOffset = 0;
+    std::uint64_t lodAliveCountsOffset = 0;
 };
 
 constexpr std::uint64_t kHeaderSerializedSize = 320;
+constexpr std::uint64_t kHeaderSerializedSizeV8 = 512;
 constexpr std::uint64_t kSourceBlockSerializedSize = 8 + 4 + 8;
 constexpr std::uint64_t kGraphPageSerializedSize = 84;
 constexpr std::uint64_t kSpatialPageRefSerializedSize = 12;
@@ -114,7 +140,9 @@ T ReadValue(std::istream& input) {
 }
 
 void WriteHeader(std::ostream& output, const Header& header) {
-    const auto& magic = header.version >= kFormatVersion ? kMagicV7 : kMagicV6;
+    const auto& magic = header.version >= kFormatVersion ? kMagicV8
+                         : header.version >= kLegacyFormatVersion ? kMagicV7
+                         : kMagicV6;
     output.write(magic.data(), static_cast<std::streamsize>(magic.size()));
     WriteValue(output, header.version);
     WriteValue(output, header.endianTag);
@@ -159,31 +187,61 @@ void WriteHeader(std::ostream& output, const Header& header) {
     WriteValue(output, header.membershipOffset);
     WriteValue(output, header.edgeSpatialBoundsOffset);
     WriteValue(output, header.rootPayloadOffset);
+    if (header.version >= kFormatVersion) {
+        WriteValue(output, header.runtimeData.size);
+        WriteValue(output, header.runtimeData.writeTime);
+        WriteValue(output, header.runtimeNodeSectionOffset);
+        WriteValue(output, header.runtimeEdgeSectionOffset);
+        WriteValue(output, header.runtimeRootSectionOffset);
+        WriteValue(output, header.runtimeDataFileBytes);
+        WriteValue(output, header.lodAliveWordsPerLevel);
+        WriteValue(output, std::uint32_t{0});
+        WriteValue(output, header.spatialLevelCount);
+        WriteValue(output, header.spatialRowCount);
+        WriteValue(output, header.spatialCellCount);
+        WriteValue(output, header.spatialPageIdCount);
+        WriteValue(output, header.pageSpatialBoundsCount);
+        WriteValue(output, header.lodAliveBitWordCount);
+        WriteValue(output, header.lodAliveCountCount);
+        WriteValue(output, header.spatialLevelsOffset);
+        WriteValue(output, header.spatialRowsOffset);
+        WriteValue(output, header.spatialCellsOffset);
+        WriteValue(output, header.spatialPageIdsOffset);
+        WriteValue(output, header.pageSpatialBoundsOffset);
+        WriteValue(output, header.lodAliveBitsOffset);
+        WriteValue(output, header.lodAliveCountsOffset);
+        const auto written = static_cast<std::uint64_t>(output.tellp());
+        if (written > kHeaderSerializedSizeV8) {
+            throw std::runtime_error("CHIDX v8 header overflow");
+        }
+        std::array<char, 512> zeros{};
+        output.write(zeros.data(), static_cast<std::streamsize>(kHeaderSerializedSizeV8 - written));
+        if (!output) throw std::runtime_error("failed to pad CHIDX v8 header");
+    }
 }
 
 Header ReadHeader(std::istream& input) {
     std::array<char, 8> magic{};
     input.read(magic.data(), static_cast<std::streamsize>(magic.size()));
-    if (!input || (magic != kMagicV5 && magic != kMagicV6 && magic != kMagicV7)) {
+    if (!input || (magic != kMagicV5 && magic != kMagicV6 && magic != kMagicV7 && magic != kMagicV8)) {
         throw std::runtime_error("invalid CH index magic");
     }
-
     Header header;
     header.version = ReadValue<std::uint32_t>(input);
     header.endianTag = ReadValue<std::uint32_t>(input);
     if (header.version != kFormatVersionV5 && header.version != kFormatVersionV6 &&
-        header.version != kFormatVersion) {
+        header.version != kLegacyFormatVersion && header.version != kFormatVersion) {
         throw std::runtime_error("unsupported CH index version");
     }
     if ((header.version == kFormatVersionV5 && magic != kMagicV5) ||
         (header.version == kFormatVersionV6 && magic != kMagicV6) ||
-        (header.version == kFormatVersion && magic != kMagicV7)) {
+        (header.version == kLegacyFormatVersion && magic != kMagicV7) ||
+        (header.version == kFormatVersion && magic != kMagicV8)) {
         throw std::runtime_error("CH index magic/version mismatch");
     }
     if (header.endianTag != kEndianTag || std::endian::native != std::endian::little) {
         throw std::runtime_error("CH index currently requires little-endian storage");
     }
-
     header.graph.size = ReadValue<std::uint64_t>(input);
     header.graph.writeTime = ReadValue<std::int64_t>(input);
     header.ranges.size = ReadValue<std::uint64_t>(input);
@@ -212,9 +270,7 @@ Header ReadHeader(std::istream& input) {
     header.pageMaskWordCount = ReadValue<std::uint64_t>(input);
     header.membershipByteCount = ReadValue<std::uint64_t>(input);
     header.edgeSpatialBoundsCount = ReadValue<std::uint64_t>(input);
-    if (header.version >= kFormatVersionV6) {
-        header.rootPayloadRecordCount = ReadValue<std::uint64_t>(input);
-    }
+    if (header.version >= kFormatVersionV6) header.rootPayloadRecordCount = ReadValue<std::uint64_t>(input);
     header.nodeBlocksOffset = ReadValue<std::uint64_t>(input);
     header.graphEdgeBlocksOffset = ReadValue<std::uint64_t>(input);
     header.rangeEdgeBlocksOffset = ReadValue<std::uint64_t>(input);
@@ -226,8 +282,30 @@ Header ReadHeader(std::istream& input) {
     header.pageMasksOffset = ReadValue<std::uint64_t>(input);
     header.membershipOffset = ReadValue<std::uint64_t>(input);
     header.edgeSpatialBoundsOffset = ReadValue<std::uint64_t>(input);
-    if (header.version >= kFormatVersionV6) {
-        header.rootPayloadOffset = ReadValue<std::uint64_t>(input);
+    if (header.version >= kFormatVersionV6) header.rootPayloadOffset = ReadValue<std::uint64_t>(input);
+    if (header.version >= kFormatVersion) {
+        header.runtimeData.size = ReadValue<std::uint64_t>(input);
+        header.runtimeData.writeTime = ReadValue<std::int64_t>(input);
+        header.runtimeNodeSectionOffset = ReadValue<std::uint64_t>(input);
+        header.runtimeEdgeSectionOffset = ReadValue<std::uint64_t>(input);
+        header.runtimeRootSectionOffset = ReadValue<std::uint64_t>(input);
+        header.runtimeDataFileBytes = ReadValue<std::uint64_t>(input);
+        header.lodAliveWordsPerLevel = ReadValue<std::uint32_t>(input);
+        (void)ReadValue<std::uint32_t>(input);
+        header.spatialLevelCount = ReadValue<std::uint64_t>(input);
+        header.spatialRowCount = ReadValue<std::uint64_t>(input);
+        header.spatialCellCount = ReadValue<std::uint64_t>(input);
+        header.spatialPageIdCount = ReadValue<std::uint64_t>(input);
+        header.pageSpatialBoundsCount = ReadValue<std::uint64_t>(input);
+        header.lodAliveBitWordCount = ReadValue<std::uint64_t>(input);
+        header.lodAliveCountCount = ReadValue<std::uint64_t>(input);
+        header.spatialLevelsOffset = ReadValue<std::uint64_t>(input);
+        header.spatialRowsOffset = ReadValue<std::uint64_t>(input);
+        header.spatialCellsOffset = ReadValue<std::uint64_t>(input);
+        header.spatialPageIdsOffset = ReadValue<std::uint64_t>(input);
+        header.pageSpatialBoundsOffset = ReadValue<std::uint64_t>(input);
+        header.lodAliveBitsOffset = ReadValue<std::uint64_t>(input);
+        header.lodAliveCountsOffset = ReadValue<std::uint64_t>(input);
     }
     return header;
 }
@@ -294,22 +372,6 @@ CHIndexGraphPage ReadGraphPage(std::istream& input, std::uint32_t formatVersion)
     return page;
 }
 
-CHIndexRootRecord ReadRootRecord(std::istream& input) {
-    CHIndexRootRecord record;
-    record.globalEdgeId = ReadValue<std::uint32_t>(input);
-    record.birthLevel = ReadValue<std::int32_t>(input);
-    record.deathLevel = ReadValue<std::int32_t>(input);
-    record.boundsLo = ReadValue<std::uint32_t>(input);
-    record.boundsHi = ReadValue<std::uint32_t>(input);
-    record.childA = ReadValue<std::uint32_t>(input);
-    record.childB = ReadValue<std::uint32_t>(input);
-    record.geometryError = ReadValue<float>(input);
-    record.sourceX = ReadValue<float>(input);
-    record.sourceY = ReadValue<float>(input);
-    record.targetX = ReadValue<float>(input);
-    record.targetY = ReadValue<float>(input);
-    return record;
-}
 
 void WriteSpatialPageRef(std::ostream& output, const CHIndexSpatialPageRef& ref) {
     WriteValue(output, ref.key);
@@ -348,10 +410,137 @@ std::vector<T> ReadScalarArray(std::istream& input, std::uint64_t offset,
     }
     Seek(input, offset);
     std::vector<T> values(static_cast<std::size_t>(count));
-    for (auto& value : values) {
-        value = ReadValue<T>(input);
+    if (!values.empty()) {
+        input.read(reinterpret_cast<char*>(values.data()),
+                   static_cast<std::streamsize>(values.size() * sizeof(T)));
+        if (!input) throw std::runtime_error("truncated CH index scalar array");
     }
     return values;
+}
+
+
+template <typename T>
+void WriteRawArray(std::ostream& output, std::span<const T> values) {
+    static_assert(std::is_trivially_copyable_v<T>);
+    if (values.empty()) return;
+    output.write(reinterpret_cast<const char*>(values.data()),
+                 static_cast<std::streamsize>(values.size_bytes()));
+    if (!output) throw std::runtime_error("failed to write CHIDX v8 array");
+}
+
+template <typename T>
+std::vector<T> ReadRawArray(std::istream& input, std::uint64_t offset, std::uint64_t count) {
+    static_assert(std::is_trivially_copyable_v<T>);
+    if (count > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()))
+        throw std::runtime_error("CHIDX v8 array is too large");
+    Seek(input, offset);
+    std::vector<T> result(static_cast<std::size_t>(count));
+    if (!result.empty()) {
+        input.read(reinterpret_cast<char*>(result.data()),
+                   static_cast<std::streamsize>(result.size() * sizeof(T)));
+        if (!input) throw std::runtime_error("truncated CHIDX v8 array");
+    }
+    return result;
+}
+
+struct V8DerivedIndex {
+    std::vector<CHIndexSpatialLevel> levels;
+    std::vector<CHIndexSpatialRow> rows;
+    std::vector<CHIndexSpatialCell> cells;
+    std::vector<std::uint32_t> pageIds;
+    std::vector<CHIndexPageSpatialBounds> pageBounds;
+    std::vector<std::uint64_t> lodAliveBits;
+    std::vector<std::uint32_t> lodAliveCounts;
+    std::uint32_t wordsPerLevel = 0;
+};
+
+V8DerivedIndex BuildV8Derived(const CHIndexBuildData& data) {
+    V8DerivedIndex out;
+    auto refs = data.spatialPageRefs;
+    std::sort(refs.begin(), refs.end(), [](const auto& a, const auto& b) {
+        return a.key != b.key ? a.key < b.key : a.pageId < b.pageId;
+    });
+    if (refs.empty()) return out;
+    const auto maxSpatialLevel = static_cast<std::uint32_t>((refs.back().key >> 32u) & 0xffu);
+    out.levels.resize(static_cast<std::size_t>(maxSpatialLevel) + 1u);
+    std::size_t refPos = 0;
+    for (std::uint32_t level = 0; level <= maxSpatialLevel; ++level) {
+        const auto scale = std::uint64_t{1} << level;
+        const auto rowCount = static_cast<std::uint32_t>((data.spatialGridSize + scale - 1u) / scale);
+        out.levels[level] = {static_cast<std::uint32_t>(out.rows.size()), rowCount};
+        for (std::uint32_t y = 0; y < rowCount; ++y) {
+            CHIndexSpatialRow row{static_cast<std::uint32_t>(out.cells.size()), 0u};
+            while (refPos < refs.size()) {
+                const auto key = refs[refPos].key;
+                const auto refLevel = static_cast<std::uint32_t>((key >> 32u) & 0xffu);
+                const auto refY = static_cast<std::uint32_t>((key >> 16u) & 0xffffu);
+                if (refLevel < level || (refLevel == level && refY < y)) { ++refPos; continue; }
+                if (refLevel != level || refY != y) break;
+                const auto tileX = static_cast<std::uint32_t>(key & 0xffffu);
+                CHIndexSpatialCell cell{tileX, static_cast<std::uint32_t>(out.pageIds.size()), 0u};
+                while (refPos < refs.size() && refs[refPos].key == key) {
+                    if (refs[refPos].pageId >= data.graphPages.size())
+                        throw std::runtime_error("CHIDX v8 has an invalid spatial page reference");
+                    out.pageIds.push_back(refs[refPos].pageId);
+                    ++refPos;
+                }
+                cell.pageRefCount = static_cast<std::uint32_t>(out.pageIds.size()) - cell.pageRefOffset;
+                out.cells.push_back(cell);
+            }
+            row.cellCount = static_cast<std::uint32_t>(out.cells.size()) - row.cellOffset;
+            out.rows.push_back(row);
+        }
+    }
+
+    out.pageBounds.resize(data.graphPages.size());
+    std::vector<std::uint8_t> valid(data.graphPages.size(), 0u);
+    const auto gridMax = data.spatialGridSize == 0 ? 0ull : static_cast<std::uint64_t>(data.spatialGridSize) - 1u;
+    for (const auto& ref : refs) {
+        const auto level = static_cast<std::uint32_t>((ref.key >> 32u) & 0xffu);
+        if (level >= 31u) continue;
+        const auto tileX = static_cast<std::uint32_t>(ref.key & 0xffffu);
+        const auto tileY = static_cast<std::uint32_t>((ref.key >> 16u) & 0xffffu);
+        const auto scale = std::uint64_t{1} << level;
+        const auto reach = scale / 2u;
+        const auto startX = static_cast<std::uint64_t>(tileX) * scale;
+        const auto startY = static_cast<std::uint64_t>(tileY) * scale;
+        const auto endX = std::min<std::uint64_t>(gridMax, (static_cast<std::uint64_t>(tileX) + 1u) * scale - 1u);
+        const auto endY = std::min<std::uint64_t>(gridMax, (static_cast<std::uint64_t>(tileY) + 1u) * scale - 1u);
+        CHIndexPageSpatialBounds b{
+            static_cast<std::uint32_t>(startX > reach ? startX - reach : 0u),
+            static_cast<std::uint32_t>(startY > reach ? startY - reach : 0u),
+            static_cast<std::uint32_t>(std::min<std::uint64_t>(gridMax, endX + reach)),
+            static_cast<std::uint32_t>(std::min<std::uint64_t>(gridMax, endY + reach))};
+        auto& dst = out.pageBounds[ref.pageId];
+        if (!valid[ref.pageId]) { dst = b; valid[ref.pageId] = 1u; }
+        else {
+            dst.minX = std::min(dst.minX, b.minX); dst.minY = std::min(dst.minY, b.minY);
+            dst.maxX = std::max(dst.maxX, b.maxX); dst.maxY = std::max(dst.maxY, b.maxY);
+        }
+    }
+
+    out.wordsPerLevel = static_cast<std::uint32_t>((data.graphPages.size() + 63u) / 64u);
+    out.lodAliveCounts.assign(static_cast<std::size_t>(data.maxLevel) + 1u, 0u);
+    out.lodAliveBits.assign((static_cast<std::size_t>(data.maxLevel) + 1u) * out.wordsPerLevel, 0ull);
+    for (std::uint32_t pageId = 0; pageId < data.graphPages.size(); ++pageId) {
+        const auto& page = data.graphPages[pageId];
+        for (std::uint32_t word = 0; word < data.lodMaskWordsPerPage; ++word) {
+            const auto source = static_cast<std::size_t>(page.lodMaskOffset) + word;
+            if (source >= data.pageAliveMasks.size()) throw std::runtime_error("CHIDX v8 alive-mask range is invalid");
+            auto bits = data.pageAliveMasks[source];
+            while (bits) {
+                const auto bit = static_cast<std::uint32_t>(std::countr_zero(bits));
+                const auto level = word * 64u + bit;
+                if (level <= data.maxLevel) {
+                    out.lodAliveBits[static_cast<std::size_t>(level) * out.wordsPerLevel + pageId / 64u] |=
+                        std::uint64_t{1} << (pageId & 63u);
+                    ++out.lodAliveCounts[level];
+                }
+                bits &= bits - 1u;
+            }
+        }
+    }
+    return out;
 }
 
 void EncodeVarUInt32(std::uint32_t value, std::vector<std::uint8_t>& output) {
@@ -403,6 +592,7 @@ std::vector<std::uint8_t> EncodeMembership(
 Header BuildHeader(const analysis::DatasetLayoutAnalysisReport& report,
                    std::uint64_t membershipByteCount) {
     Header header;
+    header.version = kLegacyFormatVersion;
     header.graph = GetFileStamp(report.graphPath);
     header.ranges = GetFileStamp(report.rangesPath);
     header.nodeCount = report.nodeCount;
@@ -456,10 +646,13 @@ Header BuildHeader(const analysis::DatasetLayoutAnalysisReport& report,
     header.rootPayloadOffset = 0;
     return header;
 }
-Header BuildHeader(const CHIndexBuildData& data) {
+Header BuildHeader(const CHIndexBuildData& data, const V8DerivedIndex& derived,
+                   const runtime::RuntimeDataHeader& runtimeHeader) {
     Header header;
+    header.version = kFormatVersion;
     header.graph = GetFileStamp(data.graphPath);
     header.ranges = GetFileStamp(data.rangesPath);
+    header.runtimeData = GetFileStamp(data.runtimeDataPath);
     header.nodeCount = data.nodeCount;
     header.edgeCount = data.edgeCount;
     header.maxLevel = data.maxLevel;
@@ -475,43 +668,62 @@ Header BuildHeader(const CHIndexBuildData& data) {
     header.maxLongitude = data.maxLongitude;
     header.nodeBlockCount = data.nodeBlocks.size();
     header.graphEdgeBlockCount = data.graphEdgeBlocks.size();
-    header.rangeEdgeBlockCount = data.rangeEdgeBlocks.size();
+    header.rangeEdgeBlockCount = 0;
     header.graphPageCount = data.graphPages.size();
-    header.spatialPageRefCount = data.spatialPageRefs.size();
+    header.spatialPageRefCount = 0;
     header.sourceBlockRefCount = data.pageSourceBlockRefs.size();
     header.childSourceBlockRefCount = data.pageChildSourceBlockRefs.size();
     header.lodChildPageRefCount = data.pageLodChildRefs.size();
     header.pageMaskWordCount = data.pageAliveMasks.size();
-    header.membershipByteCount = data.membershipByteCount;
-    header.edgeSpatialBoundsCount = data.edgeSpatialBoundsCount;
+    header.membershipByteCount = 0;
+    header.edgeSpatialBoundsCount = 0;
     header.rootPayloadRecordCount = data.rootPayloadRecordCount;
+    header.runtimeNodeSectionOffset = runtimeHeader.nodeSectionOffset;
+    header.runtimeEdgeSectionOffset = runtimeHeader.edgeSectionOffset;
+    header.runtimeRootSectionOffset = runtimeHeader.rootSectionOffset;
+    header.runtimeDataFileBytes = runtimeHeader.fileBytes;
+    header.lodAliveWordsPerLevel = derived.wordsPerLevel;
+    header.spatialLevelCount = derived.levels.size();
+    header.spatialRowCount = derived.rows.size();
+    header.spatialCellCount = derived.cells.size();
+    header.spatialPageIdCount = derived.pageIds.size();
+    header.pageSpatialBoundsCount = derived.pageBounds.size();
+    header.lodAliveBitWordCount = derived.lodAliveBits.size();
+    header.lodAliveCountCount = derived.lodAliveCounts.size();
 
-    header.nodeBlocksOffset = kHeaderSerializedSize;
+    header.nodeBlocksOffset = kHeaderSerializedSizeV8;
     header.graphEdgeBlocksOffset =
         header.nodeBlocksOffset + header.nodeBlockCount * kSourceBlockSerializedSize;
     header.rangeEdgeBlocksOffset =
         header.graphEdgeBlocksOffset + header.graphEdgeBlockCount * kSourceBlockSerializedSize;
-    header.graphPagesOffset =
-        header.rangeEdgeBlocksOffset + header.rangeEdgeBlockCount * kSourceBlockSerializedSize;
+    header.graphPagesOffset = header.rangeEdgeBlocksOffset;
     header.spatialPageRefsOffset =
         header.graphPagesOffset + header.graphPageCount * kGraphPageSerializedSize;
-    header.sourceBlockRefsOffset =
-        header.spatialPageRefsOffset +
-        header.spatialPageRefCount * kSpatialPageRefSerializedSize;
+    header.sourceBlockRefsOffset = header.spatialPageRefsOffset;
     header.childSourceBlockRefsOffset =
         header.sourceBlockRefsOffset + header.sourceBlockRefCount * sizeof(std::uint32_t);
     header.lodChildPageRefsOffset =
-        header.childSourceBlockRefsOffset +
-        header.childSourceBlockRefCount * sizeof(std::uint32_t);
+        header.childSourceBlockRefsOffset + header.childSourceBlockRefCount * sizeof(std::uint32_t);
     header.pageMasksOffset =
         header.lodChildPageRefsOffset + header.lodChildPageRefCount * sizeof(std::uint32_t);
     header.membershipOffset =
         header.pageMasksOffset + header.pageMaskWordCount * sizeof(std::uint64_t);
-    header.edgeSpatialBoundsOffset = header.membershipOffset + header.membershipByteCount;
-    header.rootPayloadOffset = header.rootPayloadRecordCount == 0
-                                   ? 0
-                                   : header.edgeSpatialBoundsOffset +
-                                         header.edgeSpatialBoundsCount * sizeof(std::uint64_t);
+    header.edgeSpatialBoundsOffset = header.membershipOffset;
+    header.rootPayloadOffset = 0;
+    header.spatialLevelsOffset = header.membershipOffset;
+    header.spatialRowsOffset =
+        header.spatialLevelsOffset + header.spatialLevelCount * sizeof(CHIndexSpatialLevel);
+    header.spatialCellsOffset =
+        header.spatialRowsOffset + header.spatialRowCount * sizeof(CHIndexSpatialRow);
+    header.spatialPageIdsOffset =
+        header.spatialCellsOffset + header.spatialCellCount * sizeof(CHIndexSpatialCell);
+    header.pageSpatialBoundsOffset =
+        header.spatialPageIdsOffset + header.spatialPageIdCount * sizeof(std::uint32_t);
+    header.lodAliveBitsOffset =
+        header.pageSpatialBoundsOffset +
+        header.pageSpatialBoundsCount * sizeof(CHIndexPageSpatialBounds);
+    header.lodAliveCountsOffset =
+        header.lodAliveBitsOffset + header.lodAliveBitWordCount * sizeof(std::uint64_t);
     return header;
 }
 
@@ -533,8 +745,16 @@ bool MatchesSourceLayout(const Header& header, const std::filesystem::path& grap
 bool Matches(const Header& header, const std::filesystem::path& graphPath,
              const std::filesystem::path& rangesPath,
              const analysis::DatasetLayoutAnalysisConfig& config) {
-    return header.version == kFormatVersion &&
-           MatchesSourceLayout(header, graphPath, rangesPath, config);
+    if (!MatchesSourceLayout(header, graphPath, rangesPath, config)) return false;
+    if (header.version == kLegacyFormatVersion) return true;
+    if (header.version != kFormatVersion) return false;
+    const auto runtimePath = runtime::RuntimeData::DefaultPath(graphPath);
+    const auto runtimeStamp = GetFileStamp(runtimePath);
+    return runtimeStamp.size != 0 &&
+           header.runtimeData.size == runtimeStamp.size &&
+           header.runtimeData.writeTime == runtimeStamp.writeTime &&
+           runtime::RuntimeData::IsValid(runtimePath, header.nodeCount, header.edgeCount,
+                                         header.rootPayloadRecordCount);
 }
 
 template <typename T>
@@ -704,131 +924,39 @@ void CHIndex::Write(const analysis::DatasetLayoutAnalysisReport& report,
 
 void CHIndex::Write(const CHIndexBuildData& data,
                     const std::filesystem::path& indexPath) {
-    if (data.nodeBlocks.empty() || data.graphEdgeBlocks.empty() ||
-        data.rangeEdgeBlocks.empty() || data.graphPages.empty() ||
-        data.spatialPageRefs.empty()) {
-        throw std::runtime_error("external CH index build data is incomplete");
+    if (data.runtimeDataPath.empty() || !std::filesystem::is_regular_file(data.runtimeDataPath) ||
+        data.nodeBlocks.empty() || data.graphEdgeBlocks.empty() || data.graphPages.empty() ||
+        data.spatialPageRefs.empty() || data.pageAliveMasks.empty()) {
+        throw std::runtime_error("external CHIDX v8 build data is incomplete");
     }
-    if (!std::filesystem::is_regular_file(data.membershipBytesPath)) {
-        throw std::runtime_error("external CH index membership stream is missing");
+    const auto runtimeHeader = runtime::RuntimeData::ReadHeader(data.runtimeDataPath);
+    if (runtimeHeader.nodeCount != data.nodeCount || runtimeHeader.edgeCount != data.edgeCount ||
+        runtimeHeader.rootRecordCount != data.rootPayloadRecordCount) {
+        throw std::runtime_error("runtime binary and CHIDX v8 counts do not match");
     }
-    if (!std::filesystem::is_regular_file(data.edgeSpatialBoundsPath) ||
-        data.edgeSpatialBoundsCount != data.edgeCount) {
-        throw std::runtime_error("external CH index edge-spatial-bounds stream is missing or invalid");
-    }
-    if (data.rootPayloadRecordCount != 0 &&
-        !std::filesystem::is_regular_file(data.rootPayloadPath)) {
-        throw std::runtime_error("external CH index root-payload stream is missing");
-    }
-
-    const auto header = BuildHeader(data);
+    const auto derived = BuildV8Derived(data);
+    const auto header = BuildHeader(data, derived, runtimeHeader);
     const auto temporaryPath = std::filesystem::path(indexPath.string() + ".tmp");
     std::ofstream output(temporaryPath, std::ios::binary | std::ios::trunc);
-    if (!output) {
-        throw std::runtime_error("could not write CH index: " + temporaryPath.string());
-    }
+    if (!output) throw std::runtime_error("could not write CHIDX v8: " + temporaryPath.string());
 
     WriteHeader(output, header);
-    for (const auto& block : data.nodeBlocks) {
-        WriteSourceBlock(output, block);
-    }
-    for (const auto& block : data.graphEdgeBlocks) {
-        WriteSourceBlock(output, block);
-    }
-    for (const auto& block : data.rangeEdgeBlocks) {
-        WriteSourceBlock(output, block);
-    }
-    for (const auto& page : data.graphPages) {
-        WriteGraphPage(output, page);
-    }
-    for (const auto& ref : data.spatialPageRefs) {
-        WriteSpatialPageRef(output, ref);
-    }
-    for (const auto value : data.pageSourceBlockRefs) {
-        WriteValue(output, value);
-    }
-    for (const auto value : data.pageChildSourceBlockRefs) {
-        WriteValue(output, value);
-    }
-    for (const auto value : data.pageLodChildRefs) {
-        WriteValue(output, value);
-    }
-    for (const auto value : data.pageAliveMasks) {
-        WriteValue(output, value);
-    }
-
-    std::ifstream membership(data.membershipBytesPath, std::ios::binary);
-    if (!membership) {
-        throw std::runtime_error("could not read CH index membership stream");
-    }
-    std::vector<char> copyBuffer(1u << 20u);
-    std::uint64_t copied = 0;
-    while (membership && copied < data.membershipByteCount) {
-        const auto remaining = data.membershipByteCount - copied;
-        const auto count = static_cast<std::streamsize>(
-            std::min<std::uint64_t>(remaining, copyBuffer.size()));
-        membership.read(copyBuffer.data(), count);
-        const auto got = membership.gcount();
-        if (got <= 0) {
-            break;
-        }
-        output.write(copyBuffer.data(), got);
-        copied += static_cast<std::uint64_t>(got);
-    }
-    if (copied != data.membershipByteCount) {
-        throw std::runtime_error("truncated CH index membership stream");
-    }
-
-    std::ifstream spatialBounds(data.edgeSpatialBoundsPath, std::ios::binary);
-    if (!spatialBounds) {
-        throw std::runtime_error("could not read CH index edge-spatial-bounds stream");
-    }
-    const auto expectedBoundsBytes = data.edgeSpatialBoundsCount * sizeof(std::uint64_t);
-    copied = 0;
-    while (spatialBounds && copied < expectedBoundsBytes) {
-        const auto remaining = expectedBoundsBytes - copied;
-        const auto count = static_cast<std::streamsize>(
-            std::min<std::uint64_t>(remaining, copyBuffer.size()));
-        spatialBounds.read(copyBuffer.data(), count);
-        const auto got = spatialBounds.gcount();
-        if (got <= 0) {
-            break;
-        }
-        output.write(copyBuffer.data(), got);
-        copied += static_cast<std::uint64_t>(got);
-    }
-    if (copied != expectedBoundsBytes) {
-        throw std::runtime_error("truncated CH index edge-spatial-bounds stream");
-    }
-
-    if (data.rootPayloadRecordCount != 0) {
-        std::ifstream rootPayload(data.rootPayloadPath, std::ios::binary);
-        if (!rootPayload) {
-            throw std::runtime_error("could not read CH index root-payload stream");
-        }
-        const auto expectedRootBytes =
-            data.rootPayloadRecordCount * kRootRecordSerializedSize;
-        copied = 0;
-        while (rootPayload && copied < expectedRootBytes) {
-            const auto remaining = expectedRootBytes - copied;
-            const auto count = static_cast<std::streamsize>(
-                std::min<std::uint64_t>(remaining, copyBuffer.size()));
-            rootPayload.read(copyBuffer.data(), count);
-            const auto got = rootPayload.gcount();
-            if (got <= 0) {
-                break;
-            }
-            output.write(copyBuffer.data(), got);
-            copied += static_cast<std::uint64_t>(got);
-        }
-        if (copied != expectedRootBytes) {
-            throw std::runtime_error("truncated CH index root-payload stream");
-        }
-    }
+    for (const auto& block : data.nodeBlocks) WriteSourceBlock(output, block);
+    for (const auto& block : data.graphEdgeBlocks) WriteSourceBlock(output, block);
+    for (const auto& page : data.graphPages) WriteGraphPage(output, page);
+    WriteRawArray<std::uint32_t>(output, data.pageSourceBlockRefs);
+    WriteRawArray<std::uint32_t>(output, data.pageChildSourceBlockRefs);
+    WriteRawArray<std::uint32_t>(output, data.pageLodChildRefs);
+    WriteRawArray<std::uint64_t>(output, data.pageAliveMasks);
+    WriteRawArray<CHIndexSpatialLevel>(output, derived.levels);
+    WriteRawArray<CHIndexSpatialRow>(output, derived.rows);
+    WriteRawArray<CHIndexSpatialCell>(output, derived.cells);
+    WriteRawArray<std::uint32_t>(output, derived.pageIds);
+    WriteRawArray<CHIndexPageSpatialBounds>(output, derived.pageBounds);
+    WriteRawArray<std::uint64_t>(output, derived.lodAliveBits);
+    WriteRawArray<std::uint32_t>(output, derived.lodAliveCounts);
     output.close();
-    if (!output) {
-        throw std::runtime_error("failed to finalize CH index");
-    }
+    if (!output) throw std::runtime_error("failed to finalize CHIDX v8");
 
     std::error_code error;
     std::filesystem::remove(indexPath, error);
@@ -836,7 +964,7 @@ void CHIndex::Write(const CHIndexBuildData& data,
     std::filesystem::rename(temporaryPath, indexPath, error);
     if (error) {
         std::filesystem::remove(temporaryPath);
-        throw std::runtime_error("could not replace CH index: " + error.message());
+        throw std::runtime_error("could not replace CHIDX v8: " + error.message());
     }
 }
 
@@ -868,6 +996,11 @@ CHIndexData CHIndex::Load(const std::filesystem::path& indexPath) {
     result.edgeSpatialBoundsCount = header.edgeSpatialBoundsCount;
     result.rootPayloadSectionOffset = header.rootPayloadOffset;
     result.rootPayloadRecordCount = header.rootPayloadRecordCount;
+    result.runtimeNodeSectionOffset = header.runtimeNodeSectionOffset;
+    result.runtimeEdgeSectionOffset = header.runtimeEdgeSectionOffset;
+    result.runtimeRootSectionOffset = header.runtimeRootSectionOffset;
+    result.runtimeDataFileBytes = header.runtimeDataFileBytes;
+    result.lodAliveWordsPerLevel = header.lodAliveWordsPerLevel;
 
     const auto checkCount = [](std::uint64_t count) {
         if (count > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
@@ -914,20 +1047,46 @@ CHIndexData CHIndex::Load(const std::filesystem::path& indexPath) {
         input, header.lodChildPageRefsOffset, header.lodChildPageRefCount);
     result.pageAliveMasks = ReadScalarArray<std::uint64_t>(
         input, header.pageMasksOffset, header.pageMaskWordCount);
-    if (header.edgeSpatialBoundsCount != header.edgeCount) {
-        throw std::runtime_error("CH index edge-spatial-bounds count does not match edge count");
+    if (header.version >= kFormatVersion) {
+        result.spatialLevels = ReadRawArray<CHIndexSpatialLevel>(
+            input, header.spatialLevelsOffset, header.spatialLevelCount);
+        result.spatialRows = ReadRawArray<CHIndexSpatialRow>(
+            input, header.spatialRowsOffset, header.spatialRowCount);
+        result.spatialCells = ReadRawArray<CHIndexSpatialCell>(
+            input, header.spatialCellsOffset, header.spatialCellCount);
+        result.spatialPageIds = ReadRawArray<std::uint32_t>(
+            input, header.spatialPageIdsOffset, header.spatialPageIdCount);
+        result.pageSpatialBounds = ReadRawArray<CHIndexPageSpatialBounds>(
+            input, header.pageSpatialBoundsOffset, header.pageSpatialBoundsCount);
+        result.lodAlivePageBits = ReadRawArray<std::uint64_t>(
+            input, header.lodAliveBitsOffset, header.lodAliveBitWordCount);
+        result.lodAlivePageCounts = ReadRawArray<std::uint32_t>(
+            input, header.lodAliveCountsOffset, header.lodAliveCountCount);
+        if (result.pageSpatialBounds.size() != result.graphPages.size() ||
+            result.lodAlivePageCounts.size() != static_cast<std::size_t>(result.maxLevel) + 1u ||
+            result.lodAliveWordsPerLevel != (result.graphPages.size() + 63u) / 64u) {
+            throw std::runtime_error("CHIDX v8 accelerator metadata is inconsistent");
+        }
     }
-    // v5 had no binary root payload, so its runtime still needs the full bounds vector to build
-    // root records from text source pages. v6 keeps the billion-edge bounds table on disk and
-    // reads only the contiguous ranges needed by backing/refinement work.
-    if (header.version == kFormatVersionV5 || header.rootPayloadRecordCount == 0) {
-        result.edgeSpatialBounds = ReadScalarArray<std::uint64_t>(
-            input, header.edgeSpatialBoundsOffset, header.edgeSpatialBoundsCount);
-    }
-    if (header.version >= kFormatVersionV6 && header.rootPayloadRecordCount != 0) {
-        if (header.rootPayloadOffset == 0) {
+    if (header.version < kFormatVersion) {
+        if (header.edgeSpatialBoundsCount != header.edgeCount) {
+            throw std::runtime_error("CH index edge-spatial-bounds count does not match edge count");
+        }
+        if (header.version == kFormatVersionV5 || header.rootPayloadRecordCount == 0) {
+            result.edgeSpatialBounds = ReadScalarArray<std::uint64_t>(
+                input, header.edgeSpatialBoundsOffset, header.edgeSpatialBoundsCount);
+        }
+        if (header.version >= kFormatVersionV6 && header.rootPayloadRecordCount != 0 &&
+            header.rootPayloadOffset == 0) {
             throw std::runtime_error("CH index root payload count has no section offset");
         }
+    } else {
+        if (header.runtimeNodeSectionOffset == 0 || header.runtimeEdgeSectionOffset == 0 ||
+            header.runtimeRootSectionOffset == 0 || header.runtimeDataFileBytes == 0) {
+            throw std::runtime_error("CHIDX v8 has no runtime-data sections");
+        }
+    }
+    if (header.rootPayloadRecordCount != 0) {
         for (const auto& page : result.graphPages) {
             if (page.rootPayloadRecordOffset > header.rootPayloadRecordCount ||
                 page.edgeCount > header.rootPayloadRecordCount - page.rootPayloadRecordOffset) {
@@ -997,12 +1156,17 @@ std::vector<CHIndexRootRecord> CHIndex::ReadGraphPageRootRecords(
         throw std::runtime_error("CH index page root-payload range is invalid");
     }
 
-    std::ifstream input(index.indexPath, std::ios::binary);
-    if (!input) {
-        throw std::runtime_error("could not open CH index: " + index.indexPath.string());
+    auto payloadPath = index.indexPath;
+    std::uint64_t sectionOffset = index.rootPayloadSectionOffset;
+    if (index.HasRuntimeBinary()) {
+        payloadPath.replace_extension(".chbin");
+        sectionOffset = index.runtimeRootSectionOffset;
     }
-    Seek(input, index.rootPayloadSectionOffset +
-                    page.rootPayloadRecordOffset * kRootRecordSerializedSize);
+    std::ifstream input(payloadPath, std::ios::binary);
+    if (!input) {
+        throw std::runtime_error("could not open root payload: " + payloadPath.string());
+    }
+    Seek(input, sectionOffset + page.rootPayloadRecordOffset * kRootRecordSerializedSize);
     std::vector<CHIndexRootRecord> records(page.edgeCount);
     if (!records.empty()) {
         input.read(reinterpret_cast<char*>(records.data()),
@@ -1016,6 +1180,9 @@ std::vector<CHIndexRootRecord> CHIndex::ReadGraphPageRootRecords(
 
 std::vector<std::uint64_t> CHIndex::ReadEdgeSpatialBounds(
     const CHIndexData& index, std::uint32_t firstEdgeId, std::uint32_t count) {
+    if (index.HasRuntimeBinary()) {
+        throw std::runtime_error("CHIDX v8 stores geometry error directly in runtime edge records");
+    }
     if (static_cast<std::uint64_t>(firstEdgeId) + count > index.edgeSpatialBoundsCount) {
         throw std::out_of_range("edge spatial-bounds range is out of range");
     }

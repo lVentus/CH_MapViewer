@@ -4,6 +4,7 @@
 #include "data/ch/CHTypes.h"
 #include "streaming/analysis/TextSourceScanner.h"
 #include "streaming/index/CHIndex.h"
+#include "streaming/runtime/RuntimeData.h"
 
 #include <algorithm>
 #include <array>
@@ -11,6 +12,7 @@
 #include <charconv>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -64,6 +66,18 @@ struct DiskEdge {
     std::int32_t birth = -1;
     std::int32_t death = -1;
 };
+
+struct ProjectedNodeRecord {
+    double x = 0.0;
+    double y = 0.0;
+};
+static_assert(sizeof(ProjectedNodeRecord) == 16u);
+
+struct PartitionedRuntimeEdgeRecord {
+    std::uint32_t localIndex = 0;
+    runtime::RuntimeEdgeRecord edge{};
+};
+static_assert(sizeof(PartitionedRuntimeEdgeRecord) == 36u);
 
 struct DiskHierarchyRecord {
     std::uint32_t childA = data::InvalidEdgeId;
@@ -159,22 +173,6 @@ data::CHProjection RuntimeProjection(double minLatitude, double minLongitude,
     return projection;
 }
 
-data::ProjectedPoint WorldCellBoundaryPoint(std::uint32_t x, std::uint32_t y,
-                                            double cellSizeMeters,
-                                            const data::CHProjection& projection) {
-    const auto xMeters = std::clamp(
-        static_cast<double>(x) * cellSizeMeters - kWorldHalfExtentMeters,
-        -kWorldHalfExtentMeters, kWorldHalfExtentMeters);
-    const auto yMeters = std::clamp(
-        static_cast<double>(y) * cellSizeMeters - kWorldHalfExtentMeters,
-        -kWorldHalfExtentMeters, kWorldHalfExtentMeters);
-    const auto longitude = xMeters / kWebMercatorRadius * 180.0 / kPi;
-    const auto latitude =
-        (2.0 * std::atan(std::exp(yMeters / kWebMercatorRadius)) - kPi * 0.5) *
-        180.0 / kPi;
-    return projection.Project(latitude, longitude);
-}
-
 double PointSegmentDistance(data::ProjectedPoint point, data::ProjectedPoint segmentStart,
                             data::ProjectedPoint segmentEnd) {
     const auto dx = segmentEnd.x - segmentStart.x;
@@ -191,19 +189,55 @@ double PointSegmentDistance(data::ProjectedPoint point, data::ProjectedPoint seg
     return std::hypot(point.x - closestX, point.y - closestY);
 }
 
+std::uint32_t WorldGridSize(double cellSizeMeters);
+
+struct ProjectedGridBoundaries {
+    std::vector<double> x;
+    std::vector<double> y;
+};
+
+ProjectedGridBoundaries BuildProjectedGridBoundaries(double cellSizeMeters,
+                                                      const data::CHProjection& projection) {
+    const auto gridSize = WorldGridSize(cellSizeMeters);
+    ProjectedGridBoundaries table;
+    table.x.resize(static_cast<std::size_t>(gridSize) + 1u);
+    table.y.resize(static_cast<std::size_t>(gridSize) + 1u);
+    for (std::uint32_t coordinate = 0; coordinate <= gridSize; ++coordinate) {
+        const auto xMeters = std::clamp(
+            static_cast<double>(coordinate) * cellSizeMeters - kWorldHalfExtentMeters,
+            -kWorldHalfExtentMeters, kWorldHalfExtentMeters);
+        const auto longitude = xMeters / kWebMercatorRadius * 180.0 / kPi;
+        table.x[coordinate] =
+            (longitude - projection.centerLongitude) * projection.longitudeScale *
+            projection.normalization;
+
+        const auto yMeters = std::clamp(
+            static_cast<double>(coordinate) * cellSizeMeters - kWorldHalfExtentMeters,
+            -kWorldHalfExtentMeters, kWorldHalfExtentMeters);
+        const auto latitude =
+            (2.0 * std::atan(std::exp(yMeters / kWebMercatorRadius)) - kPi * 0.5) *
+            180.0 / kPi;
+        table.y[coordinate] =
+            (latitude - projection.centerLatitude) * projection.normalization;
+    }
+    return table;
+}
+
 float ConservativeGeometryError(std::uint64_t packedBounds,
                                 data::ProjectedPoint source,
                                 data::ProjectedPoint target,
-                                double cellSizeMeters,
-                                const data::CHProjection& projection) {
+                                const ProjectedGridBoundaries& grid) {
     const auto bounds = UnpackCellBounds(packedBounds);
     const std::uint32_t xs[] = {bounds.minX, bounds.maxX + 1u};
     const std::uint32_t ys[] = {bounds.minY, bounds.maxY + 1u};
     double error = 0.0;
     for (const auto x : xs) {
         for (const auto y : ys) {
+            if (x >= grid.x.size() || y >= grid.y.size()) {
+                throw std::runtime_error("geometry bounds exceed precomputed fixed-grid table");
+            }
             error = std::max(error, PointSegmentDistance(
-                WorldCellBoundaryPoint(x, y, cellSizeMeters, projection), source, target));
+                {grid.x[x], grid.y[y]}, source, target));
         }
     }
     return static_cast<float>(error);
@@ -265,21 +299,6 @@ std::uint32_t NodeMorton(std::uint32_t packedCell) {
     return Morton2D(x, y, 16u);
 }
 
-std::string ReadPrefix(const std::filesystem::path& path, std::uint64_t byteCount) {
-    if (byteCount > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
-        throw std::runtime_error("source prefix is too large");
-    }
-    std::ifstream input(path, std::ios::binary);
-    if (!input) {
-        throw std::runtime_error("could not read source prefix: " + path.string());
-    }
-    std::string bytes(static_cast<std::size_t>(byteCount), '\0');
-    input.read(bytes.data(), static_cast<std::streamsize>(bytes.size()));
-    if (input.gcount() != static_cast<std::streamsize>(bytes.size())) {
-        throw std::runtime_error("source prefix is truncated");
-    }
-    return bytes;
-}
 
 class TextWriter {
 public:
@@ -544,6 +563,8 @@ public:
         return data_[index];
     }
     [[nodiscard]] std::uint64_t size() const { return count_; }
+    [[nodiscard]] T* data() { return data_; }
+    [[nodiscard]] const T* data() const { return data_; }
 
     // Temporary arrays only need process-local coherence. Avoid synchronous whole-file
     // flushes: on multi-gigabyte preprocess jobs they turn otherwise sequential work into
@@ -668,6 +689,135 @@ public:
     TempDirectoryGuard& operator=(const TempDirectoryGuard&) = delete;
 private:
     std::filesystem::path path_;
+};
+
+
+struct EdgePartitionPlan {
+    std::uint32_t partitionCount = 1;
+    std::uint64_t recordsPerPartition = 1;
+};
+
+EdgePartitionPlan MakeEdgePartitionPlan(std::uint64_t edgeCount,
+                                        std::uint64_t memoryBudgetBytes) {
+    constexpr std::uint64_t kMiB = 1024ull * 1024ull;
+    constexpr std::uint64_t kMinTargetBytes = 64ull * kMiB;
+    constexpr std::uint64_t kMaxTargetBytes = 256ull * kMiB;
+    constexpr std::uint32_t kMaxPartitions = 256u;
+    if (edgeCount == 0) {
+        return {};
+    }
+    const auto budgetDerived = memoryBudgetBytes == 0
+                                   ? kMaxTargetBytes
+                                   : std::max<std::uint64_t>(kMinTargetBytes,
+                                         memoryBudgetBytes / 48u);
+    const auto targetBytes = std::clamp<std::uint64_t>(budgetDerived,
+                                                       kMinTargetBytes,
+                                                       kMaxTargetBytes);
+    const auto totalBytes = edgeCount * sizeof(runtime::RuntimeEdgeRecord);
+    auto partitionCount = static_cast<std::uint64_t>(
+        (totalBytes + targetBytes - 1u) / targetBytes);
+    partitionCount = std::clamp<std::uint64_t>(partitionCount, 1u, kMaxPartitions);
+    const auto recordsPerPartition =
+        (edgeCount + partitionCount - 1u) / partitionCount;
+    return {static_cast<std::uint32_t>(partitionCount), recordsPerPartition};
+}
+
+class EdgePartitionWriter {
+public:
+    EdgePartitionWriter(const std::filesystem::path& directory,
+                        std::uint32_t partitionCount,
+                        std::uint64_t memoryBudgetBytes)
+        : states_(partitionCount) {
+        if (partitionCount == 0) {
+            throw std::runtime_error("edge partition writer requires at least one partition");
+        }
+        constexpr std::uint64_t kMiB = 1024ull * 1024ull;
+        const auto totalBufferBytes = std::clamp<std::uint64_t>(
+            memoryBudgetBytes == 0 ? 32ull * kMiB : memoryBudgetBytes / 128u,
+            16ull * kMiB, 64ull * kMiB);
+        const auto perPartitionBytes = std::max<std::uint64_t>(
+            64ull * 1024ull, totalBufferBytes / partitionCount);
+        const auto recordsPerBuffer = std::max<std::uint64_t>(
+            256u, perPartitionBytes / sizeof(PartitionedRuntimeEdgeRecord));
+        for (std::uint32_t i = 0; i < partitionCount; ++i) {
+            auto& state = states_[i];
+            state.path = TempPath(directory, "runtime_edge_partition", i);
+            state.output = std::make_unique<std::ofstream>(
+                state.path, std::ios::binary | std::ios::trunc);
+            if (!*state.output) {
+                throw std::runtime_error("could not create runtime edge partition file");
+            }
+            state.buffer.reserve(static_cast<std::size_t>(recordsPerBuffer));
+        }
+    }
+
+    ~EdgePartitionWriter() {
+        try {
+            Finalize();
+        } catch (...) {
+        }
+    }
+
+    void Append(std::uint32_t partition, const PartitionedRuntimeEdgeRecord& record) {
+        if (partition >= states_.size()) {
+            throw std::out_of_range("runtime edge partition index out of range");
+        }
+        auto& state = states_[partition];
+        state.buffer.push_back(record);
+        ++state.recordCount;
+        if (state.buffer.size() == state.buffer.capacity()) {
+            Flush(state);
+        }
+    }
+
+    void Finalize() {
+        if (finalized_) {
+            return;
+        }
+        for (auto& state : states_) {
+            Flush(state);
+            if (state.output) {
+                state.output->close();
+                if (!*state.output) {
+                    throw std::runtime_error("failed to finalize runtime edge partition file");
+                }
+                state.output.reset();
+            }
+        }
+        finalized_ = true;
+    }
+
+    [[nodiscard]] const std::filesystem::path& Path(std::uint32_t partition) const {
+        return states_.at(partition).path;
+    }
+
+    [[nodiscard]] std::uint64_t RecordCount(std::uint32_t partition) const {
+        return states_.at(partition).recordCount;
+    }
+
+private:
+    struct State {
+        std::filesystem::path path;
+        std::unique_ptr<std::ofstream> output;
+        std::vector<PartitionedRuntimeEdgeRecord> buffer;
+        std::uint64_t recordCount = 0;
+    };
+
+    static void Flush(State& state) {
+        if (state.buffer.empty()) {
+            return;
+        }
+        state.output->write(reinterpret_cast<const char*>(state.buffer.data()),
+                            static_cast<std::streamsize>(
+                                state.buffer.size() * sizeof(PartitionedRuntimeEdgeRecord)));
+        if (!*state.output) {
+            throw std::runtime_error("failed to write runtime edge partition");
+        }
+        state.buffer.clear();
+    }
+
+    std::vector<State> states_;
+    bool finalized_ = false;
 };
 
 std::vector<RuntimeLodGroup> BuildRuntimeLodGroups(
@@ -896,12 +1046,10 @@ public:
                           const std::vector<RuntimeLodGroup>& groups,
                           const std::vector<std::uint32_t>& levelToGroup,
                           const analysis::DatasetLayoutAnalysisConfig& config,
-                          const std::filesystem::path& edgeOrderPath,
                           const std::filesystem::path& membershipPath,
                           const DatasetPreprocessor::ProgressCallback& progressCallback)
         : edges_(edges), geometryBounds_(geometryBounds), groups_(groups), levelToGroup_(levelToGroup), config_(config),
-          edgeOrderPath_(edgeOrderPath), membershipPath_(membershipPath),
-          progressCallback_(progressCallback) {
+          membershipPath_(membershipPath), progressCallback_(progressCallback) {
         lodMaskWordsPerPage_ = 1u;
     }
 
@@ -932,7 +1080,6 @@ public:
         edgeSpatialBounds_.Release();
 
         WriteMembership();
-        edgeOrder_.Release();
         membership_.close();
         if (!membership_) {
             throw std::runtime_error("failed to finalize preprocess membership stream");
@@ -1154,7 +1301,6 @@ private:
         }
         std::sort(orderedBuckets_.begin(), orderedBuckets_.end(), BucketOrder);
 
-        edgeOrder_.Create(edgeOrderPath_, edges_.size());
         membership_.open(membershipPath_, std::ios::binary | std::ios::trunc);
         if (!membership_) {
             throw std::runtime_error("could not create preprocess membership stream");
@@ -1244,13 +1390,12 @@ private:
                 throw std::runtime_error("preprocess direct-grid bucket cursor overflow");
             }
             const auto newId = bucket.start + local;
-            edgeOrder_[newId] = edgeId;
             if (!oldToNewEdge_ || oldToNewEdge_->size() != edges_.size() ||
                 edgeSpatialBounds_.size() != edges_.size()) {
                 throw std::runtime_error("preprocess fused edge remap outputs are not initialized");
             }
             // edgeId advances sequentially, so the old->new remap is a sequential write.  The
-            // bounds write follows the exact same newId slot as edgeOrder_, so it adds no extra
+            // Bounds follow the exact same newId slot as the remap, so this adds no extra
             // graph traversal and preserves byte-for-byte bounds semantics.
             (*oldToNewEdge_)[edgeId] = static_cast<std::uint32_t>(newId);
             edgeSpatialBounds_[newId] = geometryBounds_[edgeId];
@@ -1307,13 +1452,11 @@ private:
     const std::vector<RuntimeLodGroup>& groups_;
     const std::vector<std::uint32_t>& levelToGroup_;
     const analysis::DatasetLayoutAnalysisConfig& config_;
-    std::filesystem::path edgeOrderPath_;
     std::filesystem::path membershipPath_;
     DatasetPreprocessor::ProgressCallback progressCallback_;
     std::uint32_t maxLevel_ = 0;
     std::uint32_t lodMaskWordsPerPage_ = 1;
     std::uint64_t drawableCount_ = 0;
-    MappedArray<std::uint32_t> edgeOrder_;
     MappedArray<std::uint64_t> edgeSpatialBounds_;
     MappedArray<std::uint32_t>* oldToNewEdge_ = nullptr;
     std::ofstream membership_;
@@ -1590,226 +1733,380 @@ void ResolveGeometryBounds(const std::filesystem::path& hierarchyPath,
 }
 
 
-void WritePreprocessedFiles(const std::filesystem::path& sourceGraphPath,
-                      std::uint64_t nodeSectionOffset,
-                      const MappedArray<DiskNode>& nodes,
-                      const MappedArray<DiskEdge>& edges,
-                      const MappedArray<std::uint32_t>& oldToNewNode,
-                      const MappedArray<std::uint32_t>& oldToNewEdge,
+void WriteRuntimeData(MappedArray<DiskNode>& nodes,
+                      MappedArray<DiskEdge>& edges,
+                      MappedArray<std::uint32_t>& oldToNewNode,
+                      MappedArray<std::uint32_t>& oldToNewEdge,
+                      MappedArray<std::uint64_t>& geometryBounds,
                       const MappedArray<std::uint64_t>& edgeSpatialBounds,
                       std::uint64_t drawableCount,
                       double minLatitude, double minLongitude,
                       double maxLatitude, double maxLongitude,
                       const std::filesystem::path& nodeOrderPath,
-                      const std::filesystem::path& edgeOrderPath,
-                      const std::filesystem::path& rootPayloadPath,
-                      const std::filesystem::path& graphOutputPath,
-                      const std::filesystem::path& rangesOutputPath,
+                      const std::filesystem::path& runtimeDataPath,
+                      const std::filesystem::path& tempRoot,
+                      std::uint64_t memoryBudgetBytes,
                       const analysis::DatasetLayoutAnalysisConfig& config,
                       std::vector<index::CHIndexSourceBlock>& nodeBlocks,
                       std::vector<index::CHIndexSourceBlock>& edgeBlocks,
-                      std::vector<index::CHIndexSourceBlock>& rangeBlocks,
                       const DatasetPreprocessor::ProgressCallback& progressCallback) {
-    TextWriter graphWriter(graphOutputPath);
-    graphWriter.Raw(ReadPrefix(sourceGraphPath, nodeSectionOffset));
-    std::ifstream nodeOrder(nodeOrderPath, std::ios::binary);
-    if (!nodeOrder) {
-        throw std::runtime_error("could not read preprocess node order");
-    }
-    Report(progressCallback, PreprocessStage::WriteGraph, 0, nodes.size() + edges.size());
-    std::uint32_t oldNodeId = 0;
-    for (std::uint64_t newId = 0; newId < nodes.size(); ++newId) {
-        if (!ReadBinaryRecord(nodeOrder, oldNodeId)) {
-            throw std::runtime_error("preprocess node order is truncated");
-        }
-        if (newId % config.sourceBlockNodeCount == 0) {
-            nodeBlocks.push_back({newId,
-                                  static_cast<std::uint32_t>(std::min<std::uint64_t>(
-                                      config.sourceBlockNodeCount, nodes.size() - newId)),
-                                  graphWriter.Tell()});
-        }
-        const auto& node = nodes[oldNodeId];
-        graphWriter.Line(static_cast<std::uint32_t>(newId), node.osmId,
-                         TextWriter::Coordinate(node.latitude),
-                         TextWriter::Coordinate(node.longitude),
-                         TextWriter::CompactFloat(node.elevation), node.level);
-        if ((newId + 1) % kProgressInterval == 0 || newId + 1 == nodes.size()) {
-            Report(progressCallback, PreprocessStage::WriteGraph, newId + 1,
-                   nodes.size() + edges.size());
-        }
+    const auto nodeCount = nodes.size();
+    const auto edgeCount = edges.size();
+    if (oldToNewNode.size() != nodeCount || oldToNewEdge.size() != edgeCount ||
+        geometryBounds.size() != edgeCount || edgeSpatialBounds.size() != edgeCount) {
+        throw std::runtime_error("runtime binary remap/bounds table size mismatch");
     }
 
-    std::ifstream edgeOrder(edgeOrderPath, std::ios::binary);
-    if (!edgeOrder) {
-        throw std::runtime_error("could not read preprocess edge order");
+    const auto header = runtime::RuntimeData::MakeHeader(nodeCount, edgeCount, drawableCount);
+    {
+        std::ofstream output(runtimeDataPath, std::ios::binary | std::ios::trunc);
+        if (!output) throw std::runtime_error("could not create runtime binary");
+        runtime::RuntimeData::WriteHeader(output, header);
     }
-    std::ofstream rootPayload(rootPayloadPath, std::ios::binary | std::ios::trunc);
-    if (!rootPayload) {
-        throw std::runtime_error("could not create preprocess root payload");
+    std::filesystem::resize_file(runtimeDataPath, header.fileBytes);
+
+    for (std::uint64_t first = 0; first < nodeCount; first += config.sourceBlockNodeCount) {
+        nodeBlocks.push_back({first,
+            static_cast<std::uint32_t>(std::min<std::uint64_t>(config.sourceBlockNodeCount,
+                                                                nodeCount - first)),
+            header.nodeSectionOffset + first * sizeof(runtime::RuntimeNodeRecord)});
     }
-    const auto projection = RuntimeProjection(minLatitude, minLongitude, maxLatitude, maxLongitude);
-    std::uint32_t oldEdgeId = 0;
-    for (std::uint64_t newId = 0; newId < edges.size(); ++newId) {
-        if (!ReadBinaryRecord(edgeOrder, oldEdgeId)) {
-            throw std::runtime_error("preprocess edge order is truncated");
+    for (std::uint64_t first = 0; first < edgeCount; first += config.sourceBlockEdgeCount) {
+        edgeBlocks.push_back({first,
+            static_cast<std::uint32_t>(std::min<std::uint64_t>(config.sourceBlockEdgeCount,
+                                                                edgeCount - first)),
+            header.edgeSectionOffset + first * sizeof(runtime::RuntimeEdgeRecord)});
+    }
+
+    const auto projection = RuntimeProjection(minLatitude, minLongitude,
+                                              maxLatitude, maxLongitude);
+    const auto projectedGrid = BuildProjectedGridBoundaries(config.spatialCellSizeMeters,
+                                                             projection);
+    const auto projectedNodePath = TempPath(tempRoot, "projected_nodes");
+    MappedArray<ProjectedNodeRecord> projectedNodes;
+    projectedNodes.Create(projectedNodePath, nodeCount);
+    MappedArray<std::uint32_t> nodeOrder;
+    nodeOrder.OpenExisting(nodeOrderPath, nodeCount);
+
+    const auto totalWork = nodeCount * 2u + edgeCount * 2u;
+    std::uint64_t completed = 0;
+    Report(progressCallback, PreprocessStage::WriteGraph, completed, totalWork);
+
+    // Project every source node exactly once in source-ID order. The old writer projected the
+    // same endpoint again for every incident edge and randomly touched the much larger DiskNode
+    // array. A compact 16-byte projected table keeps the exact double-precision geometry-error
+    // calculation while making the edge pass substantially more cache friendly.
+    for (std::uint64_t oldId = 0; oldId < nodeCount; ++oldId) {
+        const auto projected = projection.Project(nodes[oldId].latitude, nodes[oldId].longitude);
+        projectedNodes[oldId] = {projected.x, projected.y};
+        if ((oldId + 1u) % kProgressInterval == 0u || oldId + 1u == nodeCount) {
+            completed = oldId + 1u;
+            Report(progressCallback, PreprocessStage::WriteGraph, completed, totalWork);
         }
-        if (newId % config.sourceBlockEdgeCount == 0) {
-            edgeBlocks.push_back({newId,
-                                  static_cast<std::uint32_t>(std::min<std::uint64_t>(
-                                      config.sourceBlockEdgeCount, edges.size() - newId)),
-                                  graphWriter.Tell()});
+    }
+    nodes.Release();
+
+    std::fstream runtimeOutput(runtimeDataPath,
+                               std::ios::binary | std::ios::in | std::ios::out);
+    if (!runtimeOutput) {
+        throw std::runtime_error("could not reopen runtime binary for sequential write");
+    }
+
+    constexpr std::size_t kNodeWriteRecords = 1u << 20u;
+    std::vector<runtime::RuntimeNodeRecord> nodeWriteBuffer(kNodeWriteRecords);
+    runtimeOutput.seekp(static_cast<std::streamoff>(header.nodeSectionOffset), std::ios::beg);
+    for (std::uint64_t first = 0; first < nodeCount; first += kNodeWriteRecords) {
+        const auto count = static_cast<std::size_t>(
+            std::min<std::uint64_t>(kNodeWriteRecords, nodeCount - first));
+        for (std::size_t local = 0; local < count; ++local) {
+            const auto newId = first + local;
+            const auto oldId = nodeOrder[newId];
+            const auto& projected = projectedNodes[oldId];
+            nodeWriteBuffer[local] = {static_cast<float>(projected.x),
+                                      static_cast<float>(projected.y)};
         }
+        runtimeOutput.write(reinterpret_cast<const char*>(nodeWriteBuffer.data()),
+                            static_cast<std::streamsize>(
+                                count * sizeof(runtime::RuntimeNodeRecord)));
+        if (!runtimeOutput) {
+            throw std::runtime_error("failed to write runtime node section");
+        }
+        completed = nodeCount + first + count;
+        Report(progressCallback, PreprocessStage::WriteGraph, completed, totalWork);
+    }
+
+    // Scatter in SOURCE EdgeID order into coarse destination partitions. This is the important
+    // reversal from the previous writer: it never walks the ~40 GB DiskEdge table through the
+    // new permutation. All large source metadata and old-order geometry bounds are consumed
+    // sequentially. Each temporary partition is later materialized as one contiguous .chbin run.
+    const auto partitionPlan = MakeEdgePartitionPlan(edgeCount, memoryBudgetBytes);
+    const auto estimatedScratchGiB =
+        static_cast<double>(edgeCount * sizeof(PartitionedRuntimeEdgeRecord)) /
+        (1024.0 * 1024.0 * 1024.0);
+    std::fprintf(stdout,
+                 "WriteGraph sequential reorder: %u partitions, ~%.2f GiB temporary scatter, "
+                 "%llu records/partition.\n",
+                 partitionPlan.partitionCount, estimatedScratchGiB,
+                 static_cast<unsigned long long>(partitionPlan.recordsPerPartition));
+    std::fflush(stdout);
+
+    EdgePartitionWriter partitionWriter(tempRoot, partitionPlan.partitionCount,
+                                        memoryBudgetBytes);
+    for (std::uint64_t oldEdgeId = 0; oldEdgeId < edgeCount; ++oldEdgeId) {
         const auto& edge = edges[oldEdgeId];
-        const auto childA = edge.childA == data::InvalidEdgeId
-                                ? std::int64_t{-1}
-                                : static_cast<std::int64_t>(oldToNewEdge[edge.childA]);
-        const auto childB = edge.childB == data::InvalidEdgeId
-                                ? std::int64_t{-1}
-                                : static_cast<std::int64_t>(oldToNewEdge[edge.childB]);
-        graphWriter.Line(oldToNewNode[edge.source], oldToNewNode[edge.target],
-                         TextWriter::CompactFloat(edge.weight), edge.type, edge.maxSpeed,
-                         childA, childB);
+        if (edge.birth < std::numeric_limits<std::int16_t>::min() ||
+            edge.birth > std::numeric_limits<std::int16_t>::max() ||
+            edge.death < std::numeric_limits<std::int16_t>::min() ||
+            edge.death > std::numeric_limits<std::int16_t>::max() ||
+            edge.type < std::numeric_limits<std::int16_t>::min() ||
+            edge.type > std::numeric_limits<std::int16_t>::max() ||
+            edge.maxSpeed < std::numeric_limits<std::int16_t>::min() ||
+            edge.maxSpeed > std::numeric_limits<std::int16_t>::max()) {
+            throw std::runtime_error("runtime binary compact field exceeds int16 range");
+        }
 
-        if (newId < drawableCount) {
-            if (edge.birth < 0 || edge.death < 0 || newId >= edgeSpatialBounds.size()) {
-                throw std::runtime_error("drawable root payload is inconsistent with reordered edges");
-            }
-            const auto packedBounds = edgeSpatialBounds[newId];
-            const auto source = projection.Project(nodes[edge.source].latitude,
-                                                   nodes[edge.source].longitude);
-            const auto target = projection.Project(nodes[edge.target].latitude,
-                                                   nodes[edge.target].longitude);
-            index::CHIndexRootRecord record;
-            record.globalEdgeId = static_cast<std::uint32_t>(newId);
-            record.birthLevel = edge.birth;
-            record.deathLevel = edge.death;
-            record.boundsLo = static_cast<std::uint32_t>(packedBounds & 0xffffffffull);
-            record.boundsHi = static_cast<std::uint32_t>(packedBounds >> 32u);
-            const auto maxPackedCoordinate = std::max({
-                record.boundsLo & 0xffffu, (record.boundsLo >> 16u) & 0xffffu,
-                record.boundsHi & 0xffffu, (record.boundsHi >> 16u) & 0xffffu});
-            if (maxPackedCoordinate > index::kPackedSpatialCoordinateMask) {
-                throw std::runtime_error(
-                    "road-style root metadata requires a fixed grid below 16384 cells per axis");
-            }
-            index::EncodeRootRoadStyle(
-                record.boundsLo, record.boundsHi, data::RoadStyleIndexFromType(edge.type));
-            record.childA = edge.childA == data::InvalidEdgeId
+        const auto newId = static_cast<std::uint64_t>(oldToNewEdge[oldEdgeId]);
+        if (newId >= edgeCount) {
+            throw std::runtime_error("runtime binary edge remap is out of range");
+        }
+        const auto packedBounds = geometryBounds[oldEdgeId];
+        const auto& sourceProjected = projectedNodes[edge.source];
+        const auto& targetProjected = projectedNodes[edge.target];
+        const data::ProjectedPoint source{sourceProjected.x, sourceProjected.y};
+        const data::ProjectedPoint target{targetProjected.x, targetProjected.y};
+        const auto newSource = oldToNewNode[edge.source];
+        const auto newTarget = oldToNewNode[edge.target];
+        const auto childA = edge.childA == data::InvalidEdgeId
                                 ? data::InvalidEdgeId
                                 : oldToNewEdge[edge.childA];
-            record.childB = edge.childB == data::InvalidEdgeId
+        const auto childB = edge.childB == data::InvalidEdgeId
                                 ? data::InvalidEdgeId
                                 : oldToNewEdge[edge.childB];
-            record.geometryError =
-                (record.childA == data::InvalidEdgeId || record.childB == data::InvalidEdgeId)
-                    ? 0.0f
-                    : ConservativeGeometryError(packedBounds, source, target,
-                                                config.spatialCellSizeMeters, projection);
-            record.sourceX = static_cast<float>(source.x);
-            record.sourceY = static_cast<float>(source.y);
-            record.targetX = static_cast<float>(target.x);
-            record.targetY = static_cast<float>(target.y);
-            WriteBinaryRecord(rootPayload, record);
+        const auto geometryError =
+            (childA == data::InvalidEdgeId || childB == data::InvalidEdgeId)
+                ? 0.0f
+                : ConservativeGeometryError(packedBounds, source, target, projectedGrid);
+
+        PartitionedRuntimeEdgeRecord prepared;
+        const auto partition = static_cast<std::uint32_t>(
+            newId / partitionPlan.recordsPerPartition);
+        if (partition >= partitionPlan.partitionCount) {
+            throw std::runtime_error("runtime binary edge partition is out of range");
         }
-        if ((newId + 1) % kProgressInterval == 0 || newId + 1 == edges.size()) {
-            Report(progressCallback, PreprocessStage::WriteGraph,
-                   nodes.size() + newId + 1, nodes.size() + edges.size());
+        const auto partitionFirst =
+            static_cast<std::uint64_t>(partition) * partitionPlan.recordsPerPartition;
+        prepared.localIndex = static_cast<std::uint32_t>(newId - partitionFirst);
+        prepared.edge = {newSource, newTarget, childA, childB, edge.weight, geometryError,
+                         static_cast<std::int16_t>(edge.birth),
+                         static_cast<std::int16_t>(edge.death),
+                         static_cast<std::int16_t>(edge.type),
+                         static_cast<std::int16_t>(edge.maxSpeed)};
+        partitionWriter.Append(partition, prepared);
+
+        if ((oldEdgeId + 1u) % kProgressInterval == 0u || oldEdgeId + 1u == edgeCount) {
+            completed = nodeCount * 2u + oldEdgeId + 1u;
+            Report(progressCallback, PreprocessStage::WriteGraph, completed, totalWork);
         }
     }
-    graphWriter.Close();
-    rootPayload.close();
-    if (!rootPayload) {
-        throw std::runtime_error("failed to finalize preprocess root payload");
+    partitionWriter.Finalize();
+
+    // These multi-gigabyte source-order mappings are no longer needed. Releasing them before
+    // assembling the destination partitions prevents the OS from carrying their working set into
+    // the sequential output phase on 48 GB machines.
+    edges.Release();
+    geometryBounds.Release();
+    oldToNewNode.Release();
+    oldToNewEdge.Release();
+
+    constexpr std::size_t kPartitionReadRecords = 1u << 17u;
+    constexpr std::size_t kRootWriteRecords = 1u << 18u;
+    std::vector<PartitionedRuntimeEdgeRecord> partitionReadBuffer(kPartitionReadRecords);
+    std::vector<index::CHIndexRootRecord> rootWriteBuffer;
+    rootWriteBuffer.reserve(kRootWriteRecords);
+    std::uint64_t assembledEdges = 0;
+
+    for (std::uint32_t partition = 0; partition < partitionPlan.partitionCount; ++partition) {
+        const auto firstNewId =
+            static_cast<std::uint64_t>(partition) * partitionPlan.recordsPerPartition;
+        if (firstNewId >= edgeCount) {
+            break;
+        }
+        const auto partitionEdgeCount = std::min<std::uint64_t>(
+            partitionPlan.recordsPerPartition, edgeCount - firstNewId);
+        if (partitionWriter.RecordCount(partition) != partitionEdgeCount) {
+            throw std::runtime_error("runtime edge partition does not contain its full ID range");
+        }
+
+        std::vector<runtime::RuntimeEdgeRecord> orderedEdges(
+            static_cast<std::size_t>(partitionEdgeCount));
+        std::vector<std::uint64_t> seen(
+            static_cast<std::size_t>((partitionEdgeCount + 63u) / 64u), 0u);
+
+        std::ifstream partitionInput(partitionWriter.Path(partition), std::ios::binary);
+        if (!partitionInput) {
+            throw std::runtime_error("could not reopen runtime edge partition");
+        }
+        std::uint64_t recordsRead = 0;
+        while (recordsRead < partitionEdgeCount) {
+            const auto count = static_cast<std::size_t>(std::min<std::uint64_t>(
+                kPartitionReadRecords, partitionEdgeCount - recordsRead));
+            partitionInput.read(reinterpret_cast<char*>(partitionReadBuffer.data()),
+                                static_cast<std::streamsize>(
+                                    count * sizeof(PartitionedRuntimeEdgeRecord)));
+            if (!partitionInput) {
+                throw std::runtime_error("truncated runtime edge partition");
+            }
+            for (std::size_t i = 0; i < count; ++i) {
+                const auto& prepared = partitionReadBuffer[i];
+                if (prepared.localIndex >= partitionEdgeCount) {
+                    throw std::runtime_error("runtime edge partition local ID is out of range");
+                }
+                const auto word = static_cast<std::size_t>(prepared.localIndex >> 6u);
+                const auto bit = std::uint64_t{1} << (prepared.localIndex & 63u);
+                if ((seen[word] & bit) != 0u) {
+                    throw std::runtime_error("runtime edge permutation contains a duplicate ID");
+                }
+                seen[word] |= bit;
+                orderedEdges[prepared.localIndex] = prepared.edge;
+            }
+            recordsRead += count;
+        }
+
+        runtimeOutput.seekp(static_cast<std::streamoff>(
+                                header.edgeSectionOffset +
+                                firstNewId * sizeof(runtime::RuntimeEdgeRecord)),
+                            std::ios::beg);
+        runtimeOutput.write(reinterpret_cast<const char*>(orderedEdges.data()),
+                            static_cast<std::streamsize>(
+                                orderedEdges.size() * sizeof(runtime::RuntimeEdgeRecord)));
+        if (!runtimeOutput) {
+            throw std::runtime_error("failed to write reordered runtime edge partition");
+        }
+
+        // Root records share the exact prefix of new EdgeIDs. Generate them while this partition
+        // is already resident, using the sequential new-order bounds stream. No roots.tmp file and
+        // no second edge read are required.
+        const auto rootCount = firstNewId < drawableCount
+                                   ? std::min<std::uint64_t>(partitionEdgeCount,
+                                                             drawableCount - firstNewId)
+                                   : 0u;
+        std::uint64_t rootLocal = 0;
+        while (rootLocal < rootCount) {
+            const auto count = static_cast<std::size_t>(std::min<std::uint64_t>(
+                kRootWriteRecords, rootCount - rootLocal));
+            rootWriteBuffer.clear();
+            rootWriteBuffer.resize(count);
+            for (std::size_t i = 0; i < count; ++i) {
+                const auto local = rootLocal + i;
+                const auto newId = firstNewId + local;
+                const auto& edge = orderedEdges[static_cast<std::size_t>(local)];
+                if (edge.birthLevel < 0 || edge.deathLevel < 0) {
+                    throw std::runtime_error("drawable root lifetime is invalid");
+                }
+                const auto packedBounds = edgeSpatialBounds[newId];
+                auto& root = rootWriteBuffer[i];
+                root.globalEdgeId = static_cast<std::uint32_t>(newId);
+                root.birthLevel = edge.birthLevel;
+                root.deathLevel = edge.deathLevel;
+                root.boundsLo = static_cast<std::uint32_t>(packedBounds & 0xffffffffull);
+                root.boundsHi = static_cast<std::uint32_t>(packedBounds >> 32u);
+                const auto maxPackedCoordinate = std::max(
+                    {root.boundsLo & 0xffffu, (root.boundsLo >> 16u) & 0xffffu,
+                     root.boundsHi & 0xffffu, (root.boundsHi >> 16u) & 0xffffu});
+                if (maxPackedCoordinate > index::kPackedSpatialCoordinateMask) {
+                    throw std::runtime_error(
+                        "root metadata requires a fixed grid below 16384 cells per axis");
+                }
+                index::EncodeRootRoadStyle(root.boundsLo, root.boundsHi,
+                                           data::RoadStyleIndexFromType(edge.type));
+                root.childA = edge.childA;
+                root.childB = edge.childB;
+                root.geometryError = edge.geometryError;
+                const auto sourceOldId = nodeOrder[edge.source];
+                const auto targetOldId = nodeOrder[edge.target];
+                const auto& source = projectedNodes[sourceOldId];
+                const auto& target = projectedNodes[targetOldId];
+                root.sourceX = static_cast<float>(source.x);
+                root.sourceY = static_cast<float>(source.y);
+                root.targetX = static_cast<float>(target.x);
+                root.targetY = static_cast<float>(target.y);
+            }
+            runtimeOutput.seekp(static_cast<std::streamoff>(
+                                    header.rootSectionOffset +
+                                    (firstNewId + rootLocal) *
+                                        sizeof(index::CHIndexRootRecord)),
+                                std::ios::beg);
+            runtimeOutput.write(reinterpret_cast<const char*>(rootWriteBuffer.data()),
+                                static_cast<std::streamsize>(
+                                    rootWriteBuffer.size() * sizeof(index::CHIndexRootRecord)));
+            if (!runtimeOutput) {
+                throw std::runtime_error("failed to write runtime root partition");
+            }
+            rootLocal += count;
+        }
+
+        assembledEdges += partitionEdgeCount;
+        completed = nodeCount * 2u + edgeCount + assembledEdges;
+        Report(progressCallback, PreprocessStage::WriteGraph, completed, totalWork);
+        partitionInput.close();
+        RemoveFile(partitionWriter.Path(partition));
     }
 
-    TextWriter rangeWriter(rangesOutputPath);
-    edgeOrder.clear();
-    edgeOrder.seekg(0, std::ios::beg);
-    Report(progressCallback, PreprocessStage::WriteRanges, 0, edges.size());
-    for (std::uint64_t newId = 0; newId < edges.size(); ++newId) {
-        if (!ReadBinaryRecord(edgeOrder, oldEdgeId)) {
-            throw std::runtime_error("preprocess edge order is truncated while writing ranges");
-        }
-        if (newId % config.sourceBlockEdgeCount == 0) {
-            rangeBlocks.push_back({newId,
-                                   static_cast<std::uint32_t>(std::min<std::uint64_t>(
-                                       config.sourceBlockEdgeCount, edges.size() - newId)),
-                                   rangeWriter.Tell()});
-        }
-        const auto& edge = edges[oldEdgeId];
-        rangeWriter.Line(static_cast<std::uint32_t>(newId), edge.birth, edge.death);
-        if ((newId + 1) % kProgressInterval == 0 || newId + 1 == edges.size()) {
-            Report(progressCallback, PreprocessStage::WriteRanges, newId + 1, edges.size());
-        }
+    nodeOrder.Release();
+    projectedNodes.Release();
+    RemoveFile(projectedNodePath);
+    runtimeOutput.flush();
+    if (!runtimeOutput) {
+        throw std::runtime_error("failed to finalize runtime binary");
     }
-    rangeWriter.Close();
+    runtimeOutput.close();
+
+    if (assembledEdges != edgeCount) {
+        throw std::runtime_error("runtime binary sequential reorder did not assemble every edge");
+    }
+    if (!runtime::RuntimeData::IsValid(runtimeDataPath, nodeCount, edgeCount, drawableCount)) {
+        throw std::runtime_error("runtime binary validation failed");
+    }
+    Report(progressCallback, PreprocessStage::WriteRanges, edgeCount, edgeCount);
 }
 
-void ValidatePreprocessedStreaming(const std::filesystem::path& graphPath,
-                             const std::filesystem::path& rangesPath,
-                             std::uint64_t expectedNodes, std::uint64_t expectedEdges,
-                             const DatasetPreprocessor::ProgressCallback& progressCallback) {
-    Report(progressCallback, PreprocessStage::ValidateOutput, 0,
-           expectedNodes + expectedEdges * 2u);
-    TextSourceScanner graph(graphPath);
-    const auto nodeCount = graph.Read<std::uint64_t>();
-    const auto edgeCount = graph.Read<std::uint64_t>();
-    if (nodeCount != expectedNodes || edgeCount != expectedEdges) {
-        throw std::runtime_error("external preprocess changed graph counts");
-    }
-    for (std::uint64_t i = 0; i < nodeCount; ++i) {
-        const auto id = graph.Read<std::uint32_t>();
-        if (id != i) {
-            throw std::runtime_error("external preprocess node ids are not sequential");
+void ValidateRuntimeDataStreaming(const std::filesystem::path& runtimeDataPath,
+                                  std::uint64_t expectedNodes,
+                                  std::uint64_t expectedEdges,
+                                  std::uint64_t expectedRoots,
+                                  const DatasetPreprocessor::ProgressCallback& progressCallback) {
+    const auto header = runtime::RuntimeData::ReadHeader(runtimeDataPath);
+    if (header.nodeCount != expectedNodes || header.edgeCount != expectedEdges ||
+        header.rootRecordCount != expectedRoots) throw std::runtime_error("runtime binary changed dataset counts");
+    Report(progressCallback, PreprocessStage::ValidateOutput, 0, expectedEdges);
+    std::ifstream input(runtimeDataPath, std::ios::binary);
+    constexpr std::size_t kChunk = 1u << 16u;
+    std::vector<runtime::RuntimeEdgeRecord> records(kChunk);
+    std::uint64_t first=0;
+    while(first<expectedEdges) {
+        const auto count=static_cast<std::size_t>(std::min<std::uint64_t>(kChunk,expectedEdges-first));
+        runtime::RuntimeData::ReadRecords(input,header.edgeSectionOffset+first*sizeof(runtime::RuntimeEdgeRecord),
+                                          std::span<runtime::RuntimeEdgeRecord>(records.data(),count));
+        for(std::size_t i=0;i<count;++i) {
+            const auto& edge=records[i];
+            if(edge.source>=expectedNodes||edge.target>=expectedNodes||
+               (edge.childA!=data::InvalidEdgeId&&edge.childA>=expectedEdges)||
+               (edge.childB!=data::InvalidEdgeId&&edge.childB>=expectedEdges)||
+               !((edge.birthLevel==-1&&edge.deathLevel==-1)||
+                 (edge.birthLevel>=0&&edge.deathLevel>=0&&edge.deathLevel<=edge.birthLevel)))
+                throw std::runtime_error("runtime binary contains an invalid CH record");
         }
-        graph.Read<std::uint64_t>();
-        graph.Read<double>();
-        graph.Read<double>();
-        graph.Read<float>();
-        graph.Read<std::uint32_t>();
-        if ((i + 1) % kProgressInterval == 0) {
-            Report(progressCallback, PreprocessStage::ValidateOutput, i + 1,
-                   nodeCount + edgeCount * 2u);
-        }
-    }
-    for (std::uint64_t edgeId = 0; edgeId < edgeCount; ++edgeId) {
-        const auto source = graph.Read<std::uint32_t>();
-        const auto target = graph.Read<std::uint32_t>();
-        graph.Read<float>();
-        graph.Read<std::int32_t>();
-        graph.Read<std::int32_t>();
-        const auto childA = graph.Read<std::int64_t>();
-        const auto childB = graph.Read<std::int64_t>();
-        if (source >= nodeCount || target >= nodeCount ||
-            childA >= static_cast<std::int64_t>(edgeCount) ||
-            childB >= static_cast<std::int64_t>(edgeCount)) {
-            throw std::runtime_error("external preprocess produced an invalid graph reference");
-        }
-    }
-    TextSourceScanner ranges(rangesPath);
-    for (std::uint64_t record = 0; record < edgeCount; ++record) {
-        const auto edgeId = ranges.Read<std::uint32_t>();
-        const auto birth = ranges.Read<std::int32_t>();
-        const auto death = ranges.Read<std::int32_t>();
-        if (edgeId != record || !((birth == -1 && death == -1) ||
-                                  (birth >= 0 && death >= 0 && death <= birth))) {
-            throw std::runtime_error("external preprocess produced an invalid range record");
-        }
-        if ((record + 1) % kProgressInterval == 0 || record + 1 == edgeCount) {
-            Report(progressCallback, PreprocessStage::ValidateOutput,
-                   nodeCount + edgeCount + record + 1,
-                   nodeCount + edgeCount * 2u);
-        }
+        first+=count; Report(progressCallback,PreprocessStage::ValidateOutput,first,expectedEdges);
     }
 }
+
 
 } // namespace
 
 ExternalPreprocessResult RunExternalPreprocess(
     const std::filesystem::path& sourceGraphPath,
     const std::filesystem::path& sourceRangesPath,
-    const std::filesystem::path& outputGraphPath,
-    const std::filesystem::path& outputRangesPath,
+    const std::filesystem::path& outputRuntimeDataPath,
     const std::filesystem::path& outputIndexPath,
     const analysis::DatasetLayoutAnalysisConfig& config,
     std::uint64_t memoryBudgetBytes,
@@ -1863,16 +2160,13 @@ ExternalPreprocessResult RunExternalPreprocess(
         double maxLatitude = -std::numeric_limits<double>::infinity();
         double minLongitude = std::numeric_limits<double>::infinity();
         double maxLongitude = -std::numeric_limits<double>::infinity();
-        std::uint64_t nodeSectionOffset = 0;
         for (std::uint64_t record = 0; record < nodeCount; ++record) {
             const auto [id, offset] = graph.ReadWithOffset<std::uint32_t>();
             if (id != record) {
                 throw std::runtime_error(
                     "external preprocess currently requires source node records to be ID ordered");
             }
-            if (record == 0) {
-                nodeSectionOffset = offset;
-            }
+            static_cast<void>(offset);
             DiskNode node;
             node.osmId = graph.Read<std::uint64_t>();
             node.latitude = graph.Read<double>();
@@ -2019,11 +2313,10 @@ ExternalPreprocessResult RunExternalPreprocess(
             }
         }
 
-        const auto edgeOrderPath = TempPath(tempRoot, "edge_order");
         const auto membershipPath = TempPath(tempRoot, "membership");
         const auto edgeSpatialBoundsPath = TempPath(tempRoot, "edge_spatial_bounds");
         DirectGridPageBuilder pageBuilder(edges, geometryBounds, groups, levelToGroup, config,
-                                          edgeOrderPath, membershipPath, progressCallback);
+                                          membershipPath, progressCallback);
         pageBuilder.SetMaxLevel(maxLevel);
         pageBuilder.Build(drawableCount, oldToNewEdge, edgeRemapPath, edgeSpatialBoundsPath);
 
@@ -2033,37 +2326,34 @@ ExternalPreprocessResult RunExternalPreprocess(
         // deliberately leaves these optional legacy prefetch sections empty.
         auto builtPages = pageBuilder.Pages();
 
-        // Geometry bounds have now been persisted in new-EdgeID order for .chidx. The original
-        // hierarchy-order mapping can be released; reopen only the reordered compact bounds while
-        // writing the binary root payload so continent-scale preprocessing never holds both.
-        geometryBounds.Release();
+        // Keep the compact old-EdgeID bounds mapped through the sequential scatter. This lets
+        // WriteRuntimeData consume edges + bounds in one forward pass instead of looking them up
+        // through the new permutation. The writer releases it before partition assembly.
         MappedArray<std::uint64_t> newEdgeSpatialBounds;
         newEdgeSpatialBounds.OpenExisting(edgeSpatialBoundsPath, edgeCount);
         nodes.OpenExisting(nodesPath, nodeCount);
         oldToNewNode.OpenExisting(nodeRemapPath, nodeCount);
 
-        const auto rootPayloadPath = TempPath(tempRoot, "root_payload");
         std::vector<index::CHIndexSourceBlock> nodeBlocks;
         std::vector<index::CHIndexSourceBlock> edgeBlocks;
-        std::vector<index::CHIndexSourceBlock> rangeBlocks;
-        WritePreprocessedFiles(sourceGraphPath, nodeSectionOffset, nodes, edges, oldToNewNode,
-                         oldToNewEdge, newEdgeSpatialBounds, drawableCount,
-                         minLatitude, minLongitude, maxLatitude, maxLongitude,
-                         nodeOrderPath, edgeOrderPath, rootPayloadPath, outputGraphPath,
-                         outputRangesPath, config, nodeBlocks, edgeBlocks, rangeBlocks,
+        WriteRuntimeData(nodes, edges, oldToNewNode, oldToNewEdge, geometryBounds,
+                         newEdgeSpatialBounds, drawableCount, minLatitude, minLongitude,
+                         maxLatitude, maxLongitude, nodeOrderPath, outputRuntimeDataPath,
+                         tempRoot, memoryBudgetBytes, config, nodeBlocks, edgeBlocks,
                          progressCallback);
         newEdgeSpatialBounds.Release();
 
         if (strictOutputValidation) {
-            ValidatePreprocessedStreaming(outputGraphPath, outputRangesPath, nodeCount, edgeCount,
-                                          progressCallback);
+            ValidateRuntimeDataStreaming(outputRuntimeDataPath, nodeCount, edgeCount,
+                                         drawableCount, progressCallback);
         } else {
             Report(progressCallback, PreprocessStage::ValidateOutput, 1, 1);
         }
 
         index::CHIndexBuildData indexData;
-        indexData.graphPath = outputGraphPath;
-        indexData.rangesPath = outputRangesPath;
+        indexData.graphPath = sourceGraphPath;
+        indexData.rangesPath = sourceRangesPath;
+        indexData.runtimeDataPath = outputRuntimeDataPath;
         indexData.nodeCount = nodeCount;
         indexData.edgeCount = edgeCount;
         indexData.maxLevel = maxLevel;
@@ -2079,7 +2369,6 @@ ExternalPreprocessResult RunExternalPreprocess(
         indexData.maxLongitude = maxLongitude;
         indexData.nodeBlocks = std::move(nodeBlocks);
         indexData.graphEdgeBlocks = std::move(edgeBlocks);
-        indexData.rangeEdgeBlocks = std::move(rangeBlocks);
         indexData.graphPages.reserve(builtPages.size());
         for (const auto& page : builtPages) {
             indexData.graphPages.push_back(page.page);
@@ -2089,9 +2378,6 @@ ExternalPreprocessResult RunExternalPreprocess(
         indexData.pageAliveMasks = pageBuilder.AliveMasks();
         indexData.membershipBytesPath = membershipPath;
         indexData.membershipByteCount = pageBuilder.MembershipByteCount();
-        indexData.edgeSpatialBoundsPath = edgeSpatialBoundsPath;
-        indexData.edgeSpatialBoundsCount = edgeCount;
-        indexData.rootPayloadPath = rootPayloadPath;
         indexData.rootPayloadRecordCount = drawableCount;
 
         Report(progressCallback, PreprocessStage::WriteIndex, 0, 1);

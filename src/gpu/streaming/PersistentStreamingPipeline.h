@@ -29,19 +29,57 @@ enum class PersistentRangeFilterKind : std::uint8_t {
     BirthOrdered,
 };
 
+enum class GPUMemoryArchitecture : std::uint8_t {
+    Unknown,
+    Dedicated,
+    Unified,
+};
+
+struct GPUMemoryInfo {
+    GPUMemoryArchitecture architecture = GPUMemoryArchitecture::Unknown;
+    std::uint64_t reportedAvailableBytes = 0;
+    std::uint64_t reportedTotalBytes = 0;
+    bool hostSharedBufferStorageSupported = false;
+};
+
+// OpenGL does not provide a universal dedicated-vs-UMA query. This probe combines vendor/renderer
+// information with explicit driver memory extensions and supports CHMV_GPU_MEMORY_ARCH=unified or
+// dedicated as a deterministic override for ambiguous AMD APUs / unusual drivers.
+[[nodiscard]] GPUMemoryInfo QueryGpuMemoryInfo();
+[[nodiscard]] std::uint64_t RecommendPersistentGpuBudget(
+    const GPUMemoryInfo& gpu,
+    const chmv::streaming::runtime::SystemMemoryInfo& systemMemory,
+    std::uint64_t cpuCacheBudgetBytes,
+    std::uint64_t* reservedBytes = nullptr);
+
 struct PersistentStreamingConfig {
-    // Hard budget for persistent GPU streaming buffers. Capacities for root records,
-    // backing blocks, refinement geometry, hash state and draw lists are derived from it.
-    std::uint64_t gpuBudgetBytes = 384ull << 20;
+    // Hard budget for persistent GPU streaming buffers. Zero selects an automatic budget from
+    // the currently available VRAM when the driver exposes it; otherwise a conservative fallback
+    // is used. Capacities for root records, backing blocks, refinement geometry, hash state and
+    // draw lists are derived from this one budget.
+    std::uint64_t gpuBudgetBytes = 0;
     // Zero selects automatic partitioning within gpuBudgetBytes.
     std::uint64_t rootCacheBudgetBytes = 0;
     std::uint64_t refinementGeometryBudgetBytes = 0;
     std::uint64_t refinementHashBudgetBytes = 0;
+    // CPU cache shares the same physical memory pool with GPU buffers on UMA/iGPU systems.
+    // Supplying this lets automatic GPU budgeting avoid double-counting system RAM.
+    std::uint64_t cpuCacheBudgetBytes = 0;
+    GPUMemoryArchitecture memoryArchitecture = GPUMemoryArchitecture::Unknown;
+    bool enableUnifiedHostSharedBuffers = true;
 };
 
 struct PersistentStreamingStats {
     std::uint64_t gpuBudgetBytes = 0;
     std::uint64_t gpuAllocatedBytes = 0;
+    std::uint64_t gpuReportedAvailableBytes = 0;
+    std::uint64_t gpuReportedTotalBytes = 0;
+    std::uint64_t gpuAutoReservedBytes = 0;
+    bool gpuBudgetWasAuto = false;
+    GPUMemoryArchitecture gpuMemoryArchitecture = GPUMemoryArchitecture::Unknown;
+    bool gpuHostSharedStorageSupported = false;
+    bool gpuHostSharedBuffersEnabled = false;
+    std::uint64_t gpuHostSharedBufferBytes = 0;
     std::uint32_t gpuRootRecordCapacity = 0;
     std::uint32_t gpuRootPagesCached = 0;
     std::uint32_t gpuRootPagesActive = 0;
@@ -64,7 +102,9 @@ struct PersistentStreamingStats {
     std::uint32_t refinementWriteBank = 0;
     std::uint32_t refinementBanksUsed = 0;
     std::uint64_t refinementBankRecycles = 0;
+    std::uint64_t refinementForcedBankRecycles = 0;
     std::uint64_t rootPageEvictions = 0;
+    std::uint64_t rootWorkingSetRebases = 0;
     std::uint64_t rootCacheAllocationFailures = 0;
     std::uint64_t backingBlockEvictions = 0;
     std::uint64_t backingBlockFirstUploads = 0;
@@ -103,7 +143,12 @@ public:
     [[nodiscard]] bool HasRootPage(std::uint32_t pageId) const;
     [[nodiscard]] bool UploadRootPage(
         const chmv::streaming::runtime::ResidentGraphPage& page,
-        std::span<const std::uint64_t> edgeSpatialBounds);
+        std::span<const std::uint64_t> edgeSpatialBounds,
+        bool allowEviction = true);
+    // Fallback for a camera/LOD jump whose old+new atomic transition set is larger than the root
+    // cache even though the new view alone fits. The caller first makes sure all new pages are
+    // CPU-resident, then rebases the GPU root cache in one update instead of waiting forever.
+    void ClearRootCache();
     // Only strict viewport pages are protected from GPU root-cache eviction. The wider 7x7
     // residency set remains active for culling/prefetch but is replaceable under pressure.
     void SetProtectedRootPages(std::span<const std::uint32_t> pageIds);
@@ -144,6 +189,7 @@ private:
         std::uint32_t offset = 0;
         std::uint32_t count = 0;
         std::uint64_t lastUse = 0;
+        std::uint64_t lastGpuUseFrame = 0;
     };
 
     struct FreeRange {
@@ -157,9 +203,10 @@ private:
         // Newly uploaded blocks need a few frames before asynchronous GPU use readback can
         // refresh lastUse. During this short window they are soft-protected from LRU eviction.
         std::uint64_t uploadedFrame = 0;
+        std::uint64_t lastGpuUseFrame = 0;
     };
 
-    [[nodiscard]] std::uint32_t AllocateRootRange(std::uint32_t count);
+    [[nodiscard]] std::uint32_t AllocateRootRange(std::uint32_t count, bool allowEviction);
     void FreeRootRange(std::uint32_t offset, std::uint32_t count);
     bool EvictOneInactiveRootPage();
     bool EvictOneUnpinnedBackingBlock();
@@ -175,14 +222,7 @@ private:
     static constexpr std::uint32_t InvalidId = 0xffffffffu;
     static constexpr std::uint32_t LocalSize = 256u;
     static constexpr std::uint32_t RefineLocalSize = 64u;
-    static constexpr std::uint32_t MaxRootRecordCapacity = 1u << 21u;
-    static constexpr std::uint32_t MaxBackingBlockCapacity = 8192u;
     static constexpr std::uint32_t MaxAdaptiveBlockRequestsPerFrame = 128u;
-    static constexpr std::uint32_t MaxRefinementHashCapacity = 1u << 20u;
-    // Final Full-DFS geometry is cached directly as vec4 line segments. 4M segments = 64 MiB.
-    // Saturation is graceful: existing cached roots remain valid and new roots fall back to the
-    // shortcut instead of clearing the entire cache and causing visible refine/unrefine oscillation.
-    static constexpr std::uint32_t MaxLeafArenaCapacity = 1u << 22u;
     static constexpr std::uint32_t RefinementBankCount = 8u;
     static constexpr std::uint32_t RefinementBankReuseDelayFrames = 8u;
     // Readback uses a 3-slot asynchronous ring. Four frames of upload grace prevents a newly
@@ -190,6 +230,9 @@ private:
     // This is deliberately soft: if every unpinned slot is still young, LRU falls back to the
     // oldest young slot rather than failing an allocation.
     static constexpr std::uint32_t BackingUploadGraceFrames = 4u;
+    // Persistently mapped UMA buffers are written directly by the CPU. Do not recycle a range
+    // while commands from a recent frame can still read it.
+    static constexpr std::uint32_t HostSharedReuseDelayFrames = 4u;
     static constexpr std::size_t ReadbackRingSize = 3u;
 
     ComputeProgram fullScanFilterProgram_;
@@ -242,6 +285,8 @@ private:
     const chmv::streaming::index::CHIndexData* index_ = nullptr;
     PersistentStreamingConfig config_{};
     std::uint64_t allocatedGpuBytes_ = 0;
+    bool useUnifiedHostSharedBuffers_ = false;
+    std::uint64_t hostSharedBufferBytes_ = 0;
     std::uint32_t rootRecordCapacity_ = 0;
     std::uint32_t activeDescriptorCapacity_ = 0;
     std::uint32_t activePageCount_ = 0;
@@ -260,6 +305,7 @@ private:
     float lastAdaptiveDecisionScale_ = 0.0f;
     bool lastBackingReadbackWasFresh_ = false;
     std::uint64_t refinementBankRecycleCount_ = 0;
+    std::uint64_t refinementForcedBankRecycleCount_ = 0;
     std::array<std::uint32_t, RefinementBankCount> latestRefinementBankUsed_{};
     std::array<std::uint32_t, RefinementBankCount> latestRefinementBankOverflow_{};
     std::array<std::uint32_t, RefinementBankCount> latestRefinementBankLastUse_{};

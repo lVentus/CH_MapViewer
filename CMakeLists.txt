@@ -44,6 +44,7 @@ add_library(chmv_data
     src/streaming/preprocess/ExternalPreprocess.cpp
     src/streaming/index/CHIndex.cpp
     src/streaming/runtime/GraphPageStreamer.cpp
+    src/streaming/runtime/RuntimeData.cpp
 )
 
 target_include_directories(chmv_data PUBLIC src)

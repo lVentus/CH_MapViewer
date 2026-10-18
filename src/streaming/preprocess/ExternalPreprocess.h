@@ -17,8 +17,7 @@ struct ExternalPreprocessResult {
 [[nodiscard]] ExternalPreprocessResult RunExternalPreprocess(
     const std::filesystem::path& sourceGraphPath,
     const std::filesystem::path& sourceRangesPath,
-    const std::filesystem::path& outputGraphPath,
-    const std::filesystem::path& outputRangesPath,
+    const std::filesystem::path& outputRuntimeDataPath,
     const std::filesystem::path& outputIndexPath,
     const analysis::DatasetLayoutAnalysisConfig& config,
     std::uint64_t memoryBudgetBytes,

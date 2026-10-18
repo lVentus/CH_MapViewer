@@ -11,6 +11,7 @@
 #include "streaming/preprocess/DatasetPreprocessor.h"
 #include "streaming/index/CHIndex.h"
 #include "streaming/runtime/GraphPageStreamer.h"
+#include "streaming/runtime/RuntimeData.h"
 
 #include <algorithm>
 #include <bit>
@@ -154,21 +155,22 @@ void TestAsyncDatasetLoader() {
     Require(loader.Start(graphPath, rangePath), "async loader did not start");
 
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-    while (loader.Snapshot().phase != chmv::data::DatasetLoadPhase::Ready &&
+    while (loader.Snapshot().phase != chmv::data::DatasetLoadPhase::PreprocessedForStreaming &&
            loader.Snapshot().phase != chmv::data::DatasetLoadPhase::Failed &&
            std::chrono::steady_clock::now() < deadline) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 
     const auto snapshot = loader.Snapshot();
-    Require(snapshot.phase == chmv::data::DatasetLoadPhase::Ready,
-            "async loader did not complete");
+    Require(snapshot.phase == chmv::data::DatasetLoadPhase::PreprocessedForStreaming,
+            "async loader did not select the v8 binary virtual-map runtime");
     Require(snapshot.progress == 1.0f, "async loader progress did not reach 100 percent");
 
-    auto graph = loader.TakeCompleted();
-    Require(graph.has_value(), "async loader result missing");
-    Require(graph->NodeCount() == 2 && graph->EdgeCount() == 1,
-            "async loader graph mismatch");
+    auto binaryDataset = loader.TakeStreamingCompleted();
+    Require(binaryDataset.has_value(), "async loader binary runtime result missing");
+    Require(binaryDataset->index.nodeCount == 2 && binaryDataset->index.edgeCount == 1 &&
+                binaryDataset->index.HasRuntimeBinary(),
+            "async loader binary runtime index mismatch");
     Require(chmv::streaming::preprocess::DatasetPreprocessor::HasValidPreprocess(graphPath, rangePath),
             "async loader should create and validate Preprocess automatically");
 
@@ -447,26 +449,56 @@ void TestDatasetPreprocessor() {
             "preprocess ranges were not written");
     Require(std::filesystem::is_regular_file(result.paths.indexPath),
             "preprocess index was not written");
+    Require(std::filesystem::is_regular_file(result.paths.runtimeDataPath),
+            "preprocess runtime binary was not written");
     Require(result.paths.graphPath == graphPath && result.paths.rangesPath == rangePath,
-            "preprocess should keep the active dataset filenames unchanged");
-    Require(std::filesystem::is_regular_file(result.paths.originalGraphPath) &&
-                std::filesystem::is_regular_file(result.paths.originalRangesPath),
-            "preprocess did not preserve the original source pair under .org");
-    Require(readAll(result.paths.originalGraphPath) == sourceGraphBytes &&
-                readAll(result.paths.originalRangesPath) == sourceRangeBytes,
-            "preprocess did not preserve the original source bytes");
+            "preprocess should keep the source dataset filenames unchanged");
+    Require(result.paths.originalGraphPath.empty() && result.paths.originalRangesPath.empty(),
+            "v8 preprocess must not create legacy .org source copies");
+    Require(readAll(graphPath) == sourceGraphBytes && readAll(rangePath) == sourceRangeBytes,
+            "preprocess modified the original source bytes");
     Require(chmv::streaming::preprocess::DatasetPreprocessor::HasValidPreprocess(
                 graphPath, rangePath, config),
             "preprocess cache should validate against unchanged sources");
     const auto preprocessedIndex = chmv::streaming::index::CHIndex::Load(result.paths.indexPath);
+    Require(preprocessedIndex.formatVersion >= 8u && preprocessedIndex.HasRuntimeBinary(),
+            "preprocess index did not persist the v8 runtime-binary mapping");
+    Require(preprocessedIndex.HasSpatialDirectory(),
+            "preprocess index did not persist the v8 CSR spatial directory");
     Require(preprocessedIndex.HasRootPayload(),
-            "preprocess index did not persist the v6 binary root payload");
+            "preprocess runtime binary did not persist the root payload");
     Require(preprocessedIndex.rootPayloadRecordCount == sourceGraph.DrawableEdgeCount(),
             "preprocess root-payload count does not match drawable roots");
-    Require(chmv::streaming::index::CHIndex::ReadEdgeSpatialBounds(
-                preprocessedIndex, 0u, static_cast<std::uint32_t>(result.edgeCount)).size() ==
-                result.edgeCount,
-            "preprocess index did not persist one full-geometry spatial bound per edge");
+    const auto runtimeHeader = chmv::streaming::runtime::RuntimeData::ReadHeader(
+        result.paths.runtimeDataPath);
+    Require(runtimeHeader.nodeCount == sourceGraph.NodeCount() &&
+                runtimeHeader.edgeCount == sourceGraph.EdgeCount() &&
+                runtimeHeader.rootRecordCount == sourceGraph.DrawableEdgeCount(),
+            "runtime binary header does not match the source CH counts");
+    std::ifstream runtimeInput(result.paths.runtimeDataPath, std::ios::binary);
+    std::vector<chmv::streaming::runtime::RuntimeEdgeRecord> runtimeEdges(
+        static_cast<std::size_t>(runtimeHeader.edgeCount));
+    chmv::streaming::runtime::RuntimeData::ReadRecords(
+        runtimeInput, runtimeHeader.edgeSectionOffset,
+        std::span<chmv::streaming::runtime::RuntimeEdgeRecord>(runtimeEdges));
+    std::size_t runtimeShortcutCount = 0;
+    std::size_t runtimeDrawableCount = 0;
+    for (const auto& edge : runtimeEdges) {
+        Require(edge.source < runtimeHeader.nodeCount && edge.target < runtimeHeader.nodeCount,
+                "runtime binary produced an invalid endpoint reference");
+        const bool shortcut = edge.childA != chmv::data::InvalidEdgeId ||
+                              edge.childB != chmv::data::InvalidEdgeId;
+        if (shortcut) {
+            Require(edge.childA < runtimeHeader.edgeCount && edge.childB < runtimeHeader.edgeCount,
+                    "runtime binary produced an invalid shortcut reference");
+            ++runtimeShortcutCount;
+        }
+        if (edge.birthLevel >= 0) ++runtimeDrawableCount;
+    }
+    Require(runtimeShortcutCount == sourceGraph.ShortcutCount(),
+            "runtime binary changed the shortcut count");
+    Require(runtimeDrawableCount == sourceGraph.DrawableEdgeCount(),
+            "runtime binary changed the drawable lifetime count");
     const auto firstRootPage = chmv::streaming::index::CHIndex::ReadGraphPageRootRecords(
         preprocessedIndex, 0u);
     Require(firstRootPage.size() == preprocessedIndex.graphPages.front().edgeCount,
@@ -578,22 +610,36 @@ void TestGraphPageStreamer() {
     const auto preprocessResult = chmv::streaming::preprocess::DatasetPreprocessor::Run(
         graphPath, rangePath, analysisConfig, true, {}, preprocessOptions);
     auto index = chmv::streaming::index::CHIndex::Load(preprocessResult.paths.indexPath);
-    Require(index.HasRootPayload(),
-            "preprocess index did not persist the v6 binary root payload");
-    Require(chmv::streaming::index::CHIndex::ReadEdgeSpatialBounds(
-                index, 0u, static_cast<std::uint32_t>(index.edgeCount)).size() == index.edgeCount,
-            "preprocess index did not persist full-geometry edge spatial bounds");
+    Require(index.formatVersion >= 8u && index.HasRuntimeBinary() && index.HasRootPayload(),
+            "preprocess index did not persist the v8 runtime payload mapping");
+    Require(index.HasSpatialDirectory(),
+            "preprocess index did not persist the v8 CSR spatial directory");
     Require(std::abs(index.spatialCellSizeMeters - analysisConfig.spatialCellSizeMeters) < 1e-9,
             "preprocess index did not persist the fixed world-space cell size");
     const auto streamedGraph = chmv::data::CHLoader::Load(graphPath, rangePath);
+    std::uint32_t runtimeShortcutId = chmv::data::InvalidEdgeId;
+    std::uint32_t runtimeRequestedChild = chmv::data::InvalidEdgeId;
+    for (std::uint32_t pageId = 0; pageId < index.graphPages.size() &&
+                                   runtimeShortcutId == chmv::data::InvalidEdgeId; ++pageId) {
+        for (const auto& record : chmv::streaming::index::CHIndex::ReadGraphPageRootRecords(index, pageId)) {
+            if (record.childA != chmv::data::InvalidEdgeId && record.childB != chmv::data::InvalidEdgeId) {
+                runtimeShortcutId = record.globalEdgeId;
+                runtimeRequestedChild = record.childA;
+                break;
+            }
+        }
+    }
+    Require(runtimeShortcutId != chmv::data::InvalidEdgeId &&
+                runtimeRequestedChild != chmv::data::InvalidEdgeId,
+            "v8 runtime root payload lost the drawable shortcut");
 
     chmv::streaming::runtime::GraphPageStreamerConfig streamingConfig;
     Require(streamingConfig.spatialPrefetchRadius == 3,
             "runtime streaming must default to a 7x7 fixed-grid spatial neighborhood");
     Require(streamingConfig.lodPrefetchNearSpatialRadius == 1 &&
-                streamingConfig.lodPrefetchNearDistance == 2 &&
-                streamingConfig.lodPrefetchGpuWarmDistance == 2,
-            "runtime streaming must separate wide RAM LOD prefetch from a narrow GPU warm band");
+                streamingConfig.lodPrefetchNearDistance == 3 &&
+                streamingConfig.lodPrefetchGpuWarmDistance == 8,
+            "runtime streaming must keep a wider persistent GPU warm LOD band");
     Require(!streamingConfig.prefetchLodChildren,
             "runtime streaming must not prefetch LOD children before GPU misses request them");
     streamingConfig.ramBudgetBytes = 16ull * 1024ull * 1024ull;
@@ -638,19 +684,10 @@ void TestGraphPageStreamer() {
                     viewportWindow.maxY <= residencyWindow.maxY,
                 "strict viewport window must be contained by the residency neighborhood");
 
-        std::uint32_t shortcutId = chmv::data::InvalidEdgeId;
-        for (std::uint32_t edgeId = 0; edgeId < streamedGraph.EdgeCount(); ++edgeId) {
-            if (streamedGraph.Edges()[edgeId].IsShortcut()) {
-                shortcutId = edgeId;
-                break;
-            }
-        }
-        Require(shortcutId != chmv::data::InvalidEdgeId,
-                "preprocessed streaming test graph lost its shortcut");
-        const auto requestedChild = streamedGraph.Edges()[shortcutId].childA;
+        const auto requestedChild = runtimeRequestedChild;
         const auto requestedBlock = requestedChild / analysisConfig.sourceBlockEdgeCount;
         const chmv::streaming::runtime::RefinementEdgeRequest refinementRequest{
-            shortcutId, requestedChild};
+            runtimeShortcutId, requestedChild};
         const auto refinementToken = streamer.RequestRefinementEdges(
             std::span<const chmv::streaming::runtime::RefinementEdgeRequest>(
                 &refinementRequest, 1));
@@ -716,10 +753,9 @@ void TestGraphPageStreamer() {
         graphPath, rangePath);
     std::filesystem::remove(preprocessPaths.graphPath);
     std::filesystem::remove(preprocessPaths.rangesPath);
+    std::filesystem::remove(preprocessPaths.runtimeDataPath);
     std::filesystem::remove(preprocessPaths.indexPath);
     std::filesystem::remove(preprocessPaths.manifestPath);
-    std::filesystem::remove(preprocessPaths.originalGraphPath);
-    std::filesystem::remove(preprocessPaths.originalRangesPath);
 }
 
 
@@ -789,10 +825,9 @@ void TestFixedGridBoundaryAndForwardShortcut() {
         graphPath, rangePath);
     std::filesystem::remove(paths.graphPath);
     std::filesystem::remove(paths.rangesPath);
+    std::filesystem::remove(paths.runtimeDataPath);
     std::filesystem::remove(paths.indexPath);
     std::filesystem::remove(paths.manifestPath);
-    std::filesystem::remove(paths.originalGraphPath);
-    std::filesystem::remove(paths.originalRangesPath);
 }
 
 
@@ -851,13 +886,8 @@ void TestMixedOrderShortcutGeometryBounds() {
     }
     Require(rootEdge != std::numeric_limits<std::uint32_t>::max(),
             "mixed-order bounds test lost its drawable shortcut root");
-    const auto packed = chmv::streaming::index::CHIndex::ReadEdgeSpatialBounds(
-                            index, rootEdge, 1u)
-                            .front();
-    const auto minY = static_cast<std::uint32_t>((packed >> 16u) & 0xffffu);
-    const auto maxY = static_cast<std::uint32_t>((packed >> 48u) & 0xffffu);
-    Require(maxY > minY + 2u,
-            "mixed-order shortcut resolver lost child geometry from the full root bounds");
+    Require(index.HasSpatialDirectory() && index.pageSpatialBounds.size() == index.graphPages.size(),
+            "v8 index did not persist page spatial accelerators");
     Require(!index.graphPages.empty() && index.graphPages.front().spatialLevel >= 2u,
             "mixed-order shortcut root was assigned from endpoint-only bounds");
 
@@ -865,10 +895,9 @@ void TestMixedOrderShortcutGeometryBounds() {
         graphPath, rangePath);
     std::filesystem::remove(paths.graphPath);
     std::filesystem::remove(paths.rangesPath);
+    std::filesystem::remove(paths.runtimeDataPath);
     std::filesystem::remove(paths.indexPath);
     std::filesystem::remove(paths.manifestPath);
-    std::filesystem::remove(paths.originalGraphPath);
-    std::filesystem::remove(paths.originalRangesPath);
 }
 
 
@@ -932,10 +961,12 @@ void TestFixedGridPhysicalPagePacking() {
             "one LOD group should pack densely across former fixed 64x64 region boundaries");
     Require(index.graphPages.front().edgeCount == edgeCount,
             "packed physical page lost drawable edges");
-    Require(index.spatialPageRefs.size() == edgeCount,
+    Require(index.HasSpatialDirectory(),
+            "packed physical page must retain the v8 exact cell-to-page directory");
+    Require(index.spatialPageIds.size() == edgeCount,
             "packed physical page must retain exact cell-to-page lookup references");
-    Require(std::all_of(index.spatialPageRefs.begin(), index.spatialPageRefs.end(),
-                        [](const auto& ref) { return ref.pageId == 0; }),
+    Require(std::all_of(index.spatialPageIds.begin(), index.spatialPageIds.end(),
+                        [](const auto pageId) { return pageId == 0; }),
             "spatial cells should all reference the shared dense packed page");
 
     std::filesystem::remove_all(root);

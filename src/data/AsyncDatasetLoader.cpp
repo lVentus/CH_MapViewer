@@ -103,7 +103,8 @@ bool CanWholeLoadGraph(std::uint64_t nodeCount, std::uint64_t edgeCount) {
 using streaming::analysis::detail::TextSourceScanner;
 
 bool RootRoadStyleMetadataReady(const streaming::index::CHIndexData& index) {
-    if (!index.HasRootPayload() || index.rootPayloadRecordCount == 0u) {
+    // CHIDX v8 roots are emitted into .chbin with road-style metadata already encoded.
+    if (index.HasRuntimeBinary() || !index.HasRootPayload() || index.rootPayloadRecordCount == 0u) {
         return true;
     }
     std::ifstream input(index.indexPath, std::ios::binary);
@@ -309,7 +310,12 @@ bool AsyncDatasetLoader::StartInternal(const std::filesystem::path& graphPath,
                         progress_.store(Fraction(current, total));
                     });
             }
-            if (streamingOnly || !CanWholeLoadGraph(preprocessedIndex.nodeCount, preprocessedIndex.edgeCount)) {
+            // v8+ has one authoritative binary runtime path. Even when the user did not request
+            // classic out-of-core mode, keep the virtual-map renderer and let GraphPageStreamer
+            // decide whether .chbin is entirely RAM-resident or backed by the SSD. This avoids
+            // falling back to the legacy multi-billion-token .sch/.ranges parser on high-RAM hosts.
+            if (preprocessedIndex.HasRuntimeBinary() || streamingOnly ||
+                !CanWholeLoadGraph(preprocessedIndex.nodeCount, preprocessedIndex.edgeCount)) {
                 {
                     std::lock_guard lock(mutex_);
                     completedStreamingDataset_ = StreamingDataset{
@@ -318,7 +324,7 @@ bool AsyncDatasetLoader::StartInternal(const std::filesystem::path& graphPath,
                         std::move(preprocessedIndex),
                     };
                 }
-                std::cout << "Preprocessed dataset is ready for the out-of-core runtime.\n";
+                std::cout << "Preprocessed dataset is ready for the binary virtual-map runtime.\n";
                 progress_.store(1.0f);
                 phase_.store(DatasetLoadPhase::PreprocessedForStreaming);
                 return;

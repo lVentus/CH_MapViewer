@@ -1,4 +1,4 @@
-#version 450 core
+#version 430 core
 
 const uint CACHED_SEGMENT_BIT = 0x80000000u;
 const uint CACHED_SEGMENT_MASK = 0x7fffffffu;

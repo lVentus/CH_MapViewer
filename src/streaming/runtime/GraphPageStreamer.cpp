@@ -8,6 +8,7 @@
 #include <bit>
 #include <cmath>
 #include <cstddef>
+#include <cstring>
 #include <fstream>
 #include <functional>
 #include <limits>
@@ -97,31 +98,6 @@ double PointSegmentDistance(data::ProjectedPoint point, data::ProjectedPoint seg
     return std::hypot(point.x - closestX, point.y - closestY);
 }
 
-float ConservativeGeometryError(std::uint64_t packedBounds,
-                                data::ProjectedPoint source,
-                                data::ProjectedPoint target,
-                                double cellSizeMeters,
-                                const data::CHProjection& projection) {
-    const auto minX = static_cast<std::uint32_t>(packedBounds & 0xffffu);
-    const auto minY = static_cast<std::uint32_t>((packedBounds >> 16u) & 0xffffu);
-    const auto maxX = static_cast<std::uint32_t>((packedBounds >> 32u) & 0xffffu);
-    const auto maxY = static_cast<std::uint32_t>((packedBounds >> 48u) & 0xffffu);
-    const std::uint32_t xs[] = {minX, maxX + 1u};
-    const std::uint32_t ys[] = {minY, maxY + 1u};
-    double error = 0.0;
-    for (const auto x : xs) {
-        for (const auto y : ys) {
-            error = std::max(
-                error,
-                PointSegmentDistance(
-                    WorldCellBoundaryPoint(x, y, cellSizeMeters, projection), source, target));
-        }
-    }
-    // The resident node cache stores projected endpoints as floats. Inflate the bound very
-    // slightly so that float round-off cannot turn a conservative preprocess bound into an
-    // under-estimate at the Adaptive DFS stopping test.
-    return static_cast<float>(error * 1.0001 + 1e-7);
-}
 
 float ConservativeGeometryErrorCached(std::uint64_t packedBounds,
                                       data::ProjectedPoint source,
@@ -213,6 +189,7 @@ struct TemporaryEdge {
     std::uint32_t childA = data::InvalidEdgeId;
     std::uint32_t childB = data::InvalidEdgeId;
     std::uint32_t roadStyleType = 0;
+    float geometryError = 0.0f;
     std::int32_t birthLevel = -1;
     std::int32_t deathLevel = -1;
     bool graphLoaded = false;
@@ -296,115 +273,137 @@ GraphPageStreamer::GraphPageStreamer(index::CHIndexData index,
     if (refinementTileRecords == 0u || refinementTileCount == 0u) {
         throw std::runtime_error("streaming refinement tile layout is invalid");
     }
-    refinementTileByteOffsets_.assign(
-        refinementTileCount, std::numeric_limits<std::uint64_t>::max());
-    for (std::uint32_t sourceBlockId = 0; sourceBlockId < index_.graphEdgeBlocks.size();
-         ++sourceBlockId) {
-        const auto& sourceBlock = index_.graphEdgeBlocks[sourceBlockId];
-        if (sourceBlock.recordCount == 0u || sourceBlock.firstRecord >= index_.edgeCount) {
-            continue;
+
+    if (index_.HasRuntimeBinary()) {
+        runtimeDataPath_ = RuntimeData::DefaultPath(graphPath_);
+        const auto runtimeHeader = RuntimeData::ReadHeader(runtimeDataPath_);
+        if (runtimeHeader.nodeCount != index_.nodeCount ||
+            runtimeHeader.edgeCount != index_.edgeCount ||
+            runtimeHeader.rootRecordCount != index_.rootPayloadRecordCount ||
+            runtimeHeader.fileBytes != index_.runtimeDataFileBytes ||
+            runtimeHeader.nodeSectionOffset != index_.runtimeNodeSectionOffset ||
+            runtimeHeader.edgeSectionOffset != index_.runtimeEdgeSectionOffset ||
+            runtimeHeader.rootSectionOffset != index_.runtimeRootSectionOffset) {
+            throw std::runtime_error("runtime binary does not match CHIDX v8");
         }
-        const auto tileId = static_cast<std::uint32_t>(sourceBlock.firstRecord / refinementTileRecords);
-        if (tileId < refinementTileByteOffsets_.size()) {
-            refinementTileByteOffsets_[tileId] = sourceBlock.byteOffset;
+
+        if (config_.preloadRuntimeDataWhenPossible) {
+            const auto memory = QuerySystemMemoryInfo();
+            const auto reserve = std::max<std::uint64_t>(6ull * kGiB,
+                                                          memory.totalPhysicalBytes / 5u);
+            const auto required = index_.runtimeDataFileBytes + config_.ramBudgetBytes +
+                                  config_.sharedGpuReservationBytes + reserve;
+            runtimeDataPreloadEligible_ = memory.availablePhysicalBytes != 0u &&
+                                          required < memory.availablePhysicalBytes;
+        }
+    } else {
+        refinementTileByteOffsets_.assign(
+            refinementTileCount, std::numeric_limits<std::uint64_t>::max());
+        for (std::uint32_t sourceBlockId = 0; sourceBlockId < index_.graphEdgeBlocks.size();
+             ++sourceBlockId) {
+            const auto& sourceBlock = index_.graphEdgeBlocks[sourceBlockId];
+            if (sourceBlock.recordCount == 0u || sourceBlock.firstRecord >= index_.edgeCount) {
+                continue;
+            }
+            const auto tileId = static_cast<std::uint32_t>(sourceBlock.firstRecord / refinementTileRecords);
+            if (tileId < refinementTileByteOffsets_.size()) {
+                refinementTileByteOffsets_[tileId] = sourceBlock.byteOffset;
+            }
+        }
+
+        // Legacy v7 backing stores packed fixed-grid bounds and derives geometry error at load time.
+        const auto projection = RuntimeProjection(index_);
+        geometryBoundaryX_.resize(static_cast<std::size_t>(index_.spatialGridSize) + 1u);
+        geometryBoundaryY_.resize(static_cast<std::size_t>(index_.spatialGridSize) + 1u);
+        for (std::uint32_t i = 0; i <= index_.spatialGridSize; ++i) {
+            const auto pointX = WorldCellBoundaryPoint(i, 0u, index_.spatialCellSizeMeters, projection);
+            const auto pointY = WorldCellBoundaryPoint(0u, i, index_.spatialCellSizeMeters, projection);
+            geometryBoundaryX_[i] = pointX.x;
+            geometryBoundaryY_[i] = pointY.y;
         }
     }
 
-    // Cache projected fixed-grid boundaries once. Adaptive backing loads can then compute the same
-    // conservative error as before without doing exp/atan for every shortcut edge.
-    const auto projection = RuntimeProjection(index_);
-    geometryBoundaryX_.resize(static_cast<std::size_t>(index_.spatialGridSize) + 1u);
-    geometryBoundaryY_.resize(static_cast<std::size_t>(index_.spatialGridSize) + 1u);
-    for (std::uint32_t i = 0; i <= index_.spatialGridSize; ++i) {
-        const auto pointX = WorldCellBoundaryPoint(i, 0u, index_.spatialCellSizeMeters, projection);
-        const auto pointY = WorldCellBoundaryPoint(0u, i, index_.spatialCellSizeMeters, projection);
-        geometryBoundaryX_[i] = pointX.x;
-        geometryBoundaryY_[i] = pointY.y;
-    }
-
-    // Build compact runtime acceleration once. The source CHIDX keeps the exact cell->tile refs,
-    // but an overview query must not walk all of those refs just to discover that only a dozen
-    // high-LOD tiles are alive. Page bounds + level-major alive bitsets let QueryPages choose the
-    // more selective dimension (LOD-first or spatial-first) without changing CHIDX/preprocess.
     const auto pageCount = index_.graphPages.size();
     pageSpatialBounds_.resize(pageCount);
     pageEverLoaded_.assign(pageCount, 0u);
-    const auto gridMax = index_.spatialGridSize == 0
-                             ? std::uint64_t{0}
-                             : static_cast<std::uint64_t>(index_.spatialGridSize) - 1u;
-    for (const auto& ref : index_.spatialPageRefs) {
-        if (ref.pageId >= pageCount) {
-            throw std::runtime_error("CH index spatial page reference is invalid");
+    if (index_.HasSpatialDirectory()) {
+        if (index_.pageSpatialBounds.size() != pageCount ||
+            index_.lodAliveWordsPerLevel != (pageCount + 63u) / 64u ||
+            index_.lodAlivePageCounts.size() != static_cast<std::size_t>(index_.maxLevel) + 1u) {
+            throw std::runtime_error("CHIDX v8 runtime accelerators are inconsistent");
         }
-        const auto level = static_cast<std::uint32_t>((ref.key >> 32u) & 0xffu);
-        if (level >= 31u) {
-            continue;
+        for (std::size_t pageId = 0; pageId < pageCount; ++pageId) {
+            const auto& source = index_.pageSpatialBounds[pageId];
+            pageSpatialBounds_[pageId] = {
+                source.minX, source.minY, source.maxX, source.maxY,
+                index_.graphPages[pageId].edgeCount != 0u};
         }
-        const auto tileX = static_cast<std::uint32_t>(ref.key & 0xffffu);
-        const auto tileY = static_cast<std::uint32_t>((ref.key >> 16u) & 0xffffu);
-        const auto scale = std::uint64_t{1} << level;
-        const auto reach = scale / 2u;
-        const auto centerStartX = static_cast<std::uint64_t>(tileX) * scale;
-        const auto centerStartY = static_cast<std::uint64_t>(tileY) * scale;
-        const auto centerEndX = std::min<std::uint64_t>(
-            gridMax, (static_cast<std::uint64_t>(tileX) + 1u) * scale - 1u);
-        const auto centerEndY = std::min<std::uint64_t>(
-            gridMax, (static_cast<std::uint64_t>(tileY) + 1u) * scale - 1u);
-        const auto minX = static_cast<std::uint32_t>(
-            centerStartX > reach ? centerStartX - reach : 0u);
-        const auto minY = static_cast<std::uint32_t>(
-            centerStartY > reach ? centerStartY - reach : 0u);
-        const auto maxX = static_cast<std::uint32_t>(
-            std::min<std::uint64_t>(gridMax, centerEndX + reach));
-        const auto maxY = static_cast<std::uint32_t>(
-            std::min<std::uint64_t>(gridMax, centerEndY + reach));
-        auto& bounds = pageSpatialBounds_[ref.pageId];
-        if (!bounds.valid) {
-            bounds = {minX, minY, maxX, maxY, true};
-        } else {
-            bounds.minX = std::min(bounds.minX, minX);
-            bounds.minY = std::min(bounds.minY, minY);
-            bounds.maxX = std::max(bounds.maxX, maxX);
-            bounds.maxY = std::max(bounds.maxY, maxY);
-        }
-    }
-
-    lodAliveWordsPerLevel_ = (pageCount + 63u) / 64u;
-    lodAlivePageCounts_.assign(static_cast<std::size_t>(index_.maxLevel) + 1u, 0u);
-    lodAlivePageBits_.assign((static_cast<std::size_t>(index_.maxLevel) + 1u) *
-                                 lodAliveWordsPerLevel_,
-                             0ull);
-    if (index_.lodMaskWordsPerPage != 0u) {
-        for (std::uint32_t pageId = 0; pageId < pageCount; ++pageId) {
-            const auto& page = index_.graphPages[pageId];
-            for (std::uint32_t wordIndex = 0; wordIndex < index_.lodMaskWordsPerPage;
-                 ++wordIndex) {
-                const auto sourceIndex = static_cast<std::size_t>(page.lodMaskOffset) + wordIndex;
-                if (sourceIndex >= index_.pageAliveMasks.size()) {
-                    throw std::runtime_error("CH index page alive-mask range is invalid");
-                }
-                auto bits = index_.pageAliveMasks[sourceIndex];
-                while (bits != 0u) {
-                    const auto bit = static_cast<std::uint32_t>(std::countr_zero(bits));
-                    const auto level = wordIndex * 64u + bit;
-                    if (level <= index_.maxLevel) {
-                        const auto destination =
-                            static_cast<std::size_t>(level) * lodAliveWordsPerLevel_ +
-                            pageId / 64u;
-                        lodAlivePageBits_[destination] |=
-                            std::uint64_t{1} << (pageId & 63u);
-                        ++lodAlivePageCounts_[level];
-                    }
-                    bits &= bits - 1u;
-                }
+        lodAliveWordsPerLevel_ = index_.lodAliveWordsPerLevel;
+        lodAlivePageBits_ = index_.lodAlivePageBits;
+        lodAlivePageCounts_ = index_.lodAlivePageCounts;
+    } else {
+        const auto gridMax = index_.spatialGridSize == 0
+                                 ? std::uint64_t{0}
+                                 : static_cast<std::uint64_t>(index_.spatialGridSize) - 1u;
+        for (const auto& ref : index_.spatialPageRefs) {
+            if (ref.pageId >= pageCount) {
+                throw std::runtime_error("CH index spatial page reference is invalid");
+            }
+            const auto level = static_cast<std::uint32_t>((ref.key >> 32u) & 0xffu);
+            if (level >= 31u) continue;
+            const auto tileX = static_cast<std::uint32_t>(ref.key & 0xffffu);
+            const auto tileY = static_cast<std::uint32_t>((ref.key >> 16u) & 0xffffu);
+            const auto scale = std::uint64_t{1} << level;
+            const auto reach = scale / 2u;
+            const auto centerStartX = static_cast<std::uint64_t>(tileX) * scale;
+            const auto centerStartY = static_cast<std::uint64_t>(tileY) * scale;
+            const auto centerEndX = std::min<std::uint64_t>(
+                gridMax, (static_cast<std::uint64_t>(tileX) + 1u) * scale - 1u);
+            const auto centerEndY = std::min<std::uint64_t>(
+                gridMax, (static_cast<std::uint64_t>(tileY) + 1u) * scale - 1u);
+            const auto minX = static_cast<std::uint32_t>(centerStartX > reach ? centerStartX - reach : 0u);
+            const auto minY = static_cast<std::uint32_t>(centerStartY > reach ? centerStartY - reach : 0u);
+            const auto maxX = static_cast<std::uint32_t>(std::min<std::uint64_t>(gridMax, centerEndX + reach));
+            const auto maxY = static_cast<std::uint32_t>(std::min<std::uint64_t>(gridMax, centerEndY + reach));
+            auto& bounds = pageSpatialBounds_[ref.pageId];
+            if (!bounds.valid) bounds = {minX, minY, maxX, maxY, true};
+            else {
+                bounds.minX = std::min(bounds.minX, minX);
+                bounds.minY = std::min(bounds.minY, minY);
+                bounds.maxX = std::max(bounds.maxX, maxX);
+                bounds.maxY = std::max(bounds.maxY, maxY);
             }
         }
-    } else {
-        // Legacy safety path. v7 always has masks, but never make an absent optional accelerator
-        // change correctness. QueryPages will choose the spatial index if these counts are zero.
-        lodAlivePageBits_.clear();
-        lodAlivePageCounts_.clear();
-        lodAliveWordsPerLevel_ = 0;
+
+        lodAliveWordsPerLevel_ = (pageCount + 63u) / 64u;
+        lodAlivePageCounts_.assign(static_cast<std::size_t>(index_.maxLevel) + 1u, 0u);
+        lodAlivePageBits_.assign((static_cast<std::size_t>(index_.maxLevel) + 1u) *
+                                     lodAliveWordsPerLevel_, 0ull);
+        if (index_.lodMaskWordsPerPage != 0u) {
+            for (std::uint32_t pageId = 0; pageId < pageCount; ++pageId) {
+                const auto& page = index_.graphPages[pageId];
+                for (std::uint32_t wordIndex = 0; wordIndex < index_.lodMaskWordsPerPage; ++wordIndex) {
+                    const auto sourceIndex = static_cast<std::size_t>(page.lodMaskOffset) + wordIndex;
+                    if (sourceIndex >= index_.pageAliveMasks.size())
+                        throw std::runtime_error("CH index page alive-mask range is invalid");
+                    auto bits = index_.pageAliveMasks[sourceIndex];
+                    while (bits != 0u) {
+                        const auto bit = static_cast<std::uint32_t>(std::countr_zero(bits));
+                        const auto level = wordIndex * 64u + bit;
+                        if (level <= index_.maxLevel) {
+                            const auto destination = static_cast<std::size_t>(level) * lodAliveWordsPerLevel_ + pageId / 64u;
+                            lodAlivePageBits_[destination] |= std::uint64_t{1} << (pageId & 63u);
+                            ++lodAlivePageCounts_[level];
+                        }
+                        bits &= bits - 1u;
+                    }
+                }
+            }
+        } else {
+            lodAlivePageBits_.clear();
+            lodAlivePageCounts_.clear();
+            lodAliveWordsPerLevel_ = 0;
+        }
     }
 
     spatialCandidateStamp_.resize(pageCount, 0u);
@@ -423,9 +422,16 @@ GraphPageStreamer::GraphPageStreamer(index::CHIndexData index,
         workers_.emplace_back([this](std::stop_token stopToken) { Worker(stopToken); });
     }
     plannerWorker_ = std::jthread([this](std::stop_token stopToken) { PlannerWorker(stopToken); });
+    if (runtimeDataPreloadEligible_) {
+        runtimePreloadWorker_ = std::jthread(
+            [this](std::stop_token stopToken) { PreloadRuntimeData(stopToken); });
+    }
 }
 
 GraphPageStreamer::~GraphPageStreamer() {
+    if (runtimePreloadWorker_.joinable()) {
+        runtimePreloadWorker_.request_stop();
+    }
     if (plannerWorker_.joinable()) {
         plannerWorker_.request_stop();
     }
@@ -444,6 +450,56 @@ GraphPageStreamer::~GraphPageStreamer() {
             worker.join();
         }
     }
+    if (runtimePreloadWorker_.joinable()) {
+        runtimePreloadWorker_.join();
+    }
+}
+
+bool GraphPageStreamer::ReadRuntimeBytes(std::ifstream& runtimeStream,
+                                         std::uint64_t byteOffset, void* destination,
+                                         std::size_t byteCount) const {
+    if (byteCount == 0u) return false;
+    if (const auto resident = runtimeResidentImage_.load(std::memory_order_acquire)) {
+        if (byteOffset > resident->size() || byteCount > resident->size() - byteOffset)
+            throw std::runtime_error("runtime binary read is out of range");
+        std::memcpy(destination, resident->data() + static_cast<std::size_t>(byteOffset), byteCount);
+        return false;
+    }
+    if (byteOffset > static_cast<std::uint64_t>(std::numeric_limits<std::streamoff>::max()) ||
+        byteCount > static_cast<std::size_t>(std::numeric_limits<std::streamsize>::max()))
+        throw std::runtime_error("runtime binary read exceeds stream range");
+    runtimeStream.clear();
+    runtimeStream.seekg(static_cast<std::streamoff>(byteOffset), std::ios::beg);
+    runtimeStream.read(static_cast<char*>(destination), static_cast<std::streamsize>(byteCount));
+    if (!runtimeStream) throw std::runtime_error("truncated runtime binary read");
+    return true;
+}
+
+void GraphPageStreamer::PreloadRuntimeData(std::stop_token stopToken) {
+    runtimeDataPreloadActive_.store(true, std::memory_order_release);
+    try {
+        auto image = std::make_shared<std::vector<std::byte>>(
+            static_cast<std::size_t>(index_.runtimeDataFileBytes));
+        std::ifstream input(runtimeDataPath_, std::ios::binary);
+        if (!input) throw std::runtime_error("could not open runtime binary for RAM preload");
+        constexpr std::size_t kChunkBytes = 64u << 20u;
+        std::size_t offset = 0;
+        while (offset < image->size() && !stopToken.stop_requested()) {
+            const auto count = std::min(kChunkBytes, image->size() - offset);
+            input.read(reinterpret_cast<char*>(image->data() + offset),
+                       static_cast<std::streamsize>(count));
+            if (!input) throw std::runtime_error("runtime binary RAM preload was truncated");
+            offset += count;
+        }
+        if (!stopToken.stop_requested()) {
+            runtimeDataResidentBytes_.store(index_.runtimeDataFileBytes, std::memory_order_release);
+            runtimeResidentImage_.store(std::move(image), std::memory_order_release);
+        }
+    } catch (...) {
+        runtimeDataResidentBytes_.store(0u, std::memory_order_release);
+        runtimeResidentImage_.store({}, std::memory_order_release);
+    }
+    runtimeDataPreloadActive_.store(false, std::memory_order_release);
 }
 
 const GraphPageStreamer::PageQueryResult& GraphPageStreamer::QueryPages(
@@ -528,7 +584,8 @@ const GraphPageStreamer::PageQueryResult& GraphPageStreamer::QueryPages(
         std::min(index_.spatialGridSize - 1u, maxViewY + residencyRadius);
     result.refinementWindow = {expandedMinX, expandedMinY, expandedMaxX, expandedMaxY};
 
-    if (index_.spatialPageRefs.empty() || index_.graphPages.empty()) {
+    if ((!index_.HasSpatialDirectory() && index_.spatialPageRefs.empty()) ||
+        index_.graphPages.empty()) {
         queryCacheKey_ = cacheKey;
         queryCacheResult_ = std::move(result);
         ++queryCacheRevision_;
@@ -561,6 +618,77 @@ const GraphPageStreamer::PageQueryResult& GraphPageStreamer::QueryPages(
         }
         const auto spatialEpoch = spatialQueryEpoch_;
         spatialCandidates.reserve(std::min<std::size_t>(index_.graphPages.size(), 8192u));
+
+        if (index_.HasSpatialDirectory()) {
+            for (std::uint32_t spatialLevel = 0;
+                 spatialLevel < index_.spatialLevels.size() && spatialLevel < 31u;
+                 ++spatialLevel) {
+                const auto scale = std::uint64_t{1} << spatialLevel;
+                const auto reach = scale / 2u;
+                const auto centerMinX = expandedMinX > reach ? expandedMinX - reach : 0u;
+                const auto centerMinY = expandedMinY > reach ? expandedMinY - reach : 0u;
+                const auto centerMaxX = std::min<std::uint64_t>(
+                    gridMax, static_cast<std::uint64_t>(expandedMaxX) + reach);
+                const auto centerMaxY = std::min<std::uint64_t>(
+                    gridMax, static_cast<std::uint64_t>(expandedMaxY) + reach);
+                const auto minTileX = static_cast<std::uint32_t>(centerMinX / scale);
+                const auto maxTileX = static_cast<std::uint32_t>(centerMaxX / scale);
+                const auto minTileY = static_cast<std::uint32_t>(centerMinY / scale);
+                const auto maxTileY = static_cast<std::uint32_t>(centerMaxY / scale);
+                const auto& level = index_.spatialLevels[spatialLevel];
+                if (level.rowOffset > index_.spatialRows.size() ||
+                    level.rowCount > index_.spatialRows.size() - level.rowOffset) {
+                    throw std::runtime_error("CHIDX v8 spatial row directory is invalid");
+                }
+
+                const auto lastTileY = std::min(maxTileY, level.rowCount == 0u ? 0u : level.rowCount - 1u);
+                if (level.rowCount == 0u || minTileY >= level.rowCount) continue;
+                for (std::uint32_t tileY = minTileY; tileY <= lastTileY; ++tileY) {
+                    const auto& row = index_.spatialRows[level.rowOffset + tileY];
+                    if (row.cellOffset > index_.spatialCells.size() ||
+                        row.cellCount > index_.spatialCells.size() - row.cellOffset) {
+                        throw std::runtime_error("CHIDX v8 spatial cell directory is invalid");
+                    }
+                    const auto firstCell = index_.spatialCells.begin() + row.cellOffset;
+                    const auto lastCell = firstCell + row.cellCount;
+                    auto cell = std::lower_bound(
+                        firstCell, lastCell, minTileX,
+                        [](const index::CHIndexSpatialCell& value, std::uint32_t x) {
+                            return value.tileX < x;
+                        });
+                    for (; cell != lastCell && cell->tileX <= maxTileX; ++cell) {
+                        if (cell->pageRefOffset > index_.spatialPageIds.size() ||
+                            cell->pageRefCount > index_.spatialPageIds.size() - cell->pageRefOffset) {
+                            throw std::runtime_error("CHIDX v8 spatial page span is invalid");
+                        }
+                        for (std::uint32_t i = 0; i < cell->pageRefCount; ++i) {
+                            const auto pageId = index_.spatialPageIds[cell->pageRefOffset + i];
+                            if (pageId >= index_.graphPages.size() || pageId >= pageSpatialBounds_.size() ||
+                                !pageSpatialBounds_[pageId].valid) continue;
+                            const auto& bounds = pageSpatialBounds_[pageId];
+                            const auto dx = RangeDistance(bounds.minX, bounds.maxX, minViewX, maxViewX);
+                            const auto dy = RangeDistance(bounds.minY, bounds.maxY, minViewY, maxViewY);
+                            const auto pageRadius = std::max(dx, dy);
+                            if (pageRadius > residencyRadius) continue;
+                            if (spatialCandidateStamp_[pageId] != spatialEpoch) {
+                                spatialCandidateStamp_[pageId] = spatialEpoch;
+                                spatialCandidateRadius_[pageId] = static_cast<std::uint8_t>(
+                                    std::min<std::uint32_t>(pageRadius, 0xffu));
+                                spatialCandidates.push_back(pageId);
+                            } else {
+                                spatialCandidateRadius_[pageId] = static_cast<std::uint8_t>(
+                                    std::min<std::uint32_t>(spatialCandidateRadius_[pageId], pageRadius));
+                            }
+                        }
+                    }
+                    if (tileY == std::numeric_limits<std::uint32_t>::max()) break;
+                }
+            }
+            lastPlannerSpatialCandidates_ = static_cast<std::uint32_t>(
+                std::min<std::size_t>(spatialCandidates.size(),
+                                      std::numeric_limits<std::uint32_t>::max()));
+            return;
+        }
 
         const auto maxSpatialLevel = static_cast<std::uint32_t>(
             (index_.spatialPageRefs.back().key >> 32u) & 0xffu);
@@ -1108,18 +1236,23 @@ RefinementRequestToken GraphPageStreamer::RequestRefinementEdges(
     blocks.reserve(requests.size());
     std::uint32_t accepted = 0;
     for (const auto& request : requests) {
-        if (request.parentEdgeId >= index_.edgeSpatialBoundsCount ||
-            request.childEdgeId >= index_.edgeCount || index_.edgeBlockRecordCount == 0) {
+        if (request.parentEdgeId >= index_.edgeCount || request.childEdgeId >= index_.edgeCount ||
+            index_.edgeBlockRecordCount == 0) {
             continue;
         }
-        const auto parentBounds = !index_.edgeSpatialBounds.empty()
-                                      ? index_.edgeSpatialBounds[request.parentEdgeId]
-                                      : index::CHIndex::ReadEdgeSpatialBounds(
-                                            index_, request.parentEdgeId, 1u)
-                                            .front();
-        if (!PackedBoundsIntersects(parentBounds, currentRefinementWindow_)) {
-            ++token.spatiallyRejectedRequestCount;
-            continue;
+        // v8 stores the final conservative geometry error in each binary edge and deliberately
+        // drops the old 8-byte-per-edge packed-bounds table. The GPU request itself already came
+        // from the committed viewport root set, so the legacy parent-bounds rejection is optional.
+        if (!index_.HasRuntimeBinary()) {
+            if (request.parentEdgeId >= index_.edgeSpatialBoundsCount) continue;
+            const auto parentBounds = !index_.edgeSpatialBounds.empty()
+                                          ? index_.edgeSpatialBounds[request.parentEdgeId]
+                                          : index::CHIndex::ReadEdgeSpatialBounds(
+                                                index_, request.parentEdgeId, 1u).front();
+            if (!PackedBoundsIntersects(parentBounds, currentRefinementWindow_)) {
+                ++token.spatiallyRejectedRequestCount;
+                continue;
+            }
         }
         ++accepted;
         const auto blockId = request.childEdgeId / RuntimeRefinementTileRecordCount(index_.edgeBlockRecordCount);
@@ -1248,6 +1381,11 @@ GraphPageStreamingStats GraphPageStreamer::Snapshot() const {
     stats.ramBudgetBytes = config_.ramBudgetBytes;
     stats.dataCacheBudgetBytes = dataCacheBudgetBytes_;
     stats.softBudgetBytes = softBudgetBytes_;
+    stats.runtimeDataFileBytes = index_.runtimeDataFileBytes;
+    stats.runtimeDataResidentBytes = runtimeDataResidentBytes_.load(std::memory_order_acquire);
+    stats.runtimeDataPreloadEligible = runtimeDataPreloadEligible_;
+    stats.runtimeDataPreloadActive = runtimeDataPreloadActive_.load(std::memory_order_acquire);
+    stats.runtimeDataFullyResident = runtimeResidentImage_.load(std::memory_order_acquire) != nullptr;
     stats.residentBytes = residentBytes_;
     stats.reservedLoadBytes = reservedLoadBytes_;
     stats.pinnedBytes = pinnedBytes_;
@@ -1321,6 +1459,7 @@ GraphPageStreamingStats GraphPageStreamer::Snapshot() const {
         stats.nodeBlockCacheEvictions = nodeBlockCacheEvictions_;
         stats.nodeBlockCacheBytes = nodeBlockCacheBytes_;
         stats.nodeBlockCacheBudgetBytes = nodeBlockCacheBudgetBytes_;
+    stats.sharedGpuReservationBytes = config_.sharedGpuReservationBytes;
     }
     stats.totalCpuCacheBytes = stats.residentBytes + stats.nodeBlockCacheBytes;
     auto peak = peakCpuCacheBytes_.load(std::memory_order_relaxed);
@@ -1564,13 +1703,22 @@ void GraphPageStreamer::QueueRefinementBlockLocked(std::uint32_t blockId,
 
 void GraphPageStreamer::Worker(std::stop_token stopToken) {
     try {
-        // Keep the text sources open for the lifetime of the worker. Both drawable root pages
-        // and refinement backing blocks share the same preprocessed graph scanner and decoded-node cache.
-        TextSourceScanner graphScanner(graphPath_);
-        TextSourceScanner rangeScanner(rangesPath_);
+        std::unique_ptr<TextSourceScanner> graphScanner;
+        std::unique_ptr<TextSourceScanner> rangeScanner;
+        if (!index_.HasRuntimeBinary()) {
+            graphScanner = std::make_unique<TextSourceScanner>(graphPath_);
+            rangeScanner = std::make_unique<TextSourceScanner>(rangesPath_);
+        }
         std::ifstream indexStream(index_.indexPath, std::ios::binary);
         if (!indexStream) {
             throw std::runtime_error("could not open CH index for persistent root streaming");
+        }
+        std::ifstream runtimeStream;
+        if (index_.HasRuntimeBinary()) {
+            runtimeStream.open(runtimeDataPath_, std::ios::binary);
+            if (!runtimeStream) {
+                throw std::runtime_error("could not open runtime binary for persistent streaming");
+            }
         }
 
         struct PageWork {
@@ -1706,12 +1854,12 @@ void GraphPageStreamer::Worker(std::stop_token stopToken) {
                         for (const auto& work : pageWork) {
                             pageIds.push_back(work.request.id);
                         }
-                        rootBatch = LoadRootPageBatch(pageIds, indexStream);
+                        rootBatch = LoadRootPageBatch(pageIds, indexStream, runtimeStream);
                         loadedPages = std::move(rootBatch.pages);
                     } else {
                         loadedPages.push_back(
                             LoadPage(pageWork.front().request.id, indexStream,
-                                     graphScanner, rangeScanner));
+                                     *graphScanner, *rangeScanner, runtimeStream));
                     }
 
                     if (loadedPages.size() != pageWork.size()) {
@@ -1719,7 +1867,7 @@ void GraphPageStreamer::Worker(std::stop_token stopToken) {
                     }
 
                     std::unique_lock lock(mutex_);
-                    if (index_.HasRootPayload()) {
+                    if (index_.HasRootPayload() && rootBatch.fromDisk) {
                         ++rootIoReadOperations_;
                         rootIoPagesRead_ += loadedPages.size();
                         rootIoBytesRead_ += rootBatch.bytesRead;
@@ -1791,7 +1939,7 @@ void GraphPageStreamer::Worker(std::stop_token stopToken) {
                     condition_.notify_all();
                 } else {
                     auto block = std::make_shared<ResidentRefinementBlock>(
-                        LoadRefinementBlock(request.id, graphScanner));
+                        LoadRefinementBlock(request.id, graphScanner.get(), runtimeStream));
                     std::unique_lock lock(mutex_);
                     ReleaseReservationLocked(refinementEstimate);
                     loadingRefinementBlocks_.erase(request.id);
@@ -1867,7 +2015,8 @@ void GraphPageStreamer::Worker(std::stop_token stopToken) {
 }
 
 GraphPageStreamer::RootPageBatchLoadResult GraphPageStreamer::LoadRootPageBatch(
-    std::span<const std::uint32_t> pageIds, std::ifstream& indexStream) {
+    std::span<const std::uint32_t> pageIds, std::ifstream& indexStream,
+    std::ifstream& runtimeStream) {
     if (pageIds.empty()) {
         throw std::runtime_error("root page batch is empty");
     }
@@ -1896,7 +2045,10 @@ GraphPageStreamer::RootPageBatchLoadResult GraphPageStreamer::LoadRootPageBatch(
         throw std::runtime_error("root page batch contains no records");
     }
 
-    const auto byteOffset = index_.rootPayloadSectionOffset +
+    const auto sectionOffset = index_.HasRuntimeBinary()
+                                   ? index_.runtimeRootSectionOffset
+                                   : index_.rootPayloadSectionOffset;
+    const auto byteOffset = sectionOffset +
         firstRecord * sizeof(index::CHIndexRootRecord);
     const auto byteCount = totalRecords * sizeof(index::CHIndexRootRecord);
     if (byteOffset > static_cast<std::uint64_t>(std::numeric_limits<std::streamoff>::max()) ||
@@ -1906,22 +2058,29 @@ GraphPageStreamer::RootPageBatchLoadResult GraphPageStreamer::LoadRootPageBatch(
 
     std::vector<index::CHIndexRootRecord> records(static_cast<std::size_t>(totalRecords));
     const auto ioBegin = std::chrono::steady_clock::now();
-    indexStream.clear();
-    indexStream.seekg(static_cast<std::streamoff>(byteOffset), std::ios::beg);
-    if (!indexStream) {
-        throw std::runtime_error("could not seek CH index RootPayload batch");
-    }
-    indexStream.read(reinterpret_cast<char*>(records.data()),
-                     static_cast<std::streamsize>(byteCount));
-    if (!indexStream) {
-        throw std::runtime_error("truncated CH index RootPayload batch");
+    bool fromDisk = true;
+    if (index_.HasRuntimeBinary()) {
+        fromDisk = ReadRuntimeBytes(runtimeStream, byteOffset, records.data(),
+                                    static_cast<std::size_t>(byteCount));
+    } else {
+        indexStream.clear();
+        indexStream.seekg(static_cast<std::streamoff>(byteOffset), std::ios::beg);
+        if (!indexStream) {
+            throw std::runtime_error("could not seek CH index RootPayload batch");
+        }
+        indexStream.read(reinterpret_cast<char*>(records.data()),
+                         static_cast<std::streamsize>(byteCount));
+        if (!indexStream) {
+            throw std::runtime_error("truncated CH index RootPayload batch");
+        }
     }
     const auto ioMilliseconds = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - ioBegin).count();
 
     RootPageBatchLoadResult result;
-    result.bytesRead = byteCount;
-    result.ioMilliseconds = ioMilliseconds;
+    result.fromDisk = fromDisk;
+    result.bytesRead = fromDisk ? byteCount : 0u;
+    result.ioMilliseconds = fromDisk ? ioMilliseconds : 0.0;
     result.pages.reserve(pageIds.size());
 
     std::size_t cursor = 0;
@@ -1952,8 +2111,9 @@ GraphPageStreamer::RootPageBatchLoadResult GraphPageStreamer::LoadRootPageBatch(
                   });
         page.memoryBytes = sizeof(page) +
                            page.rootRecords.capacity() * sizeof(index::CHIndexRootRecord);
-        page.estimatedSourceBytesRead =
-            page.rootRecords.size() * sizeof(index::CHIndexRootRecord);
+        page.estimatedSourceBytesRead = fromDisk
+            ? page.rootRecords.size() * sizeof(index::CHIndexRootRecord)
+            : 0u;
         result.pages.push_back(std::move(page));
     }
 
@@ -1969,7 +2129,7 @@ GraphPageStreamer::RootPageBatchLoadResult GraphPageStreamer::LoadRootPageBatch(
 
 ResidentGraphPage GraphPageStreamer::LoadPage(
     std::uint32_t pageId, std::ifstream& indexStream, TextSourceScanner& graphScanner,
-    TextSourceScanner& rangeScanner) {
+    TextSourceScanner& rangeScanner, std::ifstream& runtimeStream) {
     const auto beginTime = std::chrono::steady_clock::now();
 
     ResidentGraphPage result;
@@ -2121,7 +2281,7 @@ ResidentGraphPage GraphPageStreamer::LoadPage(
         const auto selectedEnd = static_cast<std::size_t>(
             std::lower_bound(nodeIds.begin(), nodeIds.end(), end) - nodeIds.begin());
 
-        const auto access = AcquireNodeBlock(blockId, graphScanner);
+        const auto access = AcquireNodeBlock(blockId, &graphScanner, runtimeStream);
         if (!access.block || access.block->firstRecord != first ||
             access.block->positions.size() != sourceBlock.recordCount) {
             throw std::runtime_error("decoded node block cache is inconsistent");
@@ -2264,7 +2424,7 @@ std::uint64_t GraphPageStreamer::RefinementTileByteOffset(
 }
 
 ResidentRefinementBlock GraphPageStreamer::LoadRefinementBlock(
-    std::uint32_t blockId, TextSourceScanner& graphScanner) {
+    std::uint32_t blockId, TextSourceScanner* graphScanner, std::ifstream& runtimeStream) {
     const auto beginTime = std::chrono::steady_clock::now();
     const auto tileRecords = RuntimeRefinementTileRecordCount(index_.edgeBlockRecordCount);
     const auto tileCount = RuntimeRefinementTileCount(index_.edgeCount, index_.edgeBlockRecordCount);
@@ -2293,32 +2453,56 @@ ResidentRefinementBlock GraphPageStreamer::LoadRefinementBlock(
     result.blockId = blockId;
     std::vector<TemporaryEdge> edges(recordCount);
 
-    bool builtOffsetTable = false;
-    const auto tileByteOffset = RefinementTileByteOffset(blockId, graphScanner, builtOffsetTable);
-    graphScanner.Seek(tileByteOffset);
-    const auto edgeBounds = index::CHIndex::ReadEdgeSpatialBounds(index_, firstEdge, recordCount);
-    for (std::uint32_t local = 0; local < recordCount; ++local) {
-        auto& edge = edges[local];
-        edge.globalEdgeId = firstEdge + local;
-        edge.source = graphScanner.Read<std::uint32_t>();
-        edge.target = graphScanner.Read<std::uint32_t>();
-        graphScanner.Read<float>();
-        edge.roadStyleType = data::RoadStyleIndexFromType(graphScanner.Read<std::int32_t>());
-        graphScanner.Read<std::int32_t>();
-        edge.childA = DecodeChild(graphScanner.Read<std::int64_t>());
-        edge.childB = DecodeChild(graphScanner.Read<std::int64_t>());
-        edge.graphLoaded = true;
+    std::vector<std::uint64_t> edgeBounds;
+    if (index_.HasRuntimeBinary()) {
+        std::vector<RuntimeEdgeRecord> records(recordCount);
+        const auto byteOffset = index_.runtimeEdgeSectionOffset +
+            firstEdge64 * sizeof(RuntimeEdgeRecord);
+        const auto diskRead = ReadRuntimeBytes(runtimeStream, byteOffset, records.data(),
+                                               records.size() * sizeof(RuntimeEdgeRecord));
+        if (diskRead) {
+            result.estimatedSourceBytesRead += records.size() * sizeof(RuntimeEdgeRecord);
+        }
+        for (std::uint32_t local = 0; local < recordCount; ++local) {
+            const auto& record = records[local];
+            auto& edge = edges[local];
+            edge.globalEdgeId = firstEdge + local;
+            edge.source = record.source;
+            edge.target = record.target;
+            edge.roadStyleType = data::RoadStyleIndexFromType(record.type);
+            edge.childA = record.childA;
+            edge.childB = record.childB;
+            edge.geometryError = record.geometryError;
+            edge.birthLevel = record.birthLevel;
+            edge.deathLevel = record.deathLevel;
+            edge.graphLoaded = true;
+        }
+    } else {
+        if (graphScanner == nullptr) throw std::runtime_error("legacy refinement scanner is missing");
+        bool builtOffsetTable = false;
+        const auto tileByteOffset = RefinementTileByteOffset(blockId, *graphScanner, builtOffsetTable);
+        graphScanner->Seek(tileByteOffset);
+        edgeBounds = index::CHIndex::ReadEdgeSpatialBounds(index_, firstEdge, recordCount);
+        for (std::uint32_t local = 0; local < recordCount; ++local) {
+            auto& edge = edges[local];
+            edge.globalEdgeId = firstEdge + local;
+            edge.source = graphScanner->Read<std::uint32_t>();
+            edge.target = graphScanner->Read<std::uint32_t>();
+            graphScanner->Read<float>();
+            edge.roadStyleType = data::RoadStyleIndexFromType(graphScanner->Read<std::int32_t>());
+            graphScanner->Read<std::int32_t>();
+            edge.childA = DecodeChild(graphScanner->Read<std::int64_t>());
+            edge.childB = DecodeChild(graphScanner->Read<std::int64_t>());
+            edge.graphLoaded = true;
+        }
+        const auto graphFileSize = std::filesystem::file_size(graphPath_);
+        const auto physicalBytes = BlockByteSize(index_.graphEdgeBlocks, sourceBlockId, graphFileSize);
+        result.estimatedSourceBytesRead = builtOffsetTable
+                                              ? physicalBytes
+                                              : std::max<std::uint64_t>(
+                                                    1u, physicalBytes * recordCount /
+                                                            std::max<std::uint32_t>(sourceBlock.recordCount, 1u));
     }
-
-    const auto graphFileSize = std::filesystem::file_size(graphPath_);
-    const auto physicalBytes = BlockByteSize(index_.graphEdgeBlocks, sourceBlockId, graphFileSize);
-    // The first request touching a physical source block scans it once to derive all 1K tile
-    // offsets. Later requests seek directly to their tile. Keep diagnostics conservative.
-    result.estimatedSourceBytesRead = builtOffsetTable
-                                          ? physicalBytes
-                                          : std::max<std::uint64_t>(
-                                                1u, physicalBytes * recordCount /
-                                                        std::max<std::uint32_t>(sourceBlock.recordCount, 1u));
 
     std::vector<std::uint32_t> nodeIds;
     nodeIds.reserve(edges.size() * 2u);
@@ -2342,7 +2526,7 @@ ResidentRefinementBlock GraphPageStreamer::LoadRefinementBlock(
         const auto selectedEnd = static_cast<std::size_t>(
             std::lower_bound(nodeIds.begin(), nodeIds.end(), end) - nodeIds.begin());
 
-        const auto access = AcquireNodeBlock(nodeBlockId, graphScanner);
+        const auto access = AcquireNodeBlock(nodeBlockId, graphScanner, runtimeStream);
         if (!access.block || access.block->firstRecord != first ||
             access.block->positions.size() != nodeSourceBlock.recordCount) {
             throw std::runtime_error("decoded node block cache is inconsistent");
@@ -2374,8 +2558,9 @@ ResidentRefinementBlock GraphPageStreamer::LoadRefinementBlock(
         }
         const auto sourceLocal = static_cast<std::uint32_t>(sourceIt - nodeIds.begin());
         const auto targetLocal = static_cast<std::uint32_t>(targetIt - nodeIds.begin());
-        float geometryError = 0.0f;
-        if (edge.childA != data::InvalidEdgeId && edge.childB != data::InvalidEdgeId) {
+        float geometryError = edge.geometryError;
+        if (!index_.HasRuntimeBinary() &&
+            edge.childA != data::InvalidEdgeId && edge.childB != data::InvalidEdgeId) {
             const auto localEdge = edge.globalEdgeId - firstEdge;
             if (localEdge >= edgeBounds.size()) {
                 throw std::runtime_error("refinement edge is missing preprocessed spatial bounds");
@@ -2394,8 +2579,8 @@ ResidentRefinementBlock GraphPageStreamer::LoadRefinementBlock(
             edge.childB,
             edge.roadStyleType,
             geometryError,
-            -1,
-            -1,
+            edge.birthLevel,
+            edge.deathLevel,
         });
     }
 
@@ -2409,7 +2594,7 @@ ResidentRefinementBlock GraphPageStreamer::LoadRefinementBlock(
 }
 
 GraphPageStreamer::NodeBlockAccess GraphPageStreamer::AcquireNodeBlock(
-    std::uint32_t blockId, TextSourceScanner& graphScanner) {
+    std::uint32_t blockId, TextSourceScanner* graphScanner, std::ifstream& runtimeStream) {
     if (blockId >= index_.nodeBlocks.size()) {
         throw std::runtime_error("node source block id out of range");
     }
@@ -2441,38 +2626,46 @@ GraphPageStreamer::NodeBlockAccess GraphPageStreamer::AcquireNodeBlock(
         decoded->firstRecord = static_cast<std::uint32_t>(block.firstRecord);
         decoded->positions.resize(block.recordCount);
 
-        const auto centerLatitude = (index_.minLatitude + index_.maxLatitude) * 0.5;
-        const auto centerLongitude = (index_.minLongitude + index_.maxLongitude) * 0.5;
-        const auto longitudeScale = std::cos(centerLatitude * kPi / 180.0);
-        const auto halfWidth = std::max((index_.maxLongitude - index_.minLongitude) * 0.5 *
-                                            longitudeScale,
-                                        1e-12);
-        const auto halfHeight =
-            std::max((index_.maxLatitude - index_.minLatitude) * 0.5, 1e-12);
-        const auto normalization = 0.95 / std::max(halfWidth, halfHeight);
-
-        graphScanner.Seek(block.byteOffset);
-        for (std::uint32_t local = 0; local < block.recordCount; ++local) {
-            const auto id = graphScanner.Read<std::uint32_t>();
-            graphScanner.Read<std::uint64_t>();
-            const auto latitude = graphScanner.Read<double>();
-            const auto longitude = graphScanner.Read<double>();
-            graphScanner.Read<float>();
-            graphScanner.Read<std::uint32_t>();
-            const auto expectedId = decoded->firstRecord + local;
-            if (id != expectedId) {
-                throw std::runtime_error("preprocessed node source block is not ID-contiguous");
+        if (index_.HasRuntimeBinary()) {
+            std::vector<RuntimeNodeRecord> records(block.recordCount);
+            const auto byteOffset = index_.runtimeNodeSectionOffset +
+                                    block.firstRecord * sizeof(RuntimeNodeRecord);
+            const auto diskRead = ReadRuntimeBytes(runtimeStream, byteOffset, records.data(),
+                                                   records.size() * sizeof(RuntimeNodeRecord));
+            for (std::uint32_t local = 0; local < block.recordCount; ++local) {
+                decoded->positions[local] = {records[local].x, records[local].y};
             }
-            decoded->positions[local] = {
-                static_cast<float>((longitude - centerLongitude) * longitudeScale * normalization),
-                static_cast<float>((latitude - centerLatitude) * normalization),
-            };
+            decoded->sourceBytesRead = diskRead ? records.size() * sizeof(RuntimeNodeRecord) : 0u;
+        } else {
+            if (graphScanner == nullptr) throw std::runtime_error("legacy node scanner is missing");
+            const auto centerLatitude = (index_.minLatitude + index_.maxLatitude) * 0.5;
+            const auto centerLongitude = (index_.minLongitude + index_.maxLongitude) * 0.5;
+            const auto longitudeScale = std::cos(centerLatitude * kPi / 180.0);
+            const auto halfWidth = std::max((index_.maxLongitude - index_.minLongitude) * 0.5 *
+                                                longitudeScale, 1e-12);
+            const auto halfHeight = std::max((index_.maxLatitude - index_.minLatitude) * 0.5, 1e-12);
+            const auto normalization = 0.95 / std::max(halfWidth, halfHeight);
+            graphScanner->Seek(block.byteOffset);
+            for (std::uint32_t local = 0; local < block.recordCount; ++local) {
+                const auto id = graphScanner->Read<std::uint32_t>();
+                graphScanner->Read<std::uint64_t>();
+                const auto latitude = graphScanner->Read<double>();
+                const auto longitude = graphScanner->Read<double>();
+                graphScanner->Read<float>();
+                graphScanner->Read<std::uint32_t>();
+                const auto expectedId = decoded->firstRecord + local;
+                if (id != expectedId)
+                    throw std::runtime_error("preprocessed node source block is not ID-contiguous");
+                decoded->positions[local] = {
+                    static_cast<float>((longitude - centerLongitude) * longitudeScale * normalization),
+                    static_cast<float>((latitude - centerLatitude) * normalization),
+                };
+            }
+            const auto nodeSectionEnd = blockId + 1u < index_.nodeBlocks.size()
+                                            ? index_.nodeBlocks[blockId + 1u].byteOffset
+                                            : index_.graphEdgeBlocks.front().byteOffset;
+            decoded->sourceBytesRead = nodeSectionEnd - block.byteOffset;
         }
-
-        const auto nodeSectionEnd = blockId + 1u < index_.nodeBlocks.size()
-                                        ? index_.nodeBlocks[blockId + 1u].byteOffset
-                                        : index_.graphEdgeBlocks.front().byteOffset;
-        decoded->sourceBytesRead = nodeSectionEnd - block.byteOffset;
         decoded->memoryBytes = sizeof(DecodedNodeBlock) +
                                decoded->positions.capacity() * sizeof(std::array<float, 2>);
     } catch (...) {

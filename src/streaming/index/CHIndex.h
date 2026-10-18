@@ -67,6 +67,11 @@ struct CHIndexSpatialPageRef {
     std::uint32_t pageId = 0;
 };
 
+struct CHIndexSpatialLevel { std::uint32_t rowOffset = 0; std::uint32_t rowCount = 0; };
+struct CHIndexSpatialRow { std::uint32_t cellOffset = 0; std::uint32_t cellCount = 0; };
+struct CHIndexSpatialCell { std::uint32_t tileX = 0; std::uint32_t pageRefOffset = 0; std::uint32_t pageRefCount = 0; };
+struct CHIndexPageSpatialBounds { std::uint32_t minX = 0; std::uint32_t minY = 0; std::uint32_t maxX = 0; std::uint32_t maxY = 0; };
+
 struct CHIndexGraphPage {
     std::uint32_t pageId = 0;
     std::uint32_t bandIndex = 0;
@@ -115,6 +120,7 @@ struct CHIndexRootRecord {
 struct CHIndexBuildData {
     std::filesystem::path graphPath;
     std::filesystem::path rangesPath;
+    std::filesystem::path runtimeDataPath;
     std::uint64_t nodeCount = 0;
     std::uint64_t edgeCount = 0;
     std::uint32_t maxLevel = 0;
@@ -169,12 +175,24 @@ struct CHIndexData {
     std::uint64_t edgeSpatialBoundsCount = 0;
     std::uint64_t rootPayloadSectionOffset = 0;
     std::uint64_t rootPayloadRecordCount = 0;
+    std::uint64_t runtimeNodeSectionOffset = 0;
+    std::uint64_t runtimeEdgeSectionOffset = 0;
+    std::uint64_t runtimeRootSectionOffset = 0;
+    std::uint64_t runtimeDataFileBytes = 0;
+    std::uint32_t lodAliveWordsPerLevel = 0;
     std::vector<std::uint64_t> edgeSpatialBounds;
     std::vector<CHIndexSourceBlock> nodeBlocks;
     std::vector<CHIndexSourceBlock> graphEdgeBlocks;
     std::vector<CHIndexSourceBlock> rangeEdgeBlocks;
     std::vector<CHIndexGraphPage> graphPages;
     std::vector<CHIndexSpatialPageRef> spatialPageRefs;
+    std::vector<CHIndexSpatialLevel> spatialLevels;
+    std::vector<CHIndexSpatialRow> spatialRows;
+    std::vector<CHIndexSpatialCell> spatialCells;
+    std::vector<std::uint32_t> spatialPageIds;
+    std::vector<CHIndexPageSpatialBounds> pageSpatialBounds;
+    std::vector<std::uint64_t> lodAlivePageBits;
+    std::vector<std::uint32_t> lodAlivePageCounts;
     std::vector<std::uint32_t> pageSourceBlockRefs;
     std::vector<std::uint32_t> pageChildSourceBlockRefs;
     std::vector<std::uint32_t> pageLodChildRefs;
@@ -189,8 +207,10 @@ struct CHIndexData {
     [[nodiscard]] std::span<const std::uint32_t> LodChildPageRefs(
         const CHIndexGraphPage& page) const;
     [[nodiscard]] bool HasRootPayload() const {
-        return rootPayloadSectionOffset != 0 && rootPayloadRecordCount != 0;
+        return (rootPayloadSectionOffset != 0 || runtimeRootSectionOffset != 0) && rootPayloadRecordCount != 0;
     }
+    [[nodiscard]] bool HasRuntimeBinary() const { return formatVersion >= 8 && runtimeDataFileBytes != 0; }
+    [[nodiscard]] bool HasSpatialDirectory() const { return !spatialLevels.empty() && !spatialRows.empty() && !spatialPageIds.empty(); }
 };
 
 class CHIndex {

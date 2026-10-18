@@ -1,4 +1,4 @@
-#version 450 core
+#version 430 core
 
 uniform vec4 uColor;
 uniform uint uRoadStyleDisabled;
