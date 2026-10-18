@@ -38,6 +38,10 @@ constexpr std::uint32_t kStreamingMemoryBudgetHysteresisMiB = 512u;
 constexpr std::size_t kAdaptiveCpuFaultWaveLimit = 128u;
 constexpr double kMetersPerProjectedDegree = 111319.49079327357;
 
+// Runtime interaction grace shared by the single application instance. Kept in this translation
+// unit so the fast-path runtime does not depend on header/member layout across incremental updates.
+float gStreamingRefinementInteractionHoldSeconds = 0.0f;
+
 renderer::RoadDrawData ToRoadDrawData(const pipeline::GPUProcessingResult& result) {
     return {
         result.edgeIdBuffer,
@@ -114,6 +118,7 @@ void Application::InstallDataset(data::CHGraph graph) {
     streamingLodPrefetchPageSet_.clear();
     streamingCommittedActivePages_.clear();
     lastStreamingRefinementMode_ = geometry::RefinementMode::None;
+    gStreamingRefinementInteractionHoldSeconds = 0.0f;
     graph_ = std::make_unique<data::CHGraph>(std::move(graph));
     roadRenderer_.SetGraph(*graph_);
     gpuPipeline_.SetGraph(roadRenderer_.EdgeCount(),
@@ -291,6 +296,7 @@ void Application::InstallStreamingDataset(data::StreamingDataset dataset) {
     streamingLodPrefetchPageSet_.clear();
     streamingCommittedActivePages_.clear();
     lastStreamingRefinementMode_ = geometry::RefinementMode::None;
+    gStreamingRefinementInteractionHoldSeconds = 0.0f;
 }
 
 streaming::runtime::StreamingViewRequest Application::BuildStreamingView(
@@ -849,6 +855,7 @@ void Application::ApplyStreamingBudgets(std::uint32_t ramBudgetMiB,
     streamingLodPrefetchPageSet_.clear();
     streamingCommittedActivePages_.clear();
     lastStreamingRefinementMode_ = geometry::RefinementMode::None;
+    gStreamingRefinementInteractionHoldSeconds = 0.0f;
     const auto appliedGpu = persistentStreamingPipeline_.Stats();
     std::cout << "Applied out-of-core budgets: RAM " << streamingRamBudgetMiB_
               << " MiB" << (streamingRamBudgetAuto_ ? " (auto)" : " (manual)")
@@ -936,7 +943,8 @@ int Application::Run() {
                                             ? streamingDisplayLodFloat_
                                             : static_cast<float>(lodLevel);
                 persistentStreamingPipeline_.Process(
-                    displayLod, filterKind, streamingRefinement, BuildRefinementGuardWindow());
+                    displayLod, filterKind, streamingRefinement, BuildRefinementGuardWindow(),
+                    gStreamingRefinementInteractionHoldSeconds > 0.0f);
                 // Poll the asynchronous GPU readback ring without stalling. A fresh result
                 // replaces the CPU backing working set, including when it is empty; a not-yet-ready
                 // readback leaves the previous work alone. This prevents old camera generations
@@ -952,9 +960,16 @@ int Application::Run() {
                     if (backingCapacity != 0u && missingBlocks.size() > backingCapacity) {
                         missingBlocks.resize(backingCapacity);
                     }
-                    if (streamingRefinement.mode == geometry::RefinementMode::Adaptive &&
-                        missingBlocks.size() > kAdaptiveCpuFaultWaveLimit) {
-                        missingBlocks.resize(kAdaptiveCpuFaultWaveLimit);
+                    const auto persistentStats = persistentStreamingPipeline_.Stats();
+                    const bool umaRefinement =
+                        persistentStats.gpuMemoryArchitecture ==
+                        gpu::streaming::GPUMemoryArchitecture::Unified;
+                    const auto cpuFaultWaveLimit = umaRefinement ? std::size_t{32u}
+                                                                 : kAdaptiveCpuFaultWaveLimit;
+                    if ((streamingRefinement.mode == geometry::RefinementMode::Adaptive ||
+                         umaRefinement) &&
+                        missingBlocks.size() > cpuFaultWaveLimit) {
+                        missingBlocks.resize(cpuFaultWaveLimit);
                     }
                     pageStreamer_->SetBackingBlockDemand(missingBlocks);
                 }
@@ -1070,12 +1085,16 @@ int Application::Run() {
             streamingStats->gpuMissingBlockRequests = persistent.missingBlockRequestCount;
             streamingStats->gpuRefinementCacheHits = persistent.refinementCacheHits;
             streamingStats->gpuRefinementCacheMisses = persistent.refinementCacheMisses;
+            streamingStats->gpuRefinementPendingRoots = persistent.refinementPendingRoots;
             streamingStats->gpuCachedRefinedRoots = persistent.cachedRefinedRoots;
             streamingStats->gpuRefinementStackOverflows =
                 persistent.refinementStackOverflows;
             streamingStats->gpuRefinementHashOverflows = persistent.refinementHashOverflows;
             streamingStats->gpuAdaptiveBlockRequestsAdmitted =
                 persistent.adaptiveBlockRequestsAdmitted;
+            streamingStats->gpuUmaRefinementDeferred = persistent.umaRefinementDeferred;
+            streamingStats->gpuUmaProgressiveFull = persistent.umaProgressiveFull;
+            streamingStats->gpuUmaRefinementRootBudget = persistent.umaRefinementRootBudget;
             streamingStats->gpuRefinementGeometryUsed = persistent.refinementGeometryUsed;
             streamingStats->gpuRefinementGeometryCapacity = persistent.refinementGeometryCapacity;
             streamingStats->gpuRefinementGeometryOverflows =
@@ -1099,6 +1118,14 @@ int Application::Run() {
                 persistent.backingCacheAllocationFailures;
             streamingStats->gpuBackingBlocksTouchedLastReadback =
                 persistent.backingBlocksTouchedLastReadback;
+            streamingStats->gpuResidentWorkingSetFastPath =
+                persistent.residentWorkingSetFastPath;
+            streamingStats->gpuResidentRefinementDispatchSkipped =
+                persistent.residentRefinementDispatchSkipped;
+            streamingStats->gpuResidentStableReadbacks = persistent.residentStableReadbacks;
+            streamingStats->gpuResidentFastPathFrames = persistent.residentFastPathFrames;
+            streamingStats->gpuResidentRefinementSkippedFrames =
+                persistent.residentRefinementSkippedFrames;
             streamingStats->gpuIncrementalRootBytesUploaded =
                 persistent.incrementalRootBytesUploaded;
             streamingStats->gpuIncrementalBackingBytesUploaded =
@@ -1197,35 +1224,54 @@ int Application::Run() {
 
 void Application::UpdateCameraInput(float deltaSeconds) {
     const auto scroll = window_.ConsumeScrollY();
+    bool cameraInteracting = scroll != 0.0;
+
     if (debugUI_.WantsMouse()) {
         wasPanning_ = false;
         camera_.Update(deltaSeconds);
-        return;
-    }
-
-    if (scroll != 0.0) {
-        camera_.Zoom(static_cast<float>(scroll));
-    }
-
-    double cursorX = 0.0;
-    double cursorY = 0.0;
-    window_.CursorPosition(cursorX, cursorY);
-
-    if (window_.LeftMouseDown()) {
-        if (wasPanning_) {
-            int width = 0;
-            int height = 0;
-            window_.FramebufferSize(width, height);
-            camera_.PanPixels(cursorX - lastCursorX_, cursorY - lastCursorY_, height);
-        }
-        wasPanning_ = true;
+        const auto zoomDelta = std::abs(camera_.TargetZoomFactor() - camera_.ZoomFactor());
+        cameraInteracting = cameraInteracting ||
+                            zoomDelta > std::max(0.0001f, camera_.ZoomFactor() * 0.0001f);
     } else {
-        wasPanning_ = false;
+        if (scroll != 0.0) {
+            camera_.Zoom(static_cast<float>(scroll));
+        }
+
+        double cursorX = 0.0;
+        double cursorY = 0.0;
+        window_.CursorPosition(cursorX, cursorY);
+
+        if (window_.LeftMouseDown()) {
+            if (wasPanning_) {
+                int width = 0;
+                int height = 0;
+                window_.FramebufferSize(width, height);
+                const auto dx = cursorX - lastCursorX_;
+                const auto dy = cursorY - lastCursorY_;
+                if (dx != 0.0 || dy != 0.0) {
+                    camera_.PanPixels(dx, dy, height);
+                    cameraInteracting = true;
+                }
+            }
+            wasPanning_ = true;
+        } else {
+            wasPanning_ = false;
+        }
+
+        lastCursorX_ = cursorX;
+        lastCursorY_ = cursorY;
+        camera_.Update(deltaSeconds);
+        const auto zoomDelta = std::abs(camera_.TargetZoomFactor() - camera_.ZoomFactor());
+        cameraInteracting = cameraInteracting ||
+                            zoomDelta > std::max(0.0001f, camera_.ZoomFactor() * 0.0001f);
     }
 
-    lastCursorX_ = cursorX;
-    lastCursorY_ = cursorY;
-    camera_.Update(deltaSeconds);
+    if (cameraInteracting) {
+        gStreamingRefinementInteractionHoldSeconds = 0.15f;
+    } else {
+        gStreamingRefinementInteractionHoldSeconds = std::max(
+            0.0f, gStreamingRefinementInteractionHoldSeconds - std::max(deltaSeconds, 0.0f));
+    }
 }
 
 void Application::ClearValidation() {

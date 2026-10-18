@@ -1491,10 +1491,36 @@ DebugUIActions DebugUI::Draw(
         ImGui::Text("GPU missing backing tiles: %u | Adaptive admitted this wave: %u",
                     streamingStats->gpuMissingBlockRequests,
                     streamingStats->gpuAdaptiveBlockRequestsAdmitted);
-        ImGui::Text("Refinement cache hit / miss: %u / %u | cached roots: %u",
+        if (streamingStats->gpuMemoryArchitecture == 2u) {
+            if (streamingStats->gpuUmaRefinementDeferred) {
+                ImGui::TextColored(
+                    ImVec4(0.95f, 0.75f, 0.20f, 1.0f),
+                    "UMA refinement: interaction throttle (minimal progress kept active)");
+            } else {
+                ImGui::Text("UMA refinement root budget/frame: %u%s",
+                            streamingStats->gpuUmaRefinementRootBudget,
+                            streamingStats->gpuUmaProgressiveFull
+                                ? " | Full DFS = progressive exact frontier"
+                                : "");
+            }
+        }
+        ImGui::Text("Refinement cache hit / miss: %u / %u | pending roots: %u | cached roots: %u",
                     streamingStats->gpuRefinementCacheHits,
                     streamingStats->gpuRefinementCacheMisses,
+                    streamingStats->gpuRefinementPendingRoots,
                     streamingStats->gpuCachedRefinedRoots);
+        if (streamingStats->gpuResidentWorkingSetFastPath) {
+            ImGui::TextColored(
+                ImVec4(0.35f, 0.90f, 0.45f, 1.0f),
+                "Resident working-set FAST PATH: %u/2 clean readbacks%s",
+                streamingStats->gpuResidentStableReadbacks,
+                streamingStats->gpuResidentRefinementDispatchSkipped
+                    ? " | refinement dispatch skipped"
+                    : " | direct resident traversal");
+        } else {
+            ImGui::Text("Resident working-set fast path: warming (%u/2 clean readbacks)",
+                        streamingStats->gpuResidentStableReadbacks);
+        }
         ImGui::Text("Cached refinement geometry: %u / %u segments | overflows: %u",
                     streamingStats->gpuRefinementGeometryUsed,
                     streamingStats->gpuRefinementGeometryCapacity,

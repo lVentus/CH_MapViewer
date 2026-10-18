@@ -95,6 +95,16 @@ std::uint32_t FloorPowerOfTwo(std::uint64_t value) {
 
 constexpr std::uint64_t kMiB = 1024ull * 1024ull;
 constexpr std::uint64_t kGiB = 1024ull * kMiB;
+constexpr std::size_t kRefinementStatsWordCount = 6u;
+
+std::uint64_t MixWorkingSetSignature(std::uint64_t seed, std::uint64_t value) {
+    value += 0x9e3779b97f4a7c15ull;
+    value = (value ^ (value >> 30u)) * 0xbf58476d1ce4e5b9ull;
+    value = (value ^ (value >> 27u)) * 0x94d049bb133111ebull;
+    value ^= value >> 31u;
+    seed ^= value + 0x9e3779b97f4a7c15ull + (seed << 6u) + (seed >> 2u);
+    return seed;
+}
 
 bool HasGlExtension(std::string_view name) {
     GLint extensionCount = 0;
@@ -251,6 +261,23 @@ std::uint64_t RecommendPersistentGpuBudget(
         }
     }
 
+    if (gpu.architecture == GPUMemoryArchitecture::Unified &&
+        systemMemory.totalPhysicalBytes != 0u) {
+        // On UMA a multi-gigabyte GL cache is not extra VRAM: it is the same DRAM used by the
+        // page cache, the desktop and the OS. Large persistently mapped SSBOs can also create a
+        // severe memory-bandwidth/TLB working set on older Intel/AMD iGPUs. Keep low-memory
+        // machines deliberately compact; zero-copy makes a smaller GPU cache much less costly
+        // than swapping shared DRAM.
+        const auto total = systemMemory.totalPhysicalBytes;
+        std::uint64_t umaCap = 6ull * kGiB;
+        if (total <= 24ull * kGiB) {
+            umaCap = 1536ull * kMiB;
+        } else if (total <= 40ull * kGiB) {
+            umaCap = 3ull * kGiB;
+        }
+        budget = std::min(budget, umaCap);
+    }
+
     if (reservedBytes != nullptr) *reservedBytes = reserve;
     return std::max<std::uint64_t>(budget, 384ull * kMiB);
 }
@@ -400,7 +427,7 @@ void PersistentStreamingPipeline::Initialize(
         std::max<std::size_t>(requestWordCount_, 1u) * sizeof(std::uint32_t);
 
     readbackSizeBytes_ =
-        (static_cast<std::size_t>(requestWordCount_) * 2u + 5u +
+        (static_cast<std::size_t>(requestWordCount_) * 2u + kRefinementStatsWordCount +
          (RefinementBankCount * 2u + 1u) + RefinementBankCount + 1u + 1u) *
         sizeof(std::uint32_t);
 
@@ -410,7 +437,7 @@ void PersistentStreamingPipeline::Initialize(
         pageTableBytes +
         (RefinementBankCount * 2u + 1u) * sizeof(std::uint32_t) +
         RefinementBankCount * sizeof(std::uint32_t) +
-        5u * sizeof(std::uint32_t) +
+        kRefinementStatsWordCount * sizeof(std::uint32_t) +
         requestBytes * 2u +
         sizeof(DispatchIndirectCommand) +
         sizeof(std::uint32_t) +
@@ -516,8 +543,8 @@ void PersistentStreamingPipeline::Initialize(
     leafArenaCounterBuffer_.Allocate(sizeof(arenaMeta), arenaMeta.data(), GL_DYNAMIC_DRAW);
     std::array<std::uint32_t, RefinementBankCount> bankLastUse{};
     refinementBankLastUseBuffer_.Allocate(sizeof(bankLastUse), bankLastUse.data(), GL_DYNAMIC_DRAW);
-    const std::uint32_t refinementStats[5] = {0u, 0u, 0u, 0u, 0u};
-    refinementStatsBuffer_.Allocate(sizeof(refinementStats), refinementStats, GL_DYNAMIC_DRAW);
+    const std::array<std::uint32_t, kRefinementStatsWordCount> refinementStats{};
+    refinementStatsBuffer_.Allocate(sizeof(refinementStats), refinementStats.data(), GL_DYNAMIC_DRAW);
 
     blockRequestBitsetBuffer_.Allocate(requestBytes, nullptr, GL_DYNAMIC_DRAW);
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, blockRequestBitsetBuffer_.Id());
@@ -580,6 +607,7 @@ void PersistentStreamingPipeline::Reset() {
         }
         readbackPending_[i] = false;
         readbackSequence_[i] = 0;
+        readbackWorkingSetSignature_[i] = 0;
     }
     readbackSizeBytes_ = 0;
     nextReadbackSlot_ = 0;
@@ -604,7 +632,18 @@ void PersistentStreamingPipeline::Reset() {
     lastProcessedRefinementMode_ = geometry::RefinementMode::None;
     lastAdaptiveScaleBucket_ = std::numeric_limits<std::int32_t>::min();
     lastAdaptiveDecisionScale_ = 0.0f;
+    progressiveFullActive_ = false;
+    umaRefinementWorkCursor_ = 0u;
+    umaAdaptiveRootsPerFrame_ = UmaAdaptiveInitialRootsPerFrame;
+    umaFullRootsPerFrame_ = UmaFullInitialRootsPerFrame;
     lastBackingReadbackWasFresh_ = false;
+    activePageGeneration_ = 1u;
+    currentWorkingSetSignature_ = 0u;
+    lastProcessWorkingSetSignature_ = 0u;
+    residentStableReadbacks_ = 0u;
+    residentWorkingSetFastPath_ = false;
+    residentRefinementComplete_ = false;
+    residentRefinementDispatchSkipped_ = false;
     refinementBankRecycleCount_ = 0;
     refinementForcedBankRecycleCount_ = 0;
     latestRefinementBankUsed_.fill(0u);
@@ -642,6 +681,10 @@ void PersistentStreamingPipeline::ClearRootCache() {
     protectedRootPageIds_.clear();
     activePageIds_.clear();
     activePageCount_ = 0u;
+    ++activePageGeneration_;
+    residentStableReadbacks_ = 0u;
+    residentWorkingSetFastPath_ = false;
+    residentRefinementComplete_ = false;
     stats_.gpuRootPagesCached = 0u;
     stats_.gpuRootPagesActive = 0u;
     ++stats_.rootWorkingSetRebases;
@@ -859,6 +902,10 @@ void PersistentStreamingPipeline::SetActiveRootPages(
                                            descriptors.data());
     }
     activePageIds_ = std::move(installed);
+    ++activePageGeneration_;
+    residentStableReadbacks_ = 0u;
+    residentWorkingSetFastPath_ = false;
+    residentRefinementComplete_ = false;
     activePageCount_ = static_cast<std::uint32_t>(activePageIds_.size());
     stats_.gpuRootPagesActive = activePageCount_;
 }
@@ -924,6 +971,9 @@ bool PersistentStreamingPipeline::EvictOneUnpinnedBackingBlock() {
     backingSlots_[slotId] = {};
     freeBackingSlots_.push_back(slotId);
     backingBlockToSlot_.erase(candidate);
+    residentStableReadbacks_ = 0u;
+    residentWorkingSetFastPath_ = false;
+    residentRefinementComplete_ = false;
     ++stats_.backingBlockEvictions;
     stats_.gpuBackingBlocksResident = static_cast<std::uint32_t>(backingBlockToSlot_.size());
     return true;
@@ -1032,6 +1082,9 @@ bool PersistentStreamingPipeline::UploadBackingBlock(
         }
     }
 
+    residentStableReadbacks_ = 0u;
+    residentWorkingSetFastPath_ = false;
+    residentRefinementComplete_ = false;
     backingSlots_[slot] = {block.blockId, ++useCounter_, backingFrameSerial_, 0u};
     backingBlockToSlot_[block.blockId] = slot;
     SetPageTableEntry(block.blockId, slot + 1u);
@@ -1080,6 +1133,10 @@ std::uint32_t PersistentStreamingPipeline::RootRecordUpperBound() const {
 }
 
 void PersistentStreamingPipeline::ResetRefinementCache() {
+    residentStableReadbacks_ = 0u;
+    residentWorkingSetFastPath_ = false;
+    residentRefinementComplete_ = false;
+    residentRefinementDispatchSkipped_ = false;
     const std::uint32_t zero = 0;
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, refinementHashBuffer_.Id());
     glClearBufferData(GL_SHADER_STORAGE_BUFFER, GL_R32UI, GL_RED_INTEGER, GL_UNSIGNED_INT, &zero);
@@ -1101,6 +1158,9 @@ void PersistentStreamingPipeline::ResetRefinementCache() {
 }
 
 void PersistentStreamingPipeline::RecycleRefinementBank(std::uint32_t bank) {
+    residentStableReadbacks_ = 0u;
+    residentWorkingSetFastPath_ = false;
+    residentRefinementComplete_ = false;
     if (bank >= RefinementBankCount || refinementHashCapacity_ == 0) {
         return;
     }
@@ -1218,9 +1278,26 @@ void PersistentStreamingPipeline::Process(
     float lodLevel,
     PersistentRangeFilterKind filterKind,
     const geometry::RefinementParameters& refinement,
-    const chmv::streaming::runtime::StreamingSpatialWindow& refinementWindow) {
+    const chmv::streaming::runtime::StreamingSpatialWindow& refinementWindow,
+    bool deferHeavyRefinement) {
     const auto refinementMode = refinement.mode;
+    const bool uma = config_.memoryArchitecture == GPUMemoryArchitecture::Unified;
+    // Keep Full DFS semantically identical on UMA and dedicated GPUs. The previous UMA-only
+    // progressive frontier made resident working sets much slower than the old whole-resident
+    // path even after every required backing block was already present. We now time-slice roots
+    // on UMA, but each admitted Full root uses the original direct DFS traversal.
+    progressiveFullActive_ = false;
+    stats_.umaProgressiveFull = progressiveFullActive_;
+    stats_.umaRefinementDeferred = uma && deferHeavyRefinement &&
+                                   refinementMode != geometry::RefinementMode::None;
     if (!index_ || activePageCount_ == 0) {
+        residentStableReadbacks_ = 0u;
+        residentWorkingSetFastPath_ = false;
+        residentRefinementComplete_ = false;
+        residentRefinementDispatchSkipped_ = false;
+        stats_.residentWorkingSetFastPath = false;
+        stats_.residentRefinementDispatchSkipped = false;
+        stats_.residentStableReadbacks = 0u;
         const std::uint32_t zero = 0;
         drawCounterBuffer_.Update(0, sizeof(zero), &zero);
         FinalizeDrawCommand();
@@ -1265,6 +1342,52 @@ void PersistentStreamingPipeline::Process(
     lastProcessedRefinementMode_ = refinementMode;
     lastAdaptiveScaleBucket_ = adaptiveScaleBucket;
 
+    std::uint64_t workingSetSignature = 0x43484d5657534650ull;
+    workingSetSignature = MixWorkingSetSignature(workingSetSignature, activePageGeneration_);
+    const auto signatureLowLod = static_cast<std::int32_t>(std::floor(lodLevel));
+    const auto signatureHighLod = static_cast<std::int32_t>(std::ceil(lodLevel));
+    const auto signatureLodPair =
+        (static_cast<std::uint64_t>(static_cast<std::uint32_t>(signatureLowLod)) << 32u) |
+        static_cast<std::uint32_t>(signatureHighLod);
+    workingSetSignature = MixWorkingSetSignature(workingSetSignature, signatureLodPair);
+    workingSetSignature = MixWorkingSetSignature(
+        workingSetSignature, static_cast<std::uint64_t>(static_cast<std::uint8_t>(filterKind)));
+    workingSetSignature = MixWorkingSetSignature(
+        workingSetSignature, static_cast<std::uint64_t>(static_cast<std::uint8_t>(refinementMode)));
+    workingSetSignature = MixWorkingSetSignature(
+        workingSetSignature, static_cast<std::uint64_t>(static_cast<std::uint32_t>(adaptiveScaleBucket)));
+    workingSetSignature = MixWorkingSetSignature(workingSetSignature, refinementWindow.minX);
+    workingSetSignature = MixWorkingSetSignature(workingSetSignature, refinementWindow.minY);
+    workingSetSignature = MixWorkingSetSignature(workingSetSignature, refinementWindow.maxX);
+    workingSetSignature = MixWorkingSetSignature(workingSetSignature, refinementWindow.maxY);
+    currentWorkingSetSignature_ = workingSetSignature;
+    if (currentWorkingSetSignature_ != lastProcessWorkingSetSignature_) {
+        residentStableReadbacks_ = 0u;
+        residentWorkingSetFastPath_ = false;
+        residentRefinementComplete_ = false;
+        residentRefinementDispatchSkipped_ = false;
+        lastProcessWorkingSetSignature_ = currentWorkingSetSignature_;
+    }
+    if (refinementMode == geometry::RefinementMode::None) {
+        residentStableReadbacks_ = 0u;
+        residentWorkingSetFastPath_ = false;
+        residentRefinementComplete_ = false;
+    }
+    const bool skipResidentRefinementDispatch =
+        refinementMode != geometry::RefinementMode::None &&
+        residentWorkingSetFastPath_ && residentRefinementComplete_ &&
+        !adaptiveForceProgress;
+    residentRefinementDispatchSkipped_ = skipResidentRefinementDispatch;
+    stats_.residentWorkingSetFastPath = residentWorkingSetFastPath_;
+    stats_.residentRefinementDispatchSkipped = skipResidentRefinementDispatch;
+    stats_.residentStableReadbacks = residentStableReadbacks_;
+    if (residentWorkingSetFastPath_) {
+        ++stats_.residentFastPathFrames;
+    }
+    if (skipResidentRefinementDispatch) {
+        ++stats_.residentRefinementSkippedFrames;
+    }
+
     const std::uint32_t zero = 0;
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, visibleRootCounterBuffer_.Id());
     glClearBufferSubData(GL_SHADER_STORAGE_BUFFER, GL_R32UI, 0, sizeof(zero), GL_RED_INTEGER,
@@ -1272,12 +1395,14 @@ void PersistentStreamingPipeline::Process(
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, drawCounterBuffer_.Id());
     glClearBufferSubData(GL_SHADER_STORAGE_BUFFER, GL_R32UI, 0, sizeof(zero), GL_RED_INTEGER,
                          GL_UNSIGNED_INT, &zero);
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, blockRequestBitsetBuffer_.Id());
-    glClearBufferData(GL_SHADER_STORAGE_BUFFER, GL_R32UI, GL_RED_INTEGER, GL_UNSIGNED_INT, &zero);
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, blockUseBitsetBuffer_.Id());
-    glClearBufferData(GL_SHADER_STORAGE_BUFFER, GL_R32UI, GL_RED_INTEGER, GL_UNSIGNED_INT, &zero);
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, refinementStatsBuffer_.Id());
-    glClearBufferData(GL_SHADER_STORAGE_BUFFER, GL_R32UI, GL_RED_INTEGER, GL_UNSIGNED_INT, &zero);
+    if (!skipResidentRefinementDispatch) {
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, blockRequestBitsetBuffer_.Id());
+        glClearBufferData(GL_SHADER_STORAGE_BUFFER, GL_R32UI, GL_RED_INTEGER, GL_UNSIGNED_INT, &zero);
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, blockUseBitsetBuffer_.Id());
+        glClearBufferData(GL_SHADER_STORAGE_BUFFER, GL_R32UI, GL_RED_INTEGER, GL_UNSIGNED_INT, &zero);
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, refinementStatsBuffer_.Id());
+        glClearBufferData(GL_SHADER_STORAGE_BUFFER, GL_R32UI, GL_RED_INTEGER, GL_UNSIGNED_INT, &zero);
+    }
 
     filterTimer_.Begin();
     auto& filterProgram = filterKind == PersistentRangeFilterKind::BirthOrdered
@@ -1307,7 +1432,7 @@ void PersistentStreamingPipeline::Process(
     prepareDispatchProgram_.Dispatch(1);
     glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_COMMAND_BARRIER_BIT);
 
-    if (refinementMode != geometry::RefinementMode::None) {
+    if (refinementMode != geometry::RefinementMode::None && !skipResidentRefinementDispatch) {
         refinementTimer_.Begin();
         refineProgram_.Bind();
         blockPageTableBuffer_.BindBase(GL_SHADER_STORAGE_BUFFER, 0);
@@ -1329,28 +1454,42 @@ void PersistentStreamingPipeline::Process(
                      static_cast<std::uint32_t>(index_->edgeCount));
         glUniform1ui(glGetUniformLocation(refineProgram_.Id(), "uBlockRecordCount"),
                      backingBlockRecordCount_);
+        const bool blockRecordCountPowerOfTwo = std::has_single_bit(backingBlockRecordCount_);
+        const auto blockRecordShift = blockRecordCountPowerOfTwo
+                                          ? static_cast<std::uint32_t>(std::countr_zero(backingBlockRecordCount_))
+                                          : 0u;
+        glUniform1ui(glGetUniformLocation(refineProgram_.Id(), "uBlockRecordPowerOfTwo"),
+                     blockRecordCountPowerOfTwo ? 1u : 0u);
+        glUniform1ui(glGetUniformLocation(refineProgram_.Id(), "uBlockRecordShift"),
+                     blockRecordShift);
+        glUniform1ui(glGetUniformLocation(refineProgram_.Id(), "uBlockRecordMask"),
+                     blockRecordCountPowerOfTwo ? backingBlockRecordCount_ - 1u : 0u);
         glUniform1ui(glGetUniformLocation(refineProgram_.Id(), "uBlockCount"),
                      backingBlockCount_);
         glUniform1ui(glGetUniformLocation(refineProgram_.Id(), "uHashMask"),
                      refinementHashCapacity_ - 1u);
+        const auto frontierMode =
+            refinementMode == geometry::RefinementMode::Adaptive || progressiveFullActive_;
         const auto activeArenaCapacity =
-            refinementMode == geometry::RefinementMode::Adaptive
-                ? leafArenaCapacity_ / 2u
-                : leafArenaCapacity_;
+            frontierMode ? leafArenaCapacity_ / 2u : leafArenaCapacity_;
         glUniform1ui(glGetUniformLocation(refineProgram_.Id(), "uBankCapacity"),
                      activeArenaCapacity / RefinementBankCount);
         stats_.refinementGeometryCapacity = activeArenaCapacity;
         glUniform1ui(glGetUniformLocation(refineProgram_.Id(), "uWriteBank"),
                      refinementWriteBank_);
+        const std::uint32_t shaderRefinementMode = progressiveFullActive_
+                                                       ? 3u
+                                                       : (refinementMode == geometry::RefinementMode::Adaptive
+                                                              ? 2u
+                                                              : 1u);
         glUniform1ui(glGetUniformLocation(refineProgram_.Id(), "uRefinementMode"),
-                     refinementMode == geometry::RefinementMode::Adaptive ? 2u : 1u);
+                     shaderRefinementMode);
         const auto adaptiveRequestBudget = static_cast<std::uint32_t>(std::clamp<std::uint64_t>(
             std::max<std::uint64_t>(32u, backingBlockCapacity_ / 32u),
             32u, MaxAdaptiveBlockRequestsPerFrame));
         glUniform1ui(glGetUniformLocation(refineProgram_.Id(), "uMaxAdaptiveBlockRequests"),
-                     refinementMode == geometry::RefinementMode::Adaptive
-                         ? adaptiveRequestBudget
-                         : std::numeric_limits<std::uint32_t>::max());
+                     frontierMode ? adaptiveRequestBudget
+                                  : std::numeric_limits<std::uint32_t>::max());
         glUniform1ui(glGetUniformLocation(refineProgram_.Id(), "uAdaptiveForceProgress"),
                      adaptiveForceProgress ? 1u : 0u);
         glUniform1f(glGetUniformLocation(refineProgram_.Id(), "uScreenPixelScale"),
@@ -1359,8 +1498,57 @@ void PersistentStreamingPipeline::Process(
                         : 0.0f);
         glUniform1f(glGetUniformLocation(refineProgram_.Id(), "uMaxScreenErrorPixels"),
                     refinementMode == geometry::RefinementMode::Adaptive ? 1.0f : 0.0f);
-        glBindBuffer(GL_DISPATCH_INDIRECT_BUFFER, dispatchBuffer_.Id());
-        glDispatchComputeIndirect(0);
+
+        std::uint32_t workLimit = std::numeric_limits<std::uint32_t>::max();
+        if (uma) {
+            // UMA still gets a watchdog quota, but it is a time budget rather than a permanent
+            // low-throughput mode. Full DFS keeps the direct recursive traversal; when a resident
+            // working set is cheap, the quota ramps exponentially so warm OOC approaches the old
+            // whole-resident throughput. During interaction we keep a tiny amount of progress
+            // instead of freezing refinement completely.
+            const bool fullTraversal = refinementMode == geometry::RefinementMode::Full;
+            auto& quota = fullTraversal ? umaFullRootsPerFrame_ : umaAdaptiveRootsPerFrame_;
+            const auto minQuota = fullTraversal ? UmaFullMinRootsPerFrame
+                                                 : UmaAdaptiveMinRootsPerFrame;
+            const auto maxQuota = fullTraversal ? UmaFullMaxRootsPerFrame
+                                                 : UmaAdaptiveMaxRootsPerFrame;
+            const auto lastMs = stats_.gpuRefinementMs;
+            if (lastMs > 6.0) {
+                quota = std::max(minQuota, quota / 2u);
+            } else if (lastMs > 3.5) {
+                quota = std::max(minQuota, quota * 3u / 4u);
+            } else if (lastMs > 0.0 && lastMs < 1.5) {
+                quota = std::min(maxQuota, std::max(quota + 1u, quota * 2u));
+            }
+            if (residentWorkingSetFastPath_ && lastMs < 3.5) {
+                const auto residentFloor = fullTraversal ? 32u : 128u;
+                quota = std::min(maxQuota, std::max(quota, residentFloor));
+            }
+            workLimit = deferHeavyRefinement ? minQuota : quota;
+            stats_.umaRefinementRootBudget = workLimit;
+        } else {
+            stats_.umaRefinementRootBudget = 0u;
+        }
+        glUniform1ui(glGetUniformLocation(refineProgram_.Id(), "uWorkStart"),
+                     umaRefinementWorkCursor_);
+        glUniform1ui(glGetUniformLocation(refineProgram_.Id(), "uWorkLimit"), workLimit);
+        // Once a camera/LOD working set has produced consecutive zero-miss readbacks, backing
+        // residency is stable. Request-on-miss remains enabled, but the hot resolve path no
+        // longer performs an atomic block-use write for every traversed edge. A signature change
+        // immediately re-enables tracking before any new working set is admitted.
+        glUniform1ui(glGetUniformLocation(refineProgram_.Id(), "uTrackBlockUse"),
+                     residentWorkingSetFastPath_ ? 0u : 1u);
+
+        if (uma) {
+            if (workLimit != 0u) {
+                const auto groups = (workLimit + RefineLocalSize - 1u) / RefineLocalSize;
+                refineProgram_.Dispatch(groups);
+                umaRefinementWorkCursor_ += workLimit;
+            }
+        } else {
+            glBindBuffer(GL_DISPATCH_INDIRECT_BUFFER, dispatchBuffer_.Id());
+            glDispatchComputeIndirect(0);
+        }
         glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
         refinementTimer_.End();
     }
@@ -1396,7 +1584,9 @@ void PersistentStreamingPipeline::Process(
     composeTimer_.End();
 
     FinalizeDrawCommand();
-    ScheduleReadback();
+    if (!skipResidentRefinementDispatch) {
+        ScheduleReadback();
+    }
     ++frameId_;
     if (frameId_ == 0u) {
         frameId_ = 1u;
@@ -1406,7 +1596,9 @@ void PersistentStreamingPipeline::Process(
     if (const auto value = filterTimer_.LastMilliseconds()) {
         stats_.gpuFilterCullMs = *value;
     }
-    if (const auto value = refinementTimer_.LastMilliseconds()) {
+    if (skipResidentRefinementDispatch) {
+        stats_.gpuRefinementMs = 0.0;
+    } else if (const auto value = refinementTimer_.LastMilliseconds()) {
         stats_.gpuRefinementMs = *value;
     }
     if (const auto value = composeTimer_.LastMilliseconds()) {
@@ -1458,7 +1650,7 @@ void PersistentStreamingPipeline::ScheduleReadback() {
              static_cast<std::size_t>(requestWordCount_) * sizeof(std::uint32_t));
     copyFrom(blockUseBitsetBuffer_.Id(),
              static_cast<std::size_t>(requestWordCount_) * sizeof(std::uint32_t));
-    copyFrom(refinementStatsBuffer_.Id(), 5u * sizeof(std::uint32_t));
+    copyFrom(refinementStatsBuffer_.Id(), kRefinementStatsWordCount * sizeof(std::uint32_t));
     copyFrom(leafArenaCounterBuffer_.Id(),
              (RefinementBankCount * 2u + 1u) * sizeof(std::uint32_t));
     copyFrom(refinementBankLastUseBuffer_.Id(),
@@ -1472,6 +1664,7 @@ void PersistentStreamingPipeline::ScheduleReadback() {
         glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0));
     readbackPending_[slot] = true;
     readbackSequence_[slot] = nextReadbackSequence_++;
+    readbackWorkingSetSignature_[slot] = currentWorkingSetSignature_;
     nextReadbackSlot_ = (slot + 1u) % ReadbackRingSize;
 }
 
@@ -1484,8 +1677,10 @@ std::vector<std::uint32_t> PersistentStreamingPipeline::ReadMissingBackingBlocks
 
     std::vector<std::uint32_t> mergedWords(requestWordCount_, 0u);
     std::vector<std::uint32_t> mergedUseWords(requestWordCount_, 0u);
+    std::vector<std::uint32_t> latestRequestWords(requestWordCount_, 0u);
     std::uint64_t latestSequence = 0;
-    std::array<std::uint32_t, 5> latestRefinementStats{};
+    std::uint64_t latestWorkingSetSignature = 0u;
+    std::array<std::uint32_t, kRefinementStatsWordCount> latestRefinementStats{};
     std::array<std::uint32_t, RefinementBankCount * 2u + 1u> latestArenaMeta{};
     std::array<std::uint32_t, RefinementBankCount> latestBankLastUse{};
     std::uint32_t latestVisibleCount = stats_.visibleRootCount;
@@ -1507,31 +1702,37 @@ std::vector<std::uint32_t> PersistentStreamingPipeline::ReadMissingBackingBlocks
                            static_cast<GLsizeiptr>(readbackSizeBytes_), data.data());
         glBindBuffer(GL_COPY_READ_BUFFER, 0);
 
-        for (std::uint32_t word = 0; word < requestWordCount_; ++word) {
-            mergedWords[word] |= data[word];
-            mergedUseWords[word] |= data[requestWordCount_ + word];
-        }
+        const auto slotSignature = readbackWorkingSetSignature_[slot];
+        if (slotSignature == currentWorkingSetSignature_) {
+            for (std::uint32_t word = 0; word < requestWordCount_; ++word) {
+                mergedWords[word] |= data[word];
+                mergedUseWords[word] |= data[requestWordCount_ + word];
+            }
 
-        if (readbackSequence_[slot] >= latestSequence) {
-            latestSequence = readbackSequence_[slot];
-            std::size_t cursor = static_cast<std::size_t>(requestWordCount_) * 2u;
-            for (auto& value : latestRefinementStats) {
-                value = data[cursor++];
+            if (readbackSequence_[slot] >= latestSequence) {
+                latestSequence = readbackSequence_[slot];
+                latestWorkingSetSignature = slotSignature;
+                std::copy_n(data.begin(), requestWordCount_, latestRequestWords.begin());
+                std::size_t cursor = static_cast<std::size_t>(requestWordCount_) * 2u;
+                for (auto& value : latestRefinementStats) {
+                    value = data[cursor++];
+                }
+                for (auto& value : latestArenaMeta) {
+                    value = data[cursor++];
+                }
+                for (auto& value : latestBankLastUse) {
+                    value = data[cursor++];
+                }
+                latestVisibleCount = data[cursor++];
+                latestDrawCount = data[cursor++];
             }
-            for (auto& value : latestArenaMeta) {
-                value = data[cursor++];
-            }
-            for (auto& value : latestBankLastUse) {
-                value = data[cursor++];
-            }
-            latestVisibleCount = data[cursor++];
-            latestDrawCount = data[cursor++];
         }
 
         glDeleteSync(reinterpret_cast<GLsync>(readbackFences_[slot]));
         readbackFences_[slot] = nullptr;
         readbackPending_[slot] = false;
         readbackSequence_[slot] = 0;
+        readbackWorkingSetSignature_[slot] = 0;
     }
 
     for (std::uint32_t word = 0; word < mergedWords.size(); ++word) {
@@ -1575,6 +1776,50 @@ std::vector<std::uint32_t> PersistentStreamingPipeline::ReadMissingBackingBlocks
         stats_.refinementStackOverflows = latestRefinementStats[2];
         stats_.refinementHashOverflows = latestRefinementStats[3];
         stats_.adaptiveBlockRequestsAdmitted = latestRefinementStats[4];
+        stats_.refinementPendingRoots = latestRefinementStats[5];
+
+        if (latestWorkingSetSignature == currentWorkingSetSignature_ &&
+            lastProcessedRefinementMode_ != geometry::RefinementMode::None) {
+            bool latestHasMissing = false;
+            for (std::uint32_t word = 0; word < latestRequestWords.size() && !latestHasMissing; ++word) {
+                auto bits = latestRequestWords[word];
+                while (bits != 0u) {
+                    const auto bitIndex = static_cast<std::uint32_t>(std::countr_zero(bits));
+                    const auto blockId = word * 32u + bitIndex;
+                    if (blockId < backingBlockCount_ && !HasBackingBlock(blockId)) {
+                        latestHasMissing = true;
+                        break;
+                    }
+                    bits &= bits - 1u;
+                }
+            }
+
+            if (!latestHasMissing) {
+                residentStableReadbacks_ = std::min<std::uint32_t>(
+                    residentStableReadbacks_ + 1u, ResidentStableReadbacksRequired);
+                residentWorkingSetFastPath_ =
+                    residentStableReadbacks_ >= ResidentStableReadbacksRequired;
+                residentRefinementComplete_ = latestRefinementStats[5] == 0u;
+            } else {
+                // A resident fast-path frame can discover a deeper block after several warm
+                // traversals. Before the CPU admits that fault wave, make the existing cache
+                // uniformly recent so an old LRU timestamp cannot immediately evict a block from
+                // the still-active closure merely because per-edge use atomics were disabled.
+                if (residentWorkingSetFastPath_) {
+                    for (auto& [blockId, slotId] : backingBlockToSlot_) {
+                        (void)blockId;
+                        backingSlots_[slotId].lastUse = ++useCounter_;
+                    }
+                }
+                residentStableReadbacks_ = 0u;
+                residentWorkingSetFastPath_ = false;
+                residentRefinementComplete_ = false;
+            }
+        }
+        stats_.residentWorkingSetFastPath = residentWorkingSetFastPath_;
+        stats_.residentRefinementDispatchSkipped = residentRefinementDispatchSkipped_;
+        stats_.residentStableReadbacks = residentStableReadbacks_;
+
         std::uint64_t geometryUsed = 0;
         std::uint64_t geometryOverflows = 0;
         std::uint32_t banksUsed = 0;
@@ -1584,7 +1829,8 @@ std::vector<std::uint32_t> PersistentStreamingPipeline::ReadMissingBackingBlocks
                 latestArenaMeta[RefinementBankCount + bank];
             latestRefinementBankLastUse_[bank] = latestBankLastUse[bank];
             const auto activeArenaCapacity =
-                lastProcessedRefinementMode_ == geometry::RefinementMode::Adaptive
+                (lastProcessedRefinementMode_ == geometry::RefinementMode::Adaptive ||
+                 progressiveFullActive_)
                     ? leafArenaCapacity_ / 2u
                     : leafArenaCapacity_;
             geometryUsed += std::min(latestRefinementBankUsed_[bank],
@@ -1596,7 +1842,8 @@ std::vector<std::uint32_t> PersistentStreamingPipeline::ReadMissingBackingBlocks
         }
         stats_.cachedRefinedRoots = latestArenaMeta[RefinementBankCount * 2u];
         const auto activeArenaCapacity =
-            lastProcessedRefinementMode_ == geometry::RefinementMode::Adaptive
+            (lastProcessedRefinementMode_ == geometry::RefinementMode::Adaptive ||
+             progressiveFullActive_)
                 ? leafArenaCapacity_ / 2u
                 : leafArenaCapacity_;
         stats_.refinementGeometryUsed = static_cast<std::uint32_t>(

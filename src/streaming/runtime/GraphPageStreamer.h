@@ -306,10 +306,14 @@ struct GraphPageStreamingStats {
     std::uint32_t gpuMissingBlockRequests = 0;
     std::uint32_t gpuRefinementCacheHits = 0;
     std::uint32_t gpuRefinementCacheMisses = 0;
+    std::uint32_t gpuRefinementPendingRoots = 0;
     std::uint32_t gpuCachedRefinedRoots = 0;
     std::uint32_t gpuRefinementStackOverflows = 0;
     std::uint32_t gpuRefinementHashOverflows = 0;
     std::uint32_t gpuAdaptiveBlockRequestsAdmitted = 0;
+    bool gpuUmaRefinementDeferred = false;
+    bool gpuUmaProgressiveFull = false;
+    std::uint32_t gpuUmaRefinementRootBudget = 0;
     std::uint32_t gpuRefinementGeometryUsed = 0;
     std::uint32_t gpuRefinementGeometryCapacity = 0;
     std::uint32_t gpuRefinementGeometryOverflows = 0;
@@ -326,6 +330,11 @@ struct GraphPageStreamingStats {
     std::uint64_t gpuBackingGraceFallbackEvictions = 0;
     std::uint64_t gpuBackingCacheAllocationFailures = 0;
     std::uint32_t gpuBackingBlocksTouchedLastReadback = 0;
+    bool gpuResidentWorkingSetFastPath = false;
+    bool gpuResidentRefinementDispatchSkipped = false;
+    std::uint32_t gpuResidentStableReadbacks = 0;
+    std::uint64_t gpuResidentFastPathFrames = 0;
+    std::uint64_t gpuResidentRefinementSkippedFrames = 0;
     std::uint64_t gpuIncrementalRootBytesUploaded = 0;
     std::uint64_t gpuIncrementalBackingBytesUploaded = 0;
     double lastGpuRootUploadMs = 0.0;

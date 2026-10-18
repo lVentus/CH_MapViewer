@@ -12,6 +12,7 @@ const uint CACHE_STATE_MASK = 0xffu;
 const uint CACHE_BANK_SHIFT = 8u;
 const uint REFINEMENT_FULL = 1u;
 const uint REFINEMENT_ADAPTIVE = 2u;
+const uint REFINEMENT_PROGRESSIVE_FULL = 3u;
 const int MAX_STACK = 128;
 const uint MAX_HASH_PROBES = 96u;
 const uint CACHE_BANK_COUNT = 8u;
@@ -50,6 +51,7 @@ layout(std430, binding = 9) buffer RefinementStats {
     uint stackOverflows;
     uint hashOverflows;
     uint admittedBlockRequests;
+    uint pendingRoots;
 };
 layout(std430, binding = 10) buffer BlockUseBits { uint useWords[]; };
 layout(std430, binding = 11) readonly buffer RootRecords { RootRecord roots[]; };
@@ -60,6 +62,9 @@ layout(std430, binding = 14) buffer RefinedRoadTypes { uint cachedRoadTypeWords[
 uniform uint uEdgeCount;
 uniform uint uBlockRecordCount;
 uniform uint uBlockCount;
+uniform uint uBlockRecordPowerOfTwo;
+uniform uint uBlockRecordShift;
+uniform uint uBlockRecordMask;
 uniform uint uHashMask;
 // Logical records per bank. In Adaptive mode every logical record occupies two vec4 slots.
 uniform uint uBankCapacity;
@@ -69,6 +74,21 @@ uniform float uScreenPixelScale;
 uniform float uMaxScreenErrorPixels;
 uniform uint uMaxAdaptiveBlockRequests;
 uniform uint uAdaptiveForceProgress;
+uniform uint uWorkStart;
+uniform uint uWorkLimit;
+uniform uint uTrackBlockUse;
+
+uint edgeBlockId(uint edgeId) {
+    return uBlockRecordPowerOfTwo != 0u
+               ? (edgeId >> uBlockRecordShift)
+               : (edgeId / uBlockRecordCount);
+}
+
+uint edgeBlockLocal(uint edgeId, uint blockId) {
+    return uBlockRecordPowerOfTwo != 0u
+               ? (edgeId & uBlockRecordMask)
+               : (edgeId - blockId * uBlockRecordCount);
+}
 
 uint hashEdge(uint edgeId) {
     uint x = edgeId + 1u;
@@ -92,7 +112,8 @@ bool requestBlock(uint blockId) {
         return true;
     }
 
-    if (uRefinementMode == REFINEMENT_ADAPTIVE) {
+    if (uRefinementMode == REFINEMENT_ADAPTIVE ||
+        uRefinementMode == REFINEMENT_PROGRESSIVE_FULL) {
         uint ticket = atomicAdd(admittedBlockRequests, 1u);
         if (ticket >= uMaxAdaptiveBlockRequests) {
             atomicAnd(requestWords[wordIndex], ~mask);
@@ -104,7 +125,7 @@ bool requestBlock(uint blockId) {
 
 void requestEdgeBlock(uint edgeId) {
     if (edgeId < uEdgeCount && uBlockRecordCount != 0u) {
-        requestBlock(edgeId / uBlockRecordCount);
+        requestBlock(edgeBlockId(edgeId));
     }
 }
 
@@ -168,7 +189,7 @@ bool resolveEdgeInternal(uint edgeId,
         return false;
     }
 
-    uint blockId = edgeId / uBlockRecordCount;
+    uint blockId = edgeBlockId(edgeId);
     uint slotPlusOne = blockSlots[blockId];
     if (slotPlusOne == 0u) {
         if (requestOnMiss) {
@@ -181,9 +202,11 @@ bool resolveEdgeInternal(uint edgeId,
         return false;
     }
 
-    touchBlock(blockId);
+    if (uTrackBlockUse != 0u) {
+        touchBlock(blockId);
+    }
     uint slot = slotPlusOne - 1u;
-    uint local = edgeId - blockId * uBlockRecordCount;
+    uint local = edgeBlockLocal(edgeId, blockId);
     uint residentIndex = slot * uBlockRecordCount + local;
     children = childPairs[residentIndex];
     segment = endpoints[residentIndex];
@@ -206,8 +229,14 @@ bool resolveEdgeNoRequest(uint edgeId,
 }
 
 bool adaptiveNodeCanSplit(uvec2 children, float geometryError) {
-    return children.x != INVALID_EDGE && children.y != INVALID_EDGE &&
-           !stopAtError(geometryError);
+    bool shortcut = children.x != INVALID_EDGE && children.y != INVALID_EDGE;
+    if (!shortcut) {
+        return false;
+    }
+    if (uRefinementMode == REFINEMENT_PROGRESSIVE_FULL) {
+        return true;
+    }
+    return !stopAtError(geometryError);
 }
 
 void storeAdaptiveNode(uint physicalBase, uint logicalIndex, vec4 segment,
@@ -531,10 +560,11 @@ void progressAdaptive(RootRecord root,
 }
 
 void main() {
-    uint rootIndex = gl_GlobalInvocationID.x;
-    if (rootIndex >= visibleCount) {
+    uint workIndex = gl_GlobalInvocationID.x;
+    if (visibleCount == 0u || workIndex >= uWorkLimit) {
         return;
     }
+    uint rootIndex = (uWorkStart + workIndex) % visibleCount;
 
     uint rootRecordIndex = visibleRoots[rootIndex];
     RootRecord root = roots[rootRecordIndex];
@@ -547,12 +577,14 @@ void main() {
     uint packedState = cacheEntries[cacheIndex].w;
     uint state = packedState & CACHE_STATE_MASK;
 
-    if (uRefinementMode == REFINEMENT_ADAPTIVE) {
+    if (uRefinementMode == REFINEMENT_ADAPTIVE ||
+        uRefinementMode == REFINEMENT_PROGRESSIVE_FULL) {
         if (state == CACHE_ADAPTIVE_READY) {
             atomicAdd(cacheHits, 1u);
             if (uAdaptiveForceProgress == 0u) {
                 return;
             }
+            atomicAdd(pendingRoots, 1u);
             if (atomicCompSwap(cacheEntries[cacheIndex].w, packedState, CACHE_BUILDING) !=
                 packedState) {
                 return;
@@ -561,9 +593,13 @@ void main() {
             return;
         }
         if (state == CACHE_UNCACHEABLE || state == CACHE_BUILDING || state == CACHE_READY_FULL) {
+            if (state != CACHE_READY_FULL) {
+                atomicAdd(pendingRoots, 1u);
+            }
             return;
         }
         if (state == CACHE_ADAPTIVE_PARTIAL) {
+            atomicAdd(pendingRoots, 1u);
             if (atomicCompSwap(cacheEntries[cacheIndex].w, packedState, CACHE_BUILDING) !=
                 packedState) {
                 return;
@@ -573,8 +609,10 @@ void main() {
             return;
         }
         if (atomicCompSwap(cacheEntries[cacheIndex].w, 0u, CACHE_BUILDING) != 0u) {
+            atomicAdd(pendingRoots, 1u);
             return;
         }
+        atomicAdd(pendingRoots, 1u);
         atomicAdd(cacheMisses, 1u);
         progressAdaptive(root, cacheIndex, 0u, false);
         return;
@@ -587,12 +625,15 @@ void main() {
     }
     if (state == CACHE_UNCACHEABLE || state == CACHE_BUILDING ||
         state == CACHE_ADAPTIVE_PARTIAL || state == CACHE_ADAPTIVE_READY) {
+        atomicAdd(pendingRoots, 1u);
         return;
     }
     if (atomicCompSwap(cacheEntries[cacheIndex].w, 0u, CACHE_BUILDING) != 0u) {
+        atomicAdd(pendingRoots, 1u);
         return;
     }
 
+    atomicAdd(pendingRoots, 1u);
     atomicAdd(cacheMisses, 1u);
     uint leafCount = 0u;
     if (!countLeavesFull(root, leafCount)) {

@@ -92,10 +92,17 @@ struct PersistentStreamingStats {
     std::uint32_t missingBlockRequestCount = 0;
     std::uint32_t refinementCacheHits = 0;
     std::uint32_t refinementCacheMisses = 0;
+    std::uint32_t refinementPendingRoots = 0;
     std::uint32_t cachedRefinedRoots = 0;
     std::uint32_t refinementStackOverflows = 0;
     std::uint32_t refinementHashOverflows = 0;
     std::uint32_t adaptiveBlockRequestsAdmitted = 0;
+    // UMA/iGPU refinement is intentionally time-sliced so camera interaction cannot submit an
+    // unbounded hierarchy traversal to a low-power GPU in one frame. Full DFS uses the same
+    // persistent frontier representation until it converges exactly to leaves.
+    bool umaRefinementDeferred = false;
+    bool umaProgressiveFull = false;
+    std::uint32_t umaRefinementRootBudget = 0;
     std::uint32_t refinementGeometryUsed = 0;
     std::uint32_t refinementGeometryCapacity = 0;
     std::uint32_t refinementGeometryOverflows = 0;
@@ -112,6 +119,11 @@ struct PersistentStreamingStats {
     std::uint64_t backingGraceFallbackEvictions = 0;
     std::uint64_t backingCacheAllocationFailures = 0;
     std::uint32_t backingBlocksTouchedLastReadback = 0;
+    bool residentWorkingSetFastPath = false;
+    bool residentRefinementDispatchSkipped = false;
+    std::uint32_t residentStableReadbacks = 0;
+    std::uint64_t residentFastPathFrames = 0;
+    std::uint64_t residentRefinementSkippedFrames = 0;
     std::uint64_t incrementalRootBytesUploaded = 0;
     std::uint64_t incrementalBackingBytesUploaded = 0;
     double lastRootUploadMs = 0.0;
@@ -164,7 +176,8 @@ public:
     void Process(float lodLevel,
                  PersistentRangeFilterKind filterKind,
                  const geometry::RefinementParameters& refinement,
-                 const chmv::streaming::runtime::StreamingSpatialWindow& refinementWindow);
+                 const chmv::streaming::runtime::StreamingSpatialWindow& refinementWindow,
+                 bool deferHeavyRefinement = false);
 
     // Compact GPU page-fault output. Each block appears at most once because the shader writes
     // a block bitset rather than one request per shortcut edge.
@@ -223,6 +236,12 @@ private:
     static constexpr std::uint32_t LocalSize = 256u;
     static constexpr std::uint32_t RefineLocalSize = 64u;
     static constexpr std::uint32_t MaxAdaptiveBlockRequestsPerFrame = 128u;
+    static constexpr std::uint32_t UmaAdaptiveInitialRootsPerFrame = 32u;
+    static constexpr std::uint32_t UmaAdaptiveMinRootsPerFrame = 4u;
+    static constexpr std::uint32_t UmaAdaptiveMaxRootsPerFrame = 4096u;
+    static constexpr std::uint32_t UmaFullInitialRootsPerFrame = 8u;
+    static constexpr std::uint32_t UmaFullMinRootsPerFrame = 1u;
+    static constexpr std::uint32_t UmaFullMaxRootsPerFrame = 2048u;
     static constexpr std::uint32_t RefinementBankCount = 8u;
     static constexpr std::uint32_t RefinementBankReuseDelayFrames = 8u;
     // Readback uses a 3-slot asynchronous ring. Four frames of upload grace prevents a newly
@@ -234,6 +253,7 @@ private:
     // while commands from a recent frame can still read it.
     static constexpr std::uint32_t HostSharedReuseDelayFrames = 4u;
     static constexpr std::size_t ReadbackRingSize = 3u;
+    static constexpr std::uint32_t ResidentStableReadbacksRequired = 2u;
 
     ComputeProgram fullScanFilterProgram_;
     ComputeProgram birthOrderedFilterProgram_;
@@ -274,6 +294,7 @@ private:
     std::array<void*, ReadbackRingSize> readbackFences_{};
     std::array<bool, ReadbackRingSize> readbackPending_{};
     std::array<std::uint64_t, ReadbackRingSize> readbackSequence_{};
+    std::array<std::uint64_t, ReadbackRingSize> readbackWorkingSetSignature_{};
     std::size_t readbackSizeBytes_ = 0;
     std::size_t nextReadbackSlot_ = 0;
     std::uint64_t nextReadbackSequence_ = 1;
@@ -303,7 +324,18 @@ private:
     geometry::RefinementMode lastProcessedRefinementMode_ = geometry::RefinementMode::None;
     std::int32_t lastAdaptiveScaleBucket_ = std::numeric_limits<std::int32_t>::min();
     float lastAdaptiveDecisionScale_ = 0.0f;
+    bool progressiveFullActive_ = false;
+    std::uint32_t umaRefinementWorkCursor_ = 0u;
+    std::uint32_t umaAdaptiveRootsPerFrame_ = UmaAdaptiveInitialRootsPerFrame;
+    std::uint32_t umaFullRootsPerFrame_ = UmaFullInitialRootsPerFrame;
     bool lastBackingReadbackWasFresh_ = false;
+    std::uint64_t activePageGeneration_ = 1u;
+    std::uint64_t currentWorkingSetSignature_ = 0u;
+    std::uint64_t lastProcessWorkingSetSignature_ = 0u;
+    std::uint32_t residentStableReadbacks_ = 0u;
+    bool residentWorkingSetFastPath_ = false;
+    bool residentRefinementComplete_ = false;
+    bool residentRefinementDispatchSkipped_ = false;
     std::uint64_t refinementBankRecycleCount_ = 0;
     std::uint64_t refinementForcedBankRecycleCount_ = 0;
     std::array<std::uint32_t, RefinementBankCount> latestRefinementBankUsed_{};
