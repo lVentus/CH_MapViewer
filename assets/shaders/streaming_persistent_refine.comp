@@ -129,13 +129,13 @@ uint rootRoadType(RootRecord root) {
 
 uint packedRoadType(uint slot, uint local) {
     uint wordsPerSlot = (uBlockRecordCount + 3u) >> 2u;
-    uint packed = roadTypeWords[slot * wordsPerSlot + (local >> 2u)];
-    return (packed >> ((local & 3u) * 8u)) & 0x3fu;
+    uint packedWord = roadTypeWords[slot * wordsPerSlot + (local >> 2u)];
+    return (packedWord >> ((local & 3u) * 8u)) & 0x3fu;
 }
 
 uint cachedRoadType(uint recordIndex) {
-    uint packed = cachedRoadTypeWords[recordIndex >> 2u];
-    return (packed >> ((recordIndex & 3u) * 8u)) & 0x3fu;
+    uint packedWord = cachedRoadTypeWords[recordIndex >> 2u];
+    return (packedWord >> ((recordIndex & 3u) * 8u)) & 0x3fu;
 }
 
 void storeCachedRoadType(uint recordIndex, uint roadType) {

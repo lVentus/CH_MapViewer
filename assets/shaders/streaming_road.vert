@@ -49,8 +49,8 @@ void main() {
     if ((item & CACHED_SEGMENT_BIT) != 0u) {
         uint segmentIndex = item & CACHED_SEGMENT_MASK;
         segment = cachedSegments[segmentIndex];
-        uint packed = cachedRoadTypeWords[segmentIndex >> 2u];
-        roadType = (packed >> ((segmentIndex & 3u) * 8u)) & 63u;
+        uint packedWord = cachedRoadTypeWords[segmentIndex >> 2u];
+        roadType = (packedWord >> ((segmentIndex & 3u) * 8u)) & 63u;
     } else {
         RootRecord root = roots[item];
         segment = root.segment;
