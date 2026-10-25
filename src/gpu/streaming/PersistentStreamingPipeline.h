@@ -128,6 +128,8 @@ struct PersistentStreamingStats {
     std::uint64_t incrementalBackingBytesUploaded = 0;
     double lastRootUploadMs = 0.0;
     double lastBackingUploadMs = 0.0;
+    double totalRootUploadMs = 0.0;
+    double totalBackingUploadMs = 0.0;
     double gpuFilterCullMs = 0.0;
     double gpuRefinementMs = 0.0;
     double gpuComposeMs = 0.0;

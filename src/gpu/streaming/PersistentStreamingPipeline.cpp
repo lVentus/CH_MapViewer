@@ -847,6 +847,7 @@ bool PersistentStreamingPipeline::UploadRootPage(
     stats_.lastRootUploadMs = std::chrono::duration<double, std::milli>(
                                   std::chrono::steady_clock::now() - begin)
                                   .count();
+    stats_.totalRootUploadMs += stats_.lastRootUploadMs;
     stats_.gpuRootPagesCached = static_cast<std::uint32_t>(rootPages_.size());
     return true;
 }
@@ -1105,6 +1106,7 @@ bool PersistentStreamingPipeline::UploadBackingBlock(
     stats_.lastBackingUploadMs = std::chrono::duration<double, std::milli>(
                                      std::chrono::steady_clock::now() - begin)
                                      .count();
+    stats_.totalBackingUploadMs += stats_.lastBackingUploadMs;
     stats_.gpuBackingBlocksResident = static_cast<std::uint32_t>(backingBlockToSlot_.size());
     return true;
 }

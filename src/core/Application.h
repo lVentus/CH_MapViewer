@@ -1,6 +1,7 @@
 #pragma once
 
 #include "benchmark/CorrectnessValidator.h"
+#include "benchmark/StreamingBenchmarkLogger.h"
 #include "core/Window.h"
 #include "data/AsyncDatasetLoader.h"
 #include "data/DatasetCatalog.h"
@@ -69,6 +70,7 @@ private:
     ui::DebugUI debugUI_;
     data::DatasetCatalog datasetCatalog_;
     data::AsyncDatasetLoader datasetLoader_;
+    benchmark::StreamingBenchmarkLogger streamingBenchmarkLogger_;
     std::unique_ptr<data::CHGraph> graph_;
     std::unique_ptr<streaming::runtime::GraphPageStreamer> pageStreamer_;
     renderer::RoadDrawData cpuDrawData_;

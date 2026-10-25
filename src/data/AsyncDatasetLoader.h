@@ -4,11 +4,14 @@
 #include "streaming/index/CHIndex.h"
 
 #include <atomic>
+#include <cstddef>
 #include <filesystem>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace chmv::data {
 
@@ -16,6 +19,10 @@ struct StreamingDataset {
     std::filesystem::path graphPath;
     std::filesystem::path rangesPath;
     streaming::index::CHIndexData index;
+    // When system RAM is large enough, the entire .chbin is read once by the background loader.
+    // GraphPageStreamer then serves every root/backing miss from this immutable RAM image and
+    // performs only RAM -> GPU residency streaming. Empty means SSD-backed Virtual Map.
+    std::shared_ptr<const std::vector<std::byte>> runtimeResidentImage;
 };
 
 enum class DatasetLoadPhase {
@@ -36,6 +43,7 @@ enum class DatasetLoadPhase {
     PreparingRangeIndex,
     PreparingGeometryErrors,
     PreparingRoadStyleMetadata,
+    PreloadingRuntimeBinary,
     PreprocessedForStreaming,
     Ready,
     Failed,

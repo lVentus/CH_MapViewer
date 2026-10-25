@@ -124,6 +124,8 @@ const char* DatasetLoadPhaseName(data::DatasetLoadPhase phase) {
         return "Preparing geometry errors";
     case data::DatasetLoadPhase::PreparingRoadStyleMetadata:
         return "Preparing road-type style metadata";
+    case data::DatasetLoadPhase::PreloadingRuntimeBinary:
+        return "Loading full binary dataset into RAM";
     case data::DatasetLoadPhase::PreprocessedForStreaming:
         return "Preprocess ready for out-of-core runtime";
     case data::DatasetLoadPhase::Ready:
@@ -888,7 +890,7 @@ DebugUIActions DebugUI::Draw(
 
     ImGui::Checkbox("Out-of-core GPU runtime", &streamDataset_);
     ImGui::TextDisabled(
-        "Enabled: use preprocessed .chidx pages. Disabled: whole-resident CHGraph for CPU/validation.");
+        "OFF: full binary graph resident in RAM + GPU, no runtime streaming. ON: Virtual Map; prefers RAM-backed streaming when .chbin fits RAM, otherwise SSD-backed.");
 
     if (datasetLoad.Active()) {
         const auto* phaseName = DatasetLoadPhaseName(datasetLoad.phase);
@@ -1277,6 +1279,23 @@ DebugUIActions DebugUI::Draw(
         }
         if (!oocTelemetryDeleteMessage_.empty()) {
             ImGui::TextDisabled("%s", oocTelemetryDeleteMessage_.c_str());
+        }
+
+        if (streamingStats->runtimeDataFullyResident) {
+            ImGui::TextColored(ImVec4(0.35f, 0.90f, 0.45f, 1.0f),
+                               "Virtual-map source: RAM-backed (.chbin fully resident; runtime SSD reads disabled)");
+        } else if (streamingStats->runtimeDataPreloadActive) {
+            ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.20f, 1.0f),
+                               "Virtual-map source: preloading .chbin into RAM");
+        } else {
+            ImGui::TextUnformatted("Virtual-map source: SSD-backed");
+        }
+        if (streamingStats->runtimeDataFileBytes != 0u) {
+            ImGui::Text("Runtime binary RAM resident / file: %.2f / %.2f MiB",
+                        static_cast<double>(streamingStats->runtimeDataResidentBytes) /
+                            (1024.0 * 1024.0),
+                        static_cast<double>(streamingStats->runtimeDataFileBytes) /
+                            (1024.0 * 1024.0));
         }
 
         ImGui::SeparatorText("Out-of-core cache budgets");

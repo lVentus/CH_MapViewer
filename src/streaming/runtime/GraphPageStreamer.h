@@ -267,15 +267,18 @@ struct GraphPageStreamingStats {
     // silently overcommit system memory. Zero for dedicated GPUs.
     std::uint64_t sharedGpuReservationBytes = 0;
     double lastPageLoadMs = 0.0;
+    double totalPageLoadMs = 0.0;
     double meanPageLoadMs = 0.0;
     double maxPageLoadMs = 0.0;
     double lastRootPlannerMs = 0.0;
+    double totalRootPlannerMs = 0.0;
     std::uint64_t rootPlannerRebuilds = 0;
     std::uint64_t rootPlannerCacheReuses = 0;
     std::uint32_t rootPlannerAliveCandidates = 0;
     std::uint32_t rootPlannerSpatialCandidates = 0;
     bool rootPlannerUsedLodFirst = false;
     double lastRefinementBlockLoadMs = 0.0;
+    double totalRefinementBlockLoadMs = 0.0;
     double meanRefinementBlockLoadMs = 0.0;
     double lastGpuWorkingSetBuildMs = 0.0;
     std::uint32_t gpuWorkingSetEdgeCount = 0;
@@ -339,6 +342,8 @@ struct GraphPageStreamingStats {
     std::uint64_t gpuIncrementalBackingBytesUploaded = 0;
     double lastGpuRootUploadMs = 0.0;
     double lastGpuBackingUploadMs = 0.0;
+    double totalGpuRootUploadMs = 0.0;
+    double totalGpuBackingUploadMs = 0.0;
     double gpuFilterCullMs = 0.0;
     double gpuRefinementMs = 0.0;
     double gpuComposeMs = 0.0;
@@ -353,7 +358,8 @@ public:
     GraphPageStreamer(index::CHIndexData index,
                       std::filesystem::path graphPath,
                       std::filesystem::path rangesPath,
-                      GraphPageStreamerConfig config = {});
+                      GraphPageStreamerConfig config = {},
+                      std::shared_ptr<const std::vector<std::byte>> runtimeResidentImage = {});
     ~GraphPageStreamer();
 
     GraphPageStreamer(const GraphPageStreamer&) = delete;
@@ -696,6 +702,7 @@ private:
     double lastPageLoadMs_ = 0.0;
     double maxPageLoadMs_ = 0.0;
     mutable std::atomic<double> lastRootPlannerMs_{0.0};
+    mutable std::atomic<double> totalRootPlannerMs_{0.0};
     mutable std::atomic<std::uint64_t> rootPlannerRebuilds_{0};
     mutable std::atomic<std::uint64_t> rootPlannerCacheReuses_{0};
     double totalRefinementBlockLoadMs_ = 0.0;

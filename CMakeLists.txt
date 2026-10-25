@@ -80,6 +80,7 @@ if(CHMV_BUILD_APP)
         src/gpu/streaming/RefinementRequestCollector.cpp
         src/gpu/streaming/PersistentStreamingPipeline.cpp
         src/benchmark/GPUTimer.cpp
+        src/benchmark/StreamingBenchmarkLogger.cpp
         src/gpu/unfolding/UnfoldingStrategyManager.cpp
         src/gpu/unfolding/NoUnfoldingStrategy.cpp
         src/gpu/unfolding/IterativeDFSUnfoldingStrategy.cpp

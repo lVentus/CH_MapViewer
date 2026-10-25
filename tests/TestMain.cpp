@@ -155,22 +155,24 @@ void TestAsyncDatasetLoader() {
     Require(loader.Start(graphPath, rangePath), "async loader did not start");
 
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-    while (loader.Snapshot().phase != chmv::data::DatasetLoadPhase::PreprocessedForStreaming &&
+    while (loader.Snapshot().phase != chmv::data::DatasetLoadPhase::Ready &&
            loader.Snapshot().phase != chmv::data::DatasetLoadPhase::Failed &&
            std::chrono::steady_clock::now() < deadline) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 
     const auto snapshot = loader.Snapshot();
-    Require(snapshot.phase == chmv::data::DatasetLoadPhase::PreprocessedForStreaming,
-            "async loader did not select the v8 binary virtual-map runtime");
+    Require(snapshot.phase == chmv::data::DatasetLoadPhase::Ready,
+            "out-of-core OFF did not produce a full-resident binary graph");
     Require(snapshot.progress == 1.0f, "async loader progress did not reach 100 percent");
 
-    auto binaryDataset = loader.TakeStreamingCompleted();
-    Require(binaryDataset.has_value(), "async loader binary runtime result missing");
-    Require(binaryDataset->index.nodeCount == 2 && binaryDataset->index.edgeCount == 1 &&
-                binaryDataset->index.HasRuntimeBinary(),
-            "async loader binary runtime index mismatch");
+    auto fullResidentGraph = loader.TakeCompleted();
+    Require(fullResidentGraph.has_value(), "full-resident binary graph result missing");
+    Require(fullResidentGraph->NodeCount() == 2 && fullResidentGraph->EdgeCount() == 1,
+            "full-resident binary graph count mismatch");
+    Require(fullResidentGraph->Ranges()[0].birthLevel == 1 &&
+                fullResidentGraph->Ranges()[0].deathLevel == 0,
+            "full-resident binary range mismatch");
     Require(chmv::streaming::preprocess::DatasetPreprocessor::HasValidPreprocess(graphPath, rangePath),
             "async loader should create and validate Preprocess automatically");
 

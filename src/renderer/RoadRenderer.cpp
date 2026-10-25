@@ -61,7 +61,7 @@ void CheckBufferSize(std::size_t sizeBytes) {
     glGetInteger64v(GL_MAX_SHADER_STORAGE_BLOCK_SIZE, &maxBlockSize);
     if (sizeBytes > static_cast<std::size_t>(maxBlockSize)) {
         throw std::runtime_error(
-            "dataset exceeds the maximum SSBO size of this GPU; streaming is not implemented yet");
+            "full-resident buffer exceeds GL_MAX_SHADER_STORAGE_BLOCK_SIZE; enable out-of-core mode");
     }
 }
 

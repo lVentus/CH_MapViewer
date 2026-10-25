@@ -8,6 +8,7 @@
 #include "gpu/unfolding/NoUnfoldingStrategy.h"
 
 #include <algorithm>
+#include <glad/gl.h>
 #include <array>
 #include <chrono>
 #include <cmath>
@@ -78,7 +79,13 @@ void Application::LoadDataset(const std::filesystem::path& graphPath,
     const bool started = streaming ? datasetLoader_.StartStreaming(graphPath, rangesPath)
                                    : datasetLoader_.Start(graphPath, rangesPath);
     if (started) {
+        streamingBenchmarkLogger_.Start(
+            graphPath, streaming ? "out_of_core" : "full_resident");
         std::cout << "Loading " << graphPath << " in background\n";
+        if (!streamingBenchmarkLogger_.Path().empty()) {
+            std::cout << "Automatic benchmark log: "
+                      << streamingBenchmarkLogger_.Path() << '\n';
+        }
     }
 }
 
@@ -120,11 +127,33 @@ void Application::InstallDataset(data::CHGraph graph) {
     lastStreamingRefinementMode_ = geometry::RefinementMode::None;
     gStreamingRefinementInteractionHoldSeconds = 0.0f;
     graph_ = std::make_unique<data::CHGraph>(std::move(graph));
-    roadRenderer_.SetGraph(*graph_);
-    gpuPipeline_.SetGraph(roadRenderer_.EdgeCount(),
-                          static_cast<std::uint32_t>(graph_->DrawableEdgeCount()));
-    rangeFilterStrategyManager_.SetGraph(*graph_);
+    const auto installBegin = std::chrono::steady_clock::now();
+    const auto gpuUploadBegin = installBegin;
+    try {
+        roadRenderer_.SetGraph(*graph_);
+        gpuPipeline_.SetGraph(roadRenderer_.EdgeCount(),
+                              static_cast<std::uint32_t>(graph_->DrawableEdgeCount()));
+        rangeFilterStrategyManager_.SetGraph(*graph_);
+        // Out-of-core OFF is a strict baseline. Complete all one-time GPU uploads before the
+        // dataset is reported ready so the first rendered frame contains no hidden streaming.
+        glFinish();
+    } catch (const std::exception& error) {
+        throw std::runtime_error(
+            std::string("Out-of-core OFF requires the complete graph to fit GPU resident "
+                        "buffers. Enable out-of-core mode for this dataset. GPU install error: ") +
+            error.what());
+    }
+    const auto gpuUploadMs = std::chrono::duration<double, std::milli>(
+                                 std::chrono::steady_clock::now() - gpuUploadBegin)
+                                 .count();
     cpuPipeline_.SetGraph(*graph_);
+    const auto installMs = std::chrono::duration<double, std::milli>(
+                               std::chrono::steady_clock::now() - installBegin)
+                               .count();
+    streamingBenchmarkLogger_.RecordFullResidentInstall(
+        graph_->NodeCount(), graph_->EdgeCount(), gpuUploadMs, installMs);
+    std::cout << "Full-resident GPU install complete: " << gpuUploadMs
+              << " ms; no runtime streaming is active.\n";
     cpuDrawData_ = {};
     lodController_.SetLevelRange(roadRenderer_.MinLevel(), roadRenderer_.MaxLevel());
     lodController_.SetManualLevel(roadRenderer_.MaxLevel());
@@ -220,7 +249,7 @@ void Application::InstallStreamingDataset(data::StreamingDataset dataset) {
 
     pageStreamer_ = std::make_unique<streaming::runtime::GraphPageStreamer>(
         std::move(dataset.index), std::move(dataset.graphPath), std::move(dataset.rangesPath),
-        streamerConfig);
+        streamerConfig, std::move(dataset.runtimeResidentImage));
 
     gpu::streaming::PersistentStreamingConfig gpuStreamingConfig;
     gpuStreamingConfig.gpuBudgetBytes = requestedGpuBudget;
@@ -885,6 +914,7 @@ int Application::Run() {
         std::optional<pipeline::CPUProcessingResult> cpuResult;
         std::int32_t lodLevel = 0;
         geometry::RefinementParameters gpuRefinement;
+        benchmark::StreamingFrameTiming streamingTiming;
 
         const bool streamingRuntime = pageStreamer_ != nullptr;
         if (graph_ || streamingRuntime) {
@@ -894,7 +924,12 @@ int Application::Run() {
                 roadStyleConfig_.enabled ? kRoadStyleNeutralTint : kDefaultRoadColor;
 
             if (streamingRuntime) {
+                const auto begin = std::chrono::steady_clock::now();
                 UpdateStreamingRuntime(width, height, continuousLod, deltaSeconds);
+                streamingTiming.updateStreamingCpuMs =
+                    std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - begin)
+                        .count();
             }
             const auto screenPixelScale =
                 camera_.ViewScale() * static_cast<float>(height) * 0.5f;
@@ -942,14 +977,29 @@ int Application::Run() {
                 const auto displayLod = streamingDisplayLodFloat_ >= 0.0f
                                             ? streamingDisplayLodFloat_
                                             : static_cast<float>(lodLevel);
-                persistentStreamingPipeline_.Process(
-                    displayLod, filterKind, streamingRefinement, BuildRefinementGuardWindow(),
-                    gStreamingRefinementInteractionHoldSeconds > 0.0f);
+                {
+                    const auto begin = std::chrono::steady_clock::now();
+                    persistentStreamingPipeline_.Process(
+                        displayLod, filterKind, streamingRefinement, BuildRefinementGuardWindow(),
+                        gStreamingRefinementInteractionHoldSeconds > 0.0f);
+                    streamingTiming.gpuProcessSubmitCpuMs =
+                        std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - begin)
+                            .count();
+                }
                 // Poll the asynchronous GPU readback ring without stalling. A fresh result
                 // replaces the CPU backing working set, including when it is empty; a not-yet-ready
                 // readback leaves the previous work alone. This prevents old camera generations
                 // from accumulating tens of thousands of queued refinement blocks.
-                auto missingBlocks = persistentStreamingPipeline_.ReadMissingBackingBlocks();
+                std::vector<std::uint32_t> missingBlocks;
+                {
+                    const auto begin = std::chrono::steady_clock::now();
+                    missingBlocks = persistentStreamingPipeline_.ReadMissingBackingBlocks();
+                    streamingTiming.gpuFaultReadbackCpuMs =
+                        std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - begin)
+                            .count();
+                }
                 if (persistentStreamingPipeline_.LastBackingReadbackWasFresh()) {
                     // GPU backing capacity is the natural admission window: queuing more blocks
                     // than can physically reside cannot make traversal complete sooner and was the
@@ -973,7 +1023,15 @@ int Application::Run() {
                     }
                     pageStreamer_->SetBackingBlockDemand(missingBlocks);
                 }
-                persistentStreamingPipeline_.Draw(camera_, width, height, normalRoadTint, roadStyleConfig_);
+                {
+                    const auto begin = std::chrono::steady_clock::now();
+                    persistentStreamingPipeline_.Draw(
+                        camera_, width, height, normalRoadTint, roadStyleConfig_);
+                    streamingTiming.drawSubmitCpuMs =
+                        std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - begin)
+                            .count();
+                }
             } else {
                 switch (processingMode_) {
                 case pipeline::ProcessingMode::GPUDriven:
@@ -1132,9 +1190,15 @@ int Application::Run() {
                 persistent.incrementalBackingBytesUploaded;
             streamingStats->lastGpuRootUploadMs = persistent.lastRootUploadMs;
             streamingStats->lastGpuBackingUploadMs = persistent.lastBackingUploadMs;
+            streamingStats->totalGpuRootUploadMs = persistent.totalRootUploadMs;
+            streamingStats->totalGpuBackingUploadMs = persistent.totalBackingUploadMs;
             streamingStats->gpuFilterCullMs = persistent.gpuFilterCullMs;
             streamingStats->gpuRefinementMs = persistent.gpuRefinementMs;
             streamingStats->gpuComposeMs = persistent.gpuComposeMs;
+        }
+        if (streamingStats) {
+            streamingBenchmarkLogger_.ObserveStreamingFrame(
+                streamingLastConsumedViewSequence_, *streamingStats, streamingTiming);
         }
         const auto datasetLoad = datasetLoader_.Snapshot();
         const auto actions = debugUI_.Draw(

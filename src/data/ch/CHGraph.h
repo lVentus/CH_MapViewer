@@ -45,6 +45,7 @@ public:
     [[nodiscard]] const EdgeRange& Range(std::uint32_t edgeId) const;
     [[nodiscard]] const OrderedRangeIndex& OrderedRanges() const;
     [[nodiscard]] const CHProjection& Projection() const;
+    void SetProjection(CHProjection projection) { projection_ = projection; }
 
     [[nodiscard]] std::size_t NodeCount() const { return nodes_.size(); }
     [[nodiscard]] std::size_t EdgeCount() const { return edges_.size(); }

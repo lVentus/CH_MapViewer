@@ -6,11 +6,16 @@
 #include "streaming/preprocess/DatasetPreprocessor.h"
 #include "streaming/index/CHIndex.h"
 #include "streaming/runtime/GraphPageStreamer.h"
+#include "streaming/runtime/RuntimeData.h"
 #include "streaming/analysis/TextSourceScanner.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cmath>
 #include <exception>
 #include <fstream>
+#include <functional>
+#include <new>
 #include <iostream>
 #include <limits>
 #include <stdexcept>
@@ -92,12 +97,187 @@ bool CanWholeLoadGraph(std::uint64_t nodeCount, std::uint64_t edgeCount) {
     if (memory.availablePhysicalBytes == 0) {
         return true;
     }
-    // CHGraph, ordered ranges, geometry-error preprocessing and temporary vectors
-    // overlap during the legacy whole-resident path. Stay conservative here; a
-    // dataset rejected by this gate remains successfully preprocessed for Phase-2
-    // out-of-core runtime instead of risking an OOM after preprocessing.
+    // Full-resident mode materializes CHGraph plus the temporary GPU upload arrays.
+    // Refuse explicitly instead of silently switching to out-of-core: OFF must remain
+    // a trustworthy no-streaming baseline.
     const auto estimatedBytes = nodeCount * 48ull + edgeCount * 80ull + (256ull << 20u);
     return estimatedBytes < memory.availablePhysicalBytes / 2u;
+}
+
+data::CHProjection RuntimeProjectionFromIndex(const streaming::index::CHIndexData& index) {
+    constexpr double kPi = 3.14159265358979323846;
+    data::CHProjection projection;
+    projection.centerLatitude = (index.minLatitude + index.maxLatitude) * 0.5;
+    projection.centerLongitude = (index.minLongitude + index.maxLongitude) * 0.5;
+    projection.longitudeScale = std::cos(projection.centerLatitude * kPi / 180.0);
+    const auto halfWidth = std::max(
+        (index.maxLongitude - index.minLongitude) * 0.5 * projection.longitudeScale, 1e-12);
+    const auto halfHeight =
+        std::max((index.maxLatitude - index.minLatitude) * 0.5, 1e-12);
+    projection.normalization = 0.95 / std::max(halfWidth, halfHeight);
+    return projection;
+}
+
+template <typename ProgressFn>
+data::CHGraph LoadWholeGraphFromRuntimeBinary(
+    const std::filesystem::path& runtimePath,
+    const streaming::index::CHIndexData& index,
+    ProgressFn&& progress) {
+    using streaming::runtime::RuntimeData;
+    using streaming::runtime::RuntimeEdgeRecord;
+    using streaming::runtime::RuntimeNodeRecord;
+
+    const auto header = RuntimeData::ReadHeader(runtimePath);
+    if (header.nodeCount != index.nodeCount || header.edgeCount != index.edgeCount) {
+        throw std::runtime_error("runtime binary/index count mismatch in full-resident load");
+    }
+    if (header.nodeCount > std::numeric_limits<std::size_t>::max() ||
+        header.edgeCount > std::numeric_limits<std::size_t>::max()) {
+        throw std::runtime_error("runtime binary exceeds host addressable vector size");
+    }
+
+    const auto begin = std::chrono::steady_clock::now();
+    std::ifstream input(runtimePath, std::ios::binary);
+    if (!input) {
+        throw std::runtime_error("could not open runtime binary for full-resident load: " +
+                                 runtimePath.string());
+    }
+
+    data::CHGraph graph;
+    auto& nodes = graph.Nodes();
+    auto& edges = graph.Edges();
+    auto& ranges = graph.Ranges();
+    nodes.resize(static_cast<std::size_t>(header.nodeCount));
+    edges.resize(static_cast<std::size_t>(header.edgeCount));
+    ranges.resize(static_cast<std::size_t>(header.edgeCount));
+
+    const auto projection = RuntimeProjectionFromIndex(index);
+    constexpr std::size_t kNodeChunk = 1u << 20u;
+    std::vector<RuntimeNodeRecord> nodeRecords(kNodeChunk);
+    for (std::uint64_t first = 0; first < header.nodeCount; first += kNodeChunk) {
+        const auto count = static_cast<std::size_t>(
+            std::min<std::uint64_t>(kNodeChunk, header.nodeCount - first));
+        RuntimeData::ReadRecords(
+            input, header.nodeSectionOffset + first * sizeof(RuntimeNodeRecord),
+            std::span<RuntimeNodeRecord>(nodeRecords.data(), count));
+        for (std::size_t i = 0; i < count; ++i) {
+            const auto& src = nodeRecords[i];
+            auto& dst = nodes[static_cast<std::size_t>(first) + i];
+            dst.latitude = static_cast<double>(src.y) / projection.normalization +
+                           projection.centerLatitude;
+            const auto lonScale = projection.longitudeScale * projection.normalization;
+            dst.longitude = std::abs(lonScale) > 1e-15
+                                ? static_cast<double>(src.x) / lonScale +
+                                      projection.centerLongitude
+                                : projection.centerLongitude;
+        }
+        progress(DatasetLoadPhase::ReadingNodes, first + count, header.nodeCount);
+    }
+
+    constexpr std::size_t kEdgeChunk = 1u << 19u;
+    std::vector<RuntimeEdgeRecord> edgeRecords(kEdgeChunk);
+    for (std::uint64_t first = 0; first < header.edgeCount; first += kEdgeChunk) {
+        const auto count = static_cast<std::size_t>(
+            std::min<std::uint64_t>(kEdgeChunk, header.edgeCount - first));
+        RuntimeData::ReadRecords(
+            input, header.edgeSectionOffset + first * sizeof(RuntimeEdgeRecord),
+            std::span<RuntimeEdgeRecord>(edgeRecords.data(), count));
+        for (std::size_t i = 0; i < count; ++i) {
+            const auto& src = edgeRecords[i];
+            const auto id = static_cast<std::size_t>(first) + i;
+            edges[id] = {
+                src.source, src.target, src.weight, static_cast<std::int32_t>(src.type),
+                static_cast<std::int32_t>(src.maxSpeed), src.childA, src.childB,
+                src.geometryError,
+            };
+            ranges[id] = {
+                static_cast<std::int32_t>(src.birthLevel),
+                static_cast<std::int32_t>(src.deathLevel),
+            };
+        }
+        progress(DatasetLoadPhase::ReadingEdges, first + count, header.edgeCount);
+    }
+
+    // Preserve exactly the projection used to produce RuntimeNodeRecord. This avoids rebuilding
+    // it from float-rounded coordinates when RoadRenderer uploads the whole graph.
+    graph.SetProjection(projection);
+    const auto elapsedMs = std::chrono::duration<double, std::milli>(
+                               std::chrono::steady_clock::now() - begin)
+                               .count();
+    const auto payloadMiB = static_cast<double>(
+        header.nodeCount * sizeof(RuntimeNodeRecord) +
+        header.edgeCount * sizeof(RuntimeEdgeRecord)) / (1024.0 * 1024.0);
+    std::cout << "Full-resident binary load: " << payloadMiB << " MiB in "
+              << elapsedMs << " ms ("
+              << (elapsedMs > 0.0 ? payloadMiB / (elapsedMs / 1000.0) : 0.0)
+              << " MiB/s, no text parsing)\n";
+    return graph;
+}
+
+std::shared_ptr<const std::vector<std::byte>> TryPreloadRuntimeBinary(
+    const std::filesystem::path& runtimePath,
+    const streaming::index::CHIndexData& index,
+    const std::function<void(std::uint64_t, std::uint64_t)>& progress) {
+    if (!index.HasRuntimeBinary() || index.runtimeDataFileBytes == 0u) {
+        return {};
+    }
+    const auto memory = streaming::runtime::QuerySystemMemoryInfo();
+    if (memory.availablePhysicalBytes == 0u) {
+        return {};
+    }
+    constexpr std::uint64_t kGiB = 1024ull * 1024ull * 1024ull;
+    const auto reserve = std::max<std::uint64_t>(6ull * kGiB, memory.totalPhysicalBytes / 5u);
+    // A full RAM image replaces runtime SSD reads; do not require room for the *maximum* normal
+    // page-cache recommendation before allowing it. After the image is allocated, the streamer
+    // sizes its decoded/page cache from the remaining physical memory. Requiring only a modest
+    // working-cache floor here lets machines with enough RAM for the world graph actually select
+    // RAM-backed OOC instead of needlessly falling back to SSD-backed streaming.
+    constexpr std::uint64_t kMinimumWorkingCache = 1ull * kGiB;
+    if (index.runtimeDataFileBytes + kMinimumWorkingCache + reserve >=
+        memory.availablePhysicalBytes) {
+        const auto needGiB = static_cast<double>(index.runtimeDataFileBytes +
+                                                  kMinimumWorkingCache + reserve) /
+                             static_cast<double>(kGiB);
+        const auto availableGiB = static_cast<double>(memory.availablePhysicalBytes) /
+                                  static_cast<double>(kGiB);
+        std::cout << "RAM-backed Virtual Map not selected: needs about " << needGiB
+                  << " GiB including safety/cache reserve, available " << availableGiB
+                  << " GiB; using SSD-backed Virtual Map.\n";
+        return {};
+    }
+
+    try {
+        const auto begin = std::chrono::steady_clock::now();
+        auto image = std::make_shared<std::vector<std::byte>>(
+            static_cast<std::size_t>(index.runtimeDataFileBytes));
+        std::ifstream input(runtimePath, std::ios::binary);
+        if (!input) {
+            return {};
+        }
+        constexpr std::size_t kChunkBytes = 64u << 20u;
+        std::size_t offset = 0u;
+        while (offset < image->size()) {
+            const auto count = std::min(kChunkBytes, image->size() - offset);
+            input.read(reinterpret_cast<char*>(image->data() + offset),
+                       static_cast<std::streamsize>(count));
+            if (!input) {
+                return {};
+            }
+            offset += count;
+            progress(offset, image->size());
+        }
+        const auto ms = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - begin)
+                            .count();
+        const auto mib = static_cast<double>(image->size()) / (1024.0 * 1024.0);
+        std::cout << "RAM-backed Virtual Map: preloaded " << mib << " MiB .chbin in "
+                  << ms << " ms ("
+                  << (ms > 0.0 ? mib / (ms / 1000.0) : 0.0) << " MiB/s).\n";
+        return image;
+    } catch (const std::bad_alloc&) {
+        std::cout << "RAM-backed preload allocation failed; using SSD-backed Virtual Map.\n";
+        return {};
+    }
 }
 
 using streaming::analysis::detail::TextSourceScanner;
@@ -310,24 +490,84 @@ bool AsyncDatasetLoader::StartInternal(const std::filesystem::path& graphPath,
                         progress_.store(Fraction(current, total));
                     });
             }
-            // v8+ has one authoritative binary runtime path. Even when the user did not request
-            // classic out-of-core mode, keep the virtual-map renderer and let GraphPageStreamer
-            // decide whether .chbin is entirely RAM-resident or backed by the SSD. This avoids
-            // falling back to the legacy multi-billion-token .sch/.ranges parser on high-RAM hosts.
-            if (preprocessedIndex.HasRuntimeBinary() || streamingOnly ||
-                !CanWholeLoadGraph(preprocessedIndex.nodeCount, preprocessedIndex.edgeCount)) {
+            if (streamingOnly) {
+                std::shared_ptr<const std::vector<std::byte>> runtimeResidentImage;
+                if (preprocessedIndex.HasRuntimeBinary()) {
+                    phase_.store(DatasetLoadPhase::PreloadingRuntimeBinary);
+                    runtimeResidentImage = TryPreloadRuntimeBinary(
+                        preprocessedPaths.runtimeDataPath, preprocessedIndex,
+                        [this, stopToken](std::uint64_t current, std::uint64_t total) {
+                            if (stopToken.stop_requested()) {
+                                throw LoadCancelled{};
+                            }
+                            progress_.store(0.95f + 0.05f * Fraction(current, total));
+                        });
+                }
                 {
                     std::lock_guard lock(mutex_);
                     completedStreamingDataset_ = StreamingDataset{
                         preprocessedPaths.graphPath,
                         preprocessedPaths.rangesPath,
                         std::move(preprocessedIndex),
+                        std::move(runtimeResidentImage),
                     };
                 }
-                std::cout << "Preprocessed dataset is ready for the binary virtual-map runtime.\n";
+                std::cout << "Out-of-core ON: binary virtual-map runtime selected.\n";
                 progress_.store(1.0f);
                 phase_.store(DatasetLoadPhase::PreprocessedForStreaming);
                 return;
+            }
+
+            // Out-of-core OFF is an explicit baseline: everything must become host-resident and
+            // then GPU-resident. Never silently fall back to Virtual Map, otherwise OFF and ON are
+            // not comparable benchmarks. v8+ loads the binary runtime directly (no ASCII parse).
+            if (preprocessedIndex.HasRuntimeBinary()) {
+                if (!CanWholeLoadGraph(preprocessedIndex.nodeCount, preprocessedIndex.edgeCount)) {
+                    throw std::runtime_error(
+                        "Out-of-core is OFF, but the full graph does not fit the safe host-RAM "
+                        "budget. Enable out-of-core mode for this dataset.");
+                }
+                const auto runtimePath = preprocessedPaths.runtimeDataPath;
+                auto graph = LoadWholeGraphFromRuntimeBinary(
+                    runtimePath, preprocessedIndex,
+                    [this, stopToken](DatasetLoadPhase stage, std::uint64_t current,
+                                      std::uint64_t total) {
+                        if (stopToken.stop_requested()) {
+                            throw LoadCancelled{};
+                        }
+                        phase_.store(stage);
+                        const auto base = stage == DatasetLoadPhase::ReadingNodes ? 0.0f : 0.35f;
+                        const auto scale = stage == DatasetLoadPhase::ReadingNodes ? 0.35f : 0.55f;
+                        progress_.store(base + scale * Fraction(current, total));
+                    });
+                if (stopToken.stop_requested()) {
+                    throw LoadCancelled{};
+                }
+                phase_.store(DatasetLoadPhase::PreparingRangeIndex);
+                progress_.store(0.92f);
+                const auto rangeBegin = std::chrono::steady_clock::now();
+                (void)graph.OrderedRanges();
+                const auto rangeMs = std::chrono::duration<double, std::milli>(
+                                         std::chrono::steady_clock::now() - rangeBegin)
+                                         .count();
+                std::cout << "Full-resident range index: " << rangeMs << " ms\n";
+                progress_.store(0.99f);
+                {
+                    std::lock_guard lock(mutex_);
+                    completedGraph_ = std::move(graph);
+                }
+                progress_.store(1.0f);
+                phase_.store(DatasetLoadPhase::Ready);
+                std::cout << "Out-of-core OFF: full binary graph is resident in RAM; GPU upload "
+                             "will be performed as one no-streaming install.\n";
+                return;
+            }
+
+            // Legacy pre-v8 fallback only. New preprocess results never take this text path.
+            if (!CanWholeLoadGraph(preprocessedIndex.nodeCount, preprocessedIndex.edgeCount)) {
+                throw std::runtime_error(
+                    "Out-of-core is OFF, but the legacy graph does not fit the safe host-RAM "
+                    "budget. Enable out-of-core mode.");
             }
 
             const float loadBase = preprocessedNow ? 0.80f : 0.0f;

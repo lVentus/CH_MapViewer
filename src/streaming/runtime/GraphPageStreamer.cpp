@@ -252,10 +252,10 @@ std::uint64_t RecommendGraphPageCacheBudget(const SystemMemoryInfo& memory) {
     return std::clamp<std::uint64_t>(afterReserve * 3u / 5u, 512ull * kMiB, 15ull * kGiB);
 }
 
-GraphPageStreamer::GraphPageStreamer(index::CHIndexData index,
-                                     std::filesystem::path graphPath,
-                                     std::filesystem::path rangesPath,
-                                     GraphPageStreamerConfig config)
+GraphPageStreamer::GraphPageStreamer(
+    index::CHIndexData index, std::filesystem::path graphPath,
+    std::filesystem::path rangesPath, GraphPageStreamerConfig config,
+    std::shared_ptr<const std::vector<std::byte>> runtimeResidentImage)
     : index_(std::move(index)),
       graphPath_(std::move(graphPath)),
       rangesPath_(std::move(rangesPath)),
@@ -287,7 +287,12 @@ GraphPageStreamer::GraphPageStreamer(index::CHIndexData index,
             throw std::runtime_error("runtime binary does not match CHIDX v8");
         }
 
-        if (config_.preloadRuntimeDataWhenPossible) {
+        if (runtimeResidentImage &&
+            runtimeResidentImage->size() == static_cast<std::size_t>(index_.runtimeDataFileBytes)) {
+            runtimeResidentImage_.store(std::move(runtimeResidentImage), std::memory_order_release);
+            runtimeDataResidentBytes_.store(index_.runtimeDataFileBytes, std::memory_order_release);
+            runtimeDataPreloadEligible_ = true;
+        } else if (config_.preloadRuntimeDataWhenPossible) {
             const auto memory = QuerySystemMemoryInfo();
             const auto reserve = std::max<std::uint64_t>(6ull * kGiB,
                                                           memory.totalPhysicalBytes / 5u);
@@ -422,7 +427,8 @@ GraphPageStreamer::GraphPageStreamer(index::CHIndexData index,
         workers_.emplace_back([this](std::stop_token stopToken) { Worker(stopToken); });
     }
     plannerWorker_ = std::jthread([this](std::stop_token stopToken) { PlannerWorker(stopToken); });
-    if (runtimeDataPreloadEligible_) {
+    if (runtimeDataPreloadEligible_ &&
+        runtimeDataResidentBytes_.load(std::memory_order_acquire) == 0u) {
         runtimePreloadWorker_ = std::jthread(
             [this](std::stop_token stopToken) { PreloadRuntimeData(stopToken); });
     }
@@ -589,9 +595,11 @@ const GraphPageStreamer::PageQueryResult& GraphPageStreamer::QueryPages(
         queryCacheKey_ = cacheKey;
         queryCacheResult_ = std::move(result);
         ++queryCacheRevision_;
-        lastRootPlannerMs_ = std::chrono::duration<double, std::milli>(
-                                 std::chrono::steady_clock::now() - plannerBegin)
-                                 .count();
+        const auto plannerMs = std::chrono::duration<double, std::milli>(
+                                   std::chrono::steady_clock::now() - plannerBegin)
+                                   .count();
+        lastRootPlannerMs_.store(plannerMs, std::memory_order_relaxed);
+        totalRootPlannerMs_.fetch_add(plannerMs, std::memory_order_relaxed);
         return queryCacheResult_;
     }
 
@@ -1005,9 +1013,11 @@ const GraphPageStreamer::PageQueryResult& GraphPageStreamer::QueryPages(
     queryCacheKey_ = cacheKey;
     queryCacheResult_ = std::move(result);
     ++queryCacheRevision_;
-    lastRootPlannerMs_ = std::chrono::duration<double, std::milli>(
-                             std::chrono::steady_clock::now() - plannerBegin)
-                             .count();
+    const auto plannerMs = std::chrono::duration<double, std::milli>(
+                               std::chrono::steady_clock::now() - plannerBegin)
+                               .count();
+    lastRootPlannerMs_.store(plannerMs, std::memory_order_relaxed);
+    totalRootPlannerMs_.fetch_add(plannerMs, std::memory_order_relaxed);
     return queryCacheResult_;
 }
 
@@ -1469,17 +1479,20 @@ GraphPageStreamingStats GraphPageStreamer::Snapshot() const {
     }
     stats.peakCpuCacheBytes = peakCpuCacheBytes_.load(std::memory_order_relaxed);
     stats.lastPageLoadMs = lastPageLoadMs_;
+    stats.totalPageLoadMs = totalPageLoadMs_;
     stats.meanPageLoadMs = totalPageLoads_ == 0
                                ? 0.0
                                : totalPageLoadMs_ / static_cast<double>(totalPageLoads_);
     stats.maxPageLoadMs = maxPageLoadMs_;
     stats.lastRootPlannerMs = lastRootPlannerMs_;
+    stats.totalRootPlannerMs = totalRootPlannerMs_.load(std::memory_order_relaxed);
     stats.rootPlannerRebuilds = rootPlannerRebuilds_;
     stats.rootPlannerCacheReuses = rootPlannerCacheReuses_;
     stats.rootPlannerAliveCandidates = lastPlannerAliveCandidates_;
     stats.rootPlannerSpatialCandidates = lastPlannerSpatialCandidates_;
     stats.rootPlannerUsedLodFirst = lastPlannerUsedLodFirst_;
     stats.lastRefinementBlockLoadMs = lastRefinementBlockLoadMs_;
+    stats.totalRefinementBlockLoadMs = totalRefinementBlockLoadMs_;
     stats.meanRefinementBlockLoadMs = totalRefinementBlockLoads_ == 0
                                           ? 0.0
                                           : totalRefinementBlockLoadMs_ /
