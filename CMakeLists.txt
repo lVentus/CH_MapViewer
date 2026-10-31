@@ -36,6 +36,8 @@ add_library(chmv_data
     src/data/ch/CHLoader.cpp
     src/data/preprocessing/GeometryErrorPreprocessor.cpp
     src/pipeline/CPUReferencePipeline.cpp
+    src/renderer/LODController.cpp
+    src/renderer/MapCamera2D.cpp
     src/reference/CPURangeFilter.cpp
     src/reference/CPUReferenceUnfolder.cpp
     src/streaming/analysis/DatasetLayoutAnalyzer.cpp
@@ -43,6 +45,11 @@ add_library(chmv_data
     src/streaming/preprocess/DatasetPreprocessor.cpp
     src/streaming/preprocess/ExternalPreprocess.cpp
     src/streaming/index/CHIndex.cpp
+    src/streaming/lod/LodPageBuilder.cpp
+    src/streaming/lod/LodPageFile.cpp
+    src/streaming/lod/LodPagePlanner.cpp
+    src/streaming/lod/LodPageReader.cpp
+    src/streaming/lod/LodPageSource.cpp
     src/streaming/runtime/GraphPageStreamer.cpp
     src/streaming/runtime/RuntimeData.cpp
 )
@@ -79,15 +86,17 @@ if(CHMV_BUILD_APP)
         src/gpu/filtering/BirthOrderedRangeFilterStrategy.cpp
         src/gpu/streaming/RefinementRequestCollector.cpp
         src/gpu/streaming/PersistentStreamingPipeline.cpp
+        src/gpu/lod/LodPagePool.cpp
+        src/gpu/lod/LodPageRenderer.cpp
+        src/gpu/lod/LodPageRuntime.cpp
         src/benchmark/GPUTimer.cpp
+        src/benchmark/LodPageZoomSweep.cpp
         src/benchmark/StreamingBenchmarkLogger.cpp
         src/gpu/unfolding/UnfoldingStrategyManager.cpp
         src/gpu/unfolding/NoUnfoldingStrategy.cpp
         src/gpu/unfolding/IterativeDFSUnfoldingStrategy.cpp
         src/gpu/unfolding/AdaptiveDFSUnfoldingStrategy.cpp
         src/pipeline/GPUDrivenPipeline.cpp
-        src/renderer/LODController.cpp
-        src/renderer/MapCamera2D.cpp
         src/renderer/Renderer.cpp
         src/renderer/RoadRenderer.cpp
         src/ui/DebugUI.cpp

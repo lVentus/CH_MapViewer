@@ -4,8 +4,10 @@
 #include "core/Window.h"
 #include "data/AsyncDatasetLoader.h"
 #include "data/DatasetCatalog.h"
+#include "benchmark/LodPageZoomSweep.h"
 #include "data/ch/CHGraph.h"
 #include "gpu/filtering/RangeFilterStrategyManager.h"
+#include "gpu/lod/LodPageRuntime.h"
 #include "gpu/unfolding/UnfoldingStrategyManager.h"
 #include "pipeline/CPUReferencePipeline.h"
 #include "pipeline/GPUDrivenPipeline.h"
@@ -128,6 +130,20 @@ const char* DatasetLoadPhaseName(data::DatasetLoadPhase phase) {
         return "Loading full binary dataset into RAM";
     case data::DatasetLoadPhase::PreprocessedForStreaming:
         return "Preprocess ready for out-of-core runtime";
+    case data::DatasetLoadPhase::ReadingSourceForLodPages:
+        return "LOD pages: reading .sch/.ranges";
+    case data::DatasetLoadPhase::ComputingLodPageHierarchy:
+        return "LOD pages: geometry errors and level contexts";
+    case data::DatasetLoadPhase::LayingOutLodPages:
+        return "LOD pages: sorting records";
+    case data::DatasetLoadPhase::WritingLodPages:
+        return "LOD pages: writing pages";
+    case data::DatasetLoadPhase::VerifyingLodPages:
+        return "LOD pages: checking against DFS";
+    case data::DatasetLoadPhase::PreloadingLodPages:
+        return "LOD pages: loading page section into RAM";
+    case data::DatasetLoadPhase::LodPagesReady:
+        return "LOD pages ready";
     case data::DatasetLoadPhase::Ready:
         return "Ready";
     case data::DatasetLoadPhase::Failed:
@@ -652,6 +668,82 @@ void DebugUI::UpdateOocTelemetry(
     oocTelemetryLastSampleTime_ = now;
 }
 
+void DebugUI::DrawLodPagePanel(const gpu::lod::LodPageRuntimeStats& stats,
+                               const benchmark::LodPageZoomSweep* sweep, float& pixelTolerance,
+                               DebugUIActions& actions) const {
+    if (!ImGui::CollapsingHeader("LOD pages", ImGuiTreeNodeFlags_DefaultOpen)) {
+        return;
+    }
+    constexpr double kMiB = 1024.0 * 1024.0;
+    const auto megabytes = [](std::uint64_t bytes) { return static_cast<double>(bytes) / kMiB; };
+    const ImVec4 warning(1.0f, 0.75f, 0.3f, 1.0f);
+    const ImVec4 failure(1.0f, 0.35f, 0.35f, 1.0f);
+
+    ImGui::SliderFloat("Pixel tolerance", &pixelTolerance, 0.5f, 16.0f, "%.2f px",
+                       ImGuiSliderFlags_Logarithmic);
+    ImGui::Text("Level %u, error code %u", stats.level, stats.threshold);
+    if (!stats.complete) {
+        ImGui::TextColored(warning, "Loading %u of %u view pages; showing level %u meanwhile",
+                           stats.missingRequiredPages, stats.requiredPages, stats.drawLevel);
+    }
+    ImGui::Text("Pages: view %u, with prefetch ring %u, drawn %u", stats.requiredPages,
+                stats.prefetchPages, stats.drawPages);
+    ImGui::Text("Segments drawn: %u", stats.drawnSegments);
+    ImGui::Text("GPU pool: %u / %u pages (%.0f MiB), %llu evictions", stats.residentPages,
+                stats.poolSlots, megabytes(stats.poolBytes),
+                static_cast<unsigned long long>(stats.evictions));
+    if (stats.poolFull) {
+        ImGui::TextColored(failure, "GPU pool full: this view needs more pages than fit");
+    }
+    if (stats.ramImage) {
+        ImGui::Text("Pages served from RAM (%.0f MiB)", megabytes(stats.pageSectionBytes));
+    } else {
+        ImGui::Text("Pages read from disk: %llu pages, %.1f MiB in %llu reads, %.1f ms",
+                    static_cast<unsigned long long>(stats.diskPagesRead),
+                    megabytes(stats.diskBytesRead),
+                    static_cast<unsigned long long>(stats.diskReadCalls), stats.diskReadMs);
+        if (!stats.readerError.empty()) {
+            ImGui::TextColored(failure, "Read error: %s", stats.readerError.c_str());
+        }
+    }
+    if (stats.corruptPages != 0u) {
+        ImGui::TextColored(failure, "%llu corrupt pages skipped (rebuild the .chlod file)",
+                           static_cast<unsigned long long>(stats.corruptPages));
+    }
+
+    ImGui::SeparatorText("This frame");
+    ImGui::Text("Plan %.3f ms, upload %.3f ms (%.2f MiB, %u pages; budget %.1f MiB)",
+                stats.planMs, stats.uploadMs, megabytes(stats.uploadedBytes),
+                stats.uploadedPages, megabytes(stats.uploadBudgetBytes));
+    ImGui::Text("CPU update %.3f ms", stats.updateMs);
+    if (stats.gpuFilterMs && stats.gpuDrawMs) {
+        ImGui::Text("GPU filter %.3f ms, draw %.3f ms", *stats.gpuFilterMs, *stats.gpuDrawMs);
+    }
+
+    ImGui::SeparatorText("Time until the view is complete");
+    ImGui::Text("Last %.1f ms, max %.1f ms (%llu loads)", stats.lastSettleMs, stats.maxSettleMs,
+                static_cast<unsigned long long>(stats.settleCount));
+    ImGui::Text("Frames with missing view pages: %llu",
+                static_cast<unsigned long long>(stats.incompleteFrames));
+
+    ImGui::SeparatorText("Zoom sweep benchmark");
+    ImGui::TextDisabled("Overview -> 3 km in 12 s, hold 3 s, back out, hold 3 s. Writes a "
+                        "per-frame CSV next to the dataset.");
+    if (sweep != nullptr && sweep->Running()) {
+        ImGui::Text("Running: %s", sweep->PhaseName());
+        if (ImGui::Button("Cancel sweep")) {
+            actions.cancelLodPageZoomSweep = true;
+        }
+    } else {
+        if (ImGui::Button("Run zoom sweep")) {
+            actions.startLodPageZoomSweep = true;
+        }
+        if (sweep != nullptr && !sweep->Summary().empty()) {
+            ImGui::TextWrapped("%s", sweep->Summary().c_str());
+        }
+    }
+}
+
 void DebugUI::StartRoadTypeDiagnostic(std::filesystem::path graphPath,
                                       std::filesystem::path rangesPath) {
     if (roadTypeDiagnosticRunning_.exchange(true)) {
@@ -842,7 +934,9 @@ DebugUIActions DebugUI::Draw(
     bool canValidate,
     const streaming::index::CHIndexData* streamingIndex,
     const streaming::runtime::GraphPageStreamingStats* streamingStats,
-    renderer::RoadStyleConfig& roadStyles) {
+    renderer::RoadStyleConfig& roadStyles,
+    const gpu::lod::LodPageRuntimeStats* lodPageStats,
+    const benchmark::LodPageZoomSweep* lodPageSweep) {
     DebugUIActions actions;
 
     ImGui::Begin("CH_MapViewer");
@@ -876,7 +970,9 @@ DebugUIActions DebugUI::Draw(
         }
         if (ImGui::Button("Load dataset")) {
             actions.datasetRequest = selectedDataset_;
-            actions.datasetStreaming = streamDataset_;
+            actions.datasetStreaming = datasetRuntime_ == 1;
+            actions.datasetLodPages = datasetRuntime_ == 2;
+            actions.lodPagesKeepInRam = lodPagesKeepInRam_;
         }
         if (datasetLoad.Active()) {
             ImGui::EndDisabled();
@@ -888,9 +984,20 @@ DebugUIActions DebugUI::Draw(
         datasetCatalog.Refresh();
     }
 
-    ImGui::Checkbox("Out-of-core GPU runtime", &streamDataset_);
-    ImGui::TextDisabled(
-        "OFF: full binary graph resident in RAM + GPU, no runtime streaming. ON: Virtual Map; prefers RAM-backed streaming when .chbin fits RAM, otherwise SSD-backed.");
+    ImGui::Combo("Runtime", &datasetRuntime_,
+                 "Full resident (RAM + GPU)\0Virtual Map v8 (out-of-core)\0LOD pages (new)\0");
+    if (datasetRuntime_ == 0) {
+        ImGui::TextDisabled("Full binary graph resident in RAM + GPU, no runtime streaming.");
+    } else if (datasetRuntime_ == 1) {
+        ImGui::TextDisabled(
+            "Virtual Map; prefers RAM-backed streaming when .chbin fits RAM, otherwise "
+            "SSD-backed.");
+    } else {
+        ImGui::Checkbox("Keep page file in RAM if it fits", &lodPagesKeepInRam_);
+        ImGui::TextDisabled(
+            "Builds <name>.chlod once (complete CH + LOD pages, checked against DFS). Pages are "
+            "chosen from the camera alone and streamed into the GPU; OFF reads them from disk.");
+    }
 
     if (datasetLoad.Active()) {
         const auto* phaseName = DatasetLoadPhaseName(datasetLoad.phase);
@@ -904,7 +1011,12 @@ DebugUIActions DebugUI::Draw(
 
     ImGui::Separator();
 
-    if (graph || streamingIndex) {
+    if (graph || streamingIndex || lodPageStats) {
+        if (lodPageStats) {
+            ImGui::Text("LOD pages: %llu (%llu records)",
+                        static_cast<unsigned long long>(lodPageStats->pageCount),
+                        static_cast<unsigned long long>(lodPageStats->recordCount));
+        }
         if (streamingIndex) {
             ImGui::Text("Nodes: %llu", static_cast<unsigned long long>(streamingIndex->nodeCount));
             ImGui::Text("Edges: %llu", static_cast<unsigned long long>(streamingIndex->edgeCount));
@@ -950,6 +1062,10 @@ DebugUIActions DebugUI::Draw(
         }
     } else {
         ImGui::TextUnformatted("No CH dataset loaded.");
+    }
+
+    if (lodPageStats) {
+        DrawLodPagePanel(*lodPageStats, lodPageSweep, maxScreenErrorPixels, actions);
     }
 
     ImGui::Separator();

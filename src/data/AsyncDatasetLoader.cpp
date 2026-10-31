@@ -5,6 +5,7 @@
 #include "streaming/analysis/DatasetLayoutAnalyzer.h"
 #include "streaming/preprocess/DatasetPreprocessor.h"
 #include "streaming/index/CHIndex.h"
+#include "streaming/lod/LodPageBuilder.h"
 #include "streaming/runtime/GraphPageStreamer.h"
 #include "streaming/runtime/RuntimeData.h"
 #include "streaming/analysis/TextSourceScanner.h"
@@ -64,10 +65,55 @@ DatasetLoadPhase ToDatasetPhase(streaming::preprocess::PreprocessStage stage) {
     return DatasetLoadPhase::CheckingPreprocess;
 }
 
+DatasetLoadPhase ToDatasetPhase(streaming::lod::BuildStage stage) {
+    using streaming::lod::BuildStage;
+    switch (stage) {
+    case BuildStage::ReadNodes:
+    case BuildStage::ReadEdges:
+    case BuildStage::ReadRanges:
+        return DatasetLoadPhase::ReadingSourceForLodPages;
+    case BuildStage::ComputeHierarchy:
+        return DatasetLoadPhase::ComputingLodPageHierarchy;
+    case BuildStage::LayoutPages:
+        return DatasetLoadPhase::LayingOutLodPages;
+    case BuildStage::WritePages:
+        return DatasetLoadPhase::WritingLodPages;
+    case BuildStage::Verify:
+        return DatasetLoadPhase::VerifyingLodPages;
+    }
+    return DatasetLoadPhase::CheckingPreprocess;
+}
+
 struct PreprocessProgressRange {
     float begin = 0.0f;
     float end = 0.0f;
 };
+
+PreprocessProgressRange LodBuildStageRange(streaming::lod::BuildStage stage) {
+    using streaming::lod::BuildStage;
+    switch (stage) {
+    case BuildStage::ReadNodes:        return {0.00f, 0.05f};
+    case BuildStage::ReadEdges:        return {0.05f, 0.30f};
+    case BuildStage::ReadRanges:       return {0.30f, 0.38f};
+    case BuildStage::ComputeHierarchy: return {0.38f, 0.55f};
+    case BuildStage::LayoutPages:      return {0.55f, 0.70f};
+    case BuildStage::WritePages:       return {0.70f, 0.85f};
+    case BuildStage::Verify:           return {0.85f, 0.97f};
+    }
+    return {0.0f, 1.0f};
+}
+
+// Same rule as the RAM image of the .chbin: keep a generous reserve for the OS and the rest of
+// the viewer, and only then hold the whole page section in memory.
+bool LodPageImageFitsInRam(std::uint64_t bytes) {
+    const auto memory = streaming::runtime::QuerySystemMemoryInfo();
+    if (memory.availablePhysicalBytes == 0u) {
+        return false;
+    }
+    constexpr std::uint64_t kGiB = 1024ull * 1024ull * 1024ull;
+    const auto reserve = std::max<std::uint64_t>(6ull * kGiB, memory.totalPhysicalBytes / 5u);
+    return bytes + kGiB + reserve < memory.availablePhysicalBytes;
+}
 
 PreprocessProgressRange PreprocessStageRange(streaming::preprocess::PreprocessStage stage) {
     using streaming::preprocess::PreprocessStage;
@@ -413,12 +459,11 @@ bool AsyncDatasetLoader::StartStreaming(const std::filesystem::path& graphPath,
     return StartInternal(graphPath, rangesPath, true);
 }
 
-bool AsyncDatasetLoader::StartInternal(const std::filesystem::path& graphPath,
-                                       const std::filesystem::path& rangesPath,
-                                       bool streamingOnly) {
+bool AsyncDatasetLoader::PrepareStart() {
     const auto currentPhase = phase_.load();
     if (currentPhase != DatasetLoadPhase::Idle && currentPhase != DatasetLoadPhase::Failed &&
-        currentPhase != DatasetLoadPhase::PreprocessedForStreaming) {
+        currentPhase != DatasetLoadPhase::PreprocessedForStreaming &&
+        currentPhase != DatasetLoadPhase::LodPagesReady) {
         return false;
     }
 
@@ -430,11 +475,99 @@ bool AsyncDatasetLoader::StartInternal(const std::filesystem::path& graphPath,
         std::lock_guard lock(mutex_);
         completedGraph_.reset();
         completedStreamingDataset_.reset();
+        completedLodPages_.reset();
         error_.clear();
     }
 
     progress_.store(0.0f);
     phase_.store(DatasetLoadPhase::CheckingPreprocess);
+    return true;
+}
+
+bool AsyncDatasetLoader::StartLodPages(const std::filesystem::path& graphPath,
+                                       const std::filesystem::path& rangesPath, bool keepInRam) {
+    if (!PrepareStart()) {
+        return false;
+    }
+    worker_ = std::jthread([this, graphPath, rangesPath, keepInRam](std::stop_token stopToken) {
+        try {
+            LoadLodPages(graphPath, rangesPath, keepInRam, stopToken);
+        } catch (const LoadCancelled&) {
+            phase_.store(DatasetLoadPhase::Idle);
+            progress_.store(0.0f);
+        } catch (const std::exception& error) {
+            std::cerr << "LOD page load failed: " << error.what() << '\n';
+            {
+                std::lock_guard lock(mutex_);
+                error_ = error.what();
+            }
+            phase_.store(DatasetLoadPhase::Failed);
+            progress_.store(0.0f);
+        } catch (...) {
+            {
+                std::lock_guard lock(mutex_);
+                error_ = "unknown error while loading LOD pages";
+            }
+            phase_.store(DatasetLoadPhase::Failed);
+            progress_.store(0.0f);
+        }
+    });
+    return true;
+}
+
+void AsyncDatasetLoader::LoadLodPages(const std::filesystem::path& graphPath,
+                                      const std::filesystem::path& rangesPath, bool keepInRam,
+                                      const std::stop_token& stopToken) {
+    namespace lod = streaming::lod;
+    const auto path = lod::LodPageFile::DefaultPath(graphPath);
+    if (lod::LodPageFile::MatchesSource(path, graphPath, rangesPath)) {
+        std::cout << "Using LOD page file " << path << '\n';
+    } else {
+        std::cout << "Building LOD page file " << path << " in background...\n";
+        const auto result = lod::LodPageBuilder::Build(
+            graphPath, rangesPath, path, [this, &stopToken](const lod::BuildProgress& progress) {
+                if (stopToken.stop_requested()) {
+                    throw LoadCancelled{};
+                }
+                phase_.store(ToDatasetPhase(progress.stage));
+                const auto range = LodBuildStageRange(progress.stage);
+                const auto fraction = Fraction(progress.current, progress.total);
+                progress_.store(range.begin + (range.end - range.begin) * fraction);
+            });
+        std::cout << "LOD page file ready after " << result.seconds << " s: " << result.recordCount
+                  << " records in " << result.pageCount << " pages (" << result.extraContextRecords
+                  << " extra contexts, " << result.coverGapEdges << " split covers); "
+                  << result.verifiedCuts << " reference cuts match DFS exactly\n";
+    }
+
+    auto file = lod::LodPageFile::Open(path);
+    std::shared_ptr<const std::vector<std::uint32_t>> pageImage;
+    if (keepInRam && LodPageImageFitsInRam(file->PageSectionBytes())) {
+        phase_.store(DatasetLoadPhase::PreloadingLodPages);
+        pageImage = std::make_shared<const std::vector<std::uint32_t>>(file->ReadPageWords(
+            [this, &stopToken](std::uint64_t current, std::uint64_t total) {
+                if (stopToken.stop_requested()) {
+                    throw LoadCancelled{};
+                }
+                progress_.store(0.97f + 0.03f * Fraction(current, total));
+            }));
+    } else if (keepInRam) {
+        std::cout << "LOD page section does not fit the RAM reserve; reading pages from disk.\n";
+    }
+    {
+        std::lock_guard lock(mutex_);
+        completedLodPages_ = lod::LodPageDataset{std::move(file), std::move(pageImage)};
+    }
+    progress_.store(1.0f);
+    phase_.store(DatasetLoadPhase::LodPagesReady);
+}
+
+bool AsyncDatasetLoader::StartInternal(const std::filesystem::path& graphPath,
+                                       const std::filesystem::path& rangesPath,
+                                       bool streamingOnly) {
+    if (!PrepareStart()) {
+        return false;
+    }
 
     worker_ = std::jthread([this, graphPath, rangesPath, streamingOnly](std::stop_token stopToken) {
         try {
@@ -664,6 +797,22 @@ std::optional<CHGraph> AsyncDatasetLoader::TakeCompleted() {
     phase_.store(DatasetLoadPhase::Idle);
     progress_.store(0.0f);
     return graph;
+}
+
+std::optional<streaming::lod::LodPageDataset> AsyncDatasetLoader::TakeLodPagesCompleted() {
+    if (phase_.load() != DatasetLoadPhase::LodPagesReady) {
+        return std::nullopt;
+    }
+
+    std::optional<streaming::lod::LodPageDataset> dataset;
+    {
+        std::lock_guard lock(mutex_);
+        dataset = std::move(completedLodPages_);
+        completedLodPages_.reset();
+    }
+    phase_.store(DatasetLoadPhase::Idle);
+    progress_.store(0.0f);
+    return dataset;
 }
 
 std::optional<StreamingDataset> AsyncDatasetLoader::TakeStreamingCompleted() {

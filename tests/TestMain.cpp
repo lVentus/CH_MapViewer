@@ -10,6 +10,9 @@
 #include "streaming/analysis/DatasetLayoutAnalyzer.h"
 #include "streaming/preprocess/DatasetPreprocessor.h"
 #include "streaming/index/CHIndex.h"
+#include "streaming/lod/LodPageBuilder.h"
+#include "streaming/lod/LodPageFile.h"
+#include "streaming/lod/LodPagePlanner.h"
 #include "streaming/runtime/GraphPageStreamer.h"
 #include "streaming/runtime/RuntimeData.h"
 
@@ -20,6 +23,7 @@
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
+#include <string>
 #include <thread>
 #include <tuple>
 #include <vector>
@@ -989,6 +993,160 @@ void TestCorrectnessValidator() {
     Require(fail.unexpectedEdgeCount == 1, "unexpected edge count mismatch");
 }
 
+// Five nodes along a bent road: originals 0-3 at level 0, shortcuts 4 (0-2) and 5 (2-4) at
+// level 1, shortcut 6 (0-4) above them. Extra lines add shortcuts or change ranges.
+struct LodTestGraph {
+    std::filesystem::path graphPath;
+    std::filesystem::path rangesPath;
+
+    LodTestGraph(const std::vector<std::string>& extraEdges, const std::string& ranges) {
+        const auto base = std::filesystem::temp_directory_path() / "chmv_lod_test";
+        graphPath = base.string() + ".sch";
+        rangesPath = base.string() + ".sch.ranges";
+        std::ofstream graph(graphPath);
+        graph << "# bent road\n5\n" << 7u + extraEdges.size() << "\n";
+        graph << "0 100 48.0000000 9.0000000 0 4\n";
+        graph << "1 101 48.0100000 9.0100000 0 0\n";
+        graph << "2 102 48.0000000 9.0200000 0 2\n";
+        graph << "3 103 48.0100000 9.0300000 0 1\n";
+        graph << "4 104 48.0000000 9.0400000 0 3\n";
+        graph << "0 1 10 1 50 -1 -1\n1 2 10 1 50 -1 -1\n2 3 10.0 2 50 -1 -1\n";
+        graph << "3 4 10 2 50 -1 -1\n0 2 20 1 50 0 1\n2 4 20 2 50 2 3\n0 4 40 1 50 4 5\n";
+        for (const auto& edge : extraEdges) {
+            graph << edge << '\n';
+        }
+        std::ofstream(rangesPath) << ranges;
+    }
+    ~LodTestGraph() {
+        std::filesystem::remove(graphPath);
+        std::filesystem::remove(rangesPath);
+        std::filesystem::remove(chmv::streaming::lod::LodPageFile::DefaultPath(graphPath));
+    }
+};
+
+// Edges drawn by the page file, as a sorted multiset.
+std::vector<std::uint32_t> LodPageCut(const chmv::streaming::lod::LodPageFile& file,
+                                      std::uint32_t level, std::uint32_t threshold) {
+    namespace lod = chmv::streaming::lod;
+    const auto words = file.ReadPageWords({});
+    const auto recordEdges = file.ReadSection<std::uint32_t>(lod::Section::RecordEdge);
+    std::vector<std::uint32_t> edges;
+    for (std::uint32_t p = 0; p < file.Pages().size(); ++p) {
+        const auto& page = file.Pages()[p];
+        const auto* pageWords = words.data() + file.PageWordOffset(p);
+        for (std::uint32_t i = 0; i < page.recordCount; ++i) {
+            const auto* record = pageWords + lod::kPageHeaderWords + i * lod::kRecordWords;
+            if (lod::RecordDrawn(record[1], record[2], record[3], level, threshold)) {
+                edges.push_back(recordEdges[page.firstRecord + i]);
+            }
+        }
+    }
+    std::sort(edges.begin(), edges.end());
+    return edges;
+}
+
+// The same cut by plain DFS over the CH layer of the file.
+std::vector<std::uint32_t> DfsCut(const chmv::streaming::lod::LodPageFile& file,
+                                  std::uint32_t level, std::uint32_t threshold) {
+    namespace lod = chmv::streaming::lod;
+    const auto childA = file.ReadSection<std::uint32_t>(lod::Section::EdgeChildA);
+    const auto childB = file.ReadSection<std::uint32_t>(lod::Section::EdgeChildB);
+    const auto birth = file.ReadSection<std::int16_t>(lod::Section::EdgeBirth);
+    const auto death = file.ReadSection<std::int16_t>(lod::Section::EdgeDeath);
+    const auto error = file.ReadSection<float>(lod::Section::EdgeError);
+    std::vector<std::uint32_t> edges;
+    std::vector<std::uint32_t> stack;
+    const auto r = static_cast<std::int32_t>(level);
+    for (std::uint32_t root = 0; root < childA.size(); ++root) {
+        if (death[root] < 0 || birth[root] < 0 || r < death[root] || r > birth[root]) {
+            continue;
+        }
+        stack.push_back(root);
+        while (!stack.empty()) {
+            const auto e = stack.back();
+            stack.pop_back();
+            if (childA[e] != chmv::data::InvalidEdgeId &&
+                lod::EncodeGeometryError(error[e]) > threshold) {
+                stack.push_back(childA[e]);
+                stack.push_back(childB[e]);
+            } else {
+                edges.push_back(e);
+            }
+        }
+    }
+    std::sort(edges.begin(), edges.end());
+    return edges;
+}
+
+void RequireLodCutsMatchDfs(const chmv::streaming::lod::LodPageFile& file, const char* message) {
+    const auto codes = {std::uint32_t{0}, std::uint32_t{chmv::streaming::lod::kErrorCodeMax}};
+    for (std::uint32_t level = 0; level <= 3; ++level) {
+        for (const auto threshold : codes) {
+            Require(LodPageCut(file, level, threshold) == DfsCut(file, level, threshold),
+                    message);
+        }
+    }
+}
+
+void TestLodPageBuilder() {
+    namespace lod = chmv::streaming::lod;
+    {
+        const LodTestGraph source({}, "0 0 0\n1 0 0\n2 0 0\n3 0 0\n4 1 1\n5 1 1\n6 2 2\n");
+        const auto filePath = lod::LodPageFile::DefaultPath(source.graphPath);
+        const auto result = lod::LodPageBuilder::Build(source.graphPath, source.rangesPath,
+                                                       filePath);
+        Require(result.recordCount == 7, "every edge should get exactly one record");
+        Require(result.coverGapEdges == 0 && result.extraContextRecords == 0,
+                "simple hierarchy needs no extra contexts");
+        Require(lod::LodPageFile::MatchesSource(filePath, source.graphPath, source.rangesPath),
+                "page file should match its source");
+
+        const auto file = lod::LodPageFile::Open(filePath);
+        Require(file->Header().nodeCount == 5 && file->Header().edgeCount == 7,
+                "CH layer counts");
+        Require(file->ReadSection<std::uint32_t>(lod::Section::EdgeWeight) ==
+                    std::vector<std::uint32_t>{10, 10, 10, 10, 20, 20, 40},
+                "edge weights must survive exactly");
+        Require(file->ReadSection<std::int32_t>(lod::Section::NodeLatitude)[1] == 480100000,
+                "latitudes are stored as exact 1e-7 degrees");
+
+        const auto coarse = std::uint32_t{lod::kErrorCodeMax};
+        Require(LodPageCut(*file, 2, coarse) == std::vector<std::uint32_t>{6},
+                "level 2, coarse: one shortcut");
+        Require(LodPageCut(*file, 1, coarse) == std::vector<std::uint32_t>{4, 5},
+                "level 1, coarse: two shortcuts");
+        Require(LodPageCut(*file, 2, 0) == std::vector<std::uint32_t>{0, 1, 2, 3},
+                "level 2, exact: fully unfolded");
+        RequireLodCutsMatchDfs(*file, "page cut differs from DFS");
+
+        lod::LodPageQuery everywhere{-1e9f, -1e9f, 1e9f, 1e9f, 2, 0};
+        std::vector<std::uint32_t> pages;
+        lod::CollectLodPages(file->Groups(), file->Pages(), everywhere, pages);
+        Require(!pages.empty(), "planner must find the pages of a drawn level");
+    }
+    {
+        // Shortcut 4 is still alive at level 2 where its parent 6 is alive too: DFS reaches 4
+        // (and everything below it) twice.
+        const LodTestGraph source({}, "0 0 0\n1 0 0\n2 0 0\n3 0 0\n4 2 1\n5 1 1\n6 2 2\n");
+        const auto filePath = lod::LodPageFile::DefaultPath(source.graphPath);
+        const auto result = lod::LodPageBuilder::Build(source.graphPath, source.rangesPath,
+                                                       filePath);
+        Require(result.extraContextRecords != 0, "second visit needs its own records");
+        RequireLodCutsMatchDfs(*lod::LodPageFile::Open(filePath),
+                               "root + parent at the same level differs from DFS");
+    }
+    {
+        // Shortcut 7 (0-3 via 2) is a second parent of shortcut 4, alive at the same level as 6.
+        const LodTestGraph source(
+            {"0 3 30 1 50 4 2"},
+            "0 0 0\n1 0 0\n2 0 0\n3 0 0\n4 1 1\n5 1 1\n6 2 2\n7 2 2\n");
+        const auto filePath = lod::LodPageFile::DefaultPath(source.graphPath);
+        (void)lod::LodPageBuilder::Build(source.graphPath, source.rangesPath, filePath);
+        RequireLodCutsMatchDfs(*lod::LodPageFile::Open(filePath),
+                               "two parents at the same level differ from DFS");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -1005,6 +1163,7 @@ int main() {
         TestMixedOrderShortcutGeometryBounds();
         TestFixedGridPhysicalPagePacking();
         TestCorrectnessValidator();
+        TestLodPageBuilder();
         std::cout << "All tests passed.\n";
         return 0;
     } catch (const std::exception& error) {

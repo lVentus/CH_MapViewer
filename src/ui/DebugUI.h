@@ -17,6 +17,7 @@
 #include <thread>
 
 namespace chmv::benchmark {
+class LodPageZoomSweep;
 struct PipelineValidationResult;
 }
 
@@ -32,6 +33,10 @@ struct DatasetLoadSnapshot;
 
 namespace chmv::gpu::filtering {
 class RangeFilterStrategyManager;
+}
+
+namespace chmv::gpu::lod {
+struct LodPageRuntimeStats;
 }
 
 namespace chmv::gpu::unfolding {
@@ -63,6 +68,10 @@ namespace chmv::ui {
 struct DebugUIActions {
     std::optional<std::size_t> datasetRequest;
     bool datasetStreaming = true;
+    bool datasetLodPages = false;
+    bool lodPagesKeepInRam = true;
+    bool startLodPageZoomSweep = false;
+    bool cancelLodPageZoomSweep = false;
     bool validateCurrentResult = false;
     bool runGpuRangeBenchmark = false;
     bool applyStreamingBudgets = false;
@@ -97,7 +106,9 @@ public:
         bool canValidate,
         const streaming::index::CHIndexData* streamingIndex,
         const streaming::runtime::GraphPageStreamingStats* streamingStats,
-        renderer::RoadStyleConfig& roadStyles);
+        renderer::RoadStyleConfig& roadStyles,
+        const gpu::lod::LodPageRuntimeStats* lodPageStats,
+        const benchmark::LodPageZoomSweep* lodPageSweep);
     void EndFrame() const;
     [[nodiscard]] bool WantsMouse() const;
     [[nodiscard]] bool SplitScreenValidation() const { return splitScreenValidation_; }
@@ -118,6 +129,9 @@ private:
 
     void StartRoadTypeDiagnostic(std::filesystem::path graphPath,
                                  std::filesystem::path rangesPath);
+    void DrawLodPagePanel(const gpu::lod::LodPageRuntimeStats& stats,
+                          const benchmark::LodPageZoomSweep* sweep, float& pixelTolerance,
+                          DebugUIActions& actions) const;
 
 
     struct OocTelemetryCounters {
@@ -166,7 +180,9 @@ private:
         const streaming::runtime::GraphPageStreamingStats& stats);
 
     std::size_t selectedDataset_ = 0;
-    bool streamDataset_ = true;
+    // 0 = full resident, 1 = Virtual Map (v8 .chbin/.chidx), 2 = LOD pages (.chlod)
+    int datasetRuntime_ = 1;
+    bool lodPagesKeepInRam_ = true;
     bool splitScreenValidation_ = true;
     int streamingRamBudgetMiB_ = 0;
     int streamingGpuBudgetMiB_ = 0;

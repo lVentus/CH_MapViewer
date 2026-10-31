@@ -1,0 +1,67 @@
+#version 430 core
+
+// One workgroup per resident page, one invocation per record. Every invocation evaluates the
+// same two interval tests, so there is no traversal, no divergence and no dependency between
+// records. Survivors are compacted per workgroup with a single global atomic.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer PageWords { uint pageWords[]; };
+layout(std430, binding = 1) readonly buffer PageRecords { uvec4 pageRecords[]; };
+layout(std430, binding = 2) readonly buffer DrawSlots { uint drawSlots[]; };
+layout(std430, binding = 3) writeonly buffer Segments { uint segments[]; };
+layout(std430, binding = 4) buffer DrawCommand {
+    uint vertexCount;
+    uint instanceCount;
+    uint firstVertex;
+    uint baseInstance;
+    uint segmentCount;
+};
+
+uniform uint uSlotWords;
+uniform uint uSlotOffset;
+uniform uint uLevel;
+uniform uint uThreshold;
+
+shared uint sCount;
+shared uint sBase;
+
+bool inRange(uint packedRange) {
+    return uLevel >= (packedRange & 0xffffu) && uLevel <= (packedRange >> 16u);
+}
+
+void main() {
+    uint slot = drawSlots[uSlotOffset + gl_WorkGroupID.x];
+    uint base = slot * uSlotWords;
+    uint recordCount = pageWords[base] & 0xffffu;
+    uint local = gl_LocalInvocationID.x;
+
+    if (local == 0u) {
+        sCount = 0u;
+    }
+    barrier();
+
+    bool drawn = false;
+    uint localIndex = 0u;
+    if (local < recordCount) {
+        uvec4 record = pageRecords[(base >> 2u) + 1u + local];
+        uint errorCode = record.w & 0xffffu;
+        uint parentCode = record.w >> 16u;
+        drawn = errorCode <= uThreshold &&
+                (inRange(record.y) || (inRange(record.z) && uThreshold < parentCode));
+        if (drawn) {
+            localIndex = atomicAdd(sCount, 1u);
+        }
+    }
+    barrier();
+
+    if (local == 0u && sCount != 0u) {
+        sBase = atomicAdd(segmentCount, sCount);
+        atomicAdd(vertexCount, sCount * 6u);
+    }
+    barrier();
+
+    if (drawn) {
+        segments[sBase + localIndex] = (slot << 8u) | local;
+    }
+}

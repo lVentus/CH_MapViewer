@@ -59,7 +59,8 @@ Application::Application(const std::filesystem::path& assetDirectory)
       refinementRequestCollector_(assetDirectory / "shaders"),
       persistentStreamingPipeline_(assetDirectory / "shaders"),
       debugUI_(window_),
-      datasetCatalog_(assetDirectory / "data") {
+      datasetCatalog_(assetDirectory / "data"),
+      shaderDirectory_(assetDirectory / "shaders") {
     rangeFilterStrategyManager_.Register(
         std::make_unique<gpu::filtering::BirthOrderedRangeFilterStrategy>(
             assetDirectory / "shaders"));
@@ -90,6 +91,8 @@ void Application::LoadDataset(const std::filesystem::path& graphPath,
 }
 
 void Application::InstallDataset(data::CHGraph graph) {
+    lodPageSweep_.Cancel();
+    lodPages_.reset();
     std::cout << "Loaded " << graph.NodeCount() << " nodes and " << graph.EdgeCount()
               << " edges\n";
     streamingDisplayLod_ = -1;
@@ -167,6 +170,8 @@ void Application::InstallDataset(data::CHGraph graph) {
 }
 
 void Application::InstallStreamingDataset(data::StreamingDataset dataset) {
+    lodPageSweep_.Cancel();
+    lodPages_.reset();
     graph_.reset();
     cpuDrawData_ = {};
     ClearValidation();
@@ -326,6 +331,30 @@ void Application::InstallStreamingDataset(data::StreamingDataset dataset) {
     streamingCommittedActivePages_.clear();
     lastStreamingRefinementMode_ = geometry::RefinementMode::None;
     gStreamingRefinementInteractionHoldSeconds = 0.0f;
+}
+
+void Application::InstallLodPageDataset(streaming::lod::LodPageDataset dataset) {
+    lodPageSweep_.Cancel();
+    lodPages_.reset();
+    graph_.reset();
+    pageStreamer_.reset();
+    persistentStreamingPipeline_.Reset();
+    roadRenderer_.ClearGraph();
+    gpuPipeline_.SetGraph(0, 0);
+    cpuDrawData_ = {};
+    ClearValidation();
+    gpuRangeBenchmarkResult_.reset();
+
+    const auto& header = dataset.file->Header();
+    lodController_.SetLevelRange(0, header.maxLevel);
+    lodController_.SetManualLevel(header.maxLevel);
+    camera_.SetMetersPerNormalizedUnit(header.MetersPerNormalizedUnit());
+    camera_.Reset();
+    lodController_.SetOverviewZoom(camera_.ZoomFactor());
+    // A manual GPU budget (Apply budgets) also caps the LOD page pool; 0 keeps it automatic.
+    lodPages_ = std::make_unique<gpu::lod::LodPageRuntime>(
+        shaderDirectory_, std::move(dataset),
+        static_cast<std::uint64_t>(streamingGpuBudgetMiB_) * 1024ull * 1024ull);
 }
 
 streaming::runtime::StreamingViewRequest Application::BuildStreamingView(
@@ -902,7 +931,11 @@ int Application::Run() {
         previousFrameTime = currentFrameTime;
         window_.PollEvents();
         debugUI_.BeginFrame();
-        UpdateCameraInput(deltaSeconds);
+        if (lodPageSweep_.Running()) {
+            lodPageSweep_.Advance(camera_, deltaSeconds);
+        } else {
+            UpdateCameraInput(deltaSeconds);
+        }
 
         int width = 0;
         int height = 0;
@@ -915,6 +948,14 @@ int Application::Run() {
         std::int32_t lodLevel = 0;
         geometry::RefinementParameters gpuRefinement;
         benchmark::StreamingFrameTiming streamingTiming;
+
+        if (lodPages_) {
+            const auto& tint = roadStyleConfig_.enabled ? kRoadStyleNeutralTint : kDefaultRoadColor;
+            lodPages_->Update(camera_, lodController_, width, height, maxScreenErrorPixels_);
+            lodPages_->Draw(camera_, width, height, tint, roadStyleConfig_);
+            lodPageSweep_.Record(lodPages_->Stats(), camera_,
+                                 static_cast<double>(deltaSeconds) * 1000.0);
+        }
 
         const bool streamingRuntime = pageStreamer_ != nullptr;
         if (graph_ || streamingRuntime) {
@@ -1201,10 +1242,11 @@ int Application::Run() {
                 streamingLastConsumedViewSequence_, *streamingStats, streamingTiming);
         }
         const auto datasetLoad = datasetLoader_.Snapshot();
+        const bool hasView = graph_ || pageStreamer_ || lodPages_;
         const auto actions = debugUI_.Draw(
             graph_.get(), rangeFilterStrategyManager_, strategyManager_,
-            (graph_ || pageStreamer_) ? &camera_ : nullptr,
-            (graph_ || pageStreamer_) ? &lodController_ : nullptr, datasetCatalog_, datasetLoad,
+            hasView ? &camera_ : nullptr,
+            hasView ? &lodController_ : nullptr, datasetCatalog_, datasetLoad,
             processingMode_,
             cpuGeometryRefinement_, maxScreenErrorPixels_,
             cpuResult ? &cpuResult->stats : nullptr,
@@ -1213,7 +1255,8 @@ int Application::Run() {
             validationResult_ ? &*validationResult_ : nullptr,
             processingMode_ == pipeline::ProcessingMode::Validation && cpuResult && gpuResult,
             pageStreamer_ ? &pageStreamer_->Index() : nullptr,
-            streamingStats ? &*streamingStats : nullptr, roadStyleConfig_);
+            streamingStats ? &*streamingStats : nullptr, roadStyleConfig_,
+            lodPages_ ? &lodPages_->Stats() : nullptr, &lodPageSweep_);
         debugUI_.EndFrame();
 
         if (actions.runGpuRangeBenchmark && graph_) {
@@ -1263,7 +1306,29 @@ int Application::Run() {
 
         if (actions.datasetRequest) {
             const auto& dataset = datasetCatalog_.Entries()[*actions.datasetRequest];
-            LoadDataset(dataset.graphPath, dataset.rangesPath, actions.datasetStreaming);
+            if (actions.datasetLodPages) {
+                if (lodPages_ && lodPages_->File().Path() ==
+                                     streaming::lod::LodPageFile::DefaultPath(dataset.graphPath)) {
+                    // The page reader keeps this file open; a rebuild has to be able to replace it.
+                    lodPageSweep_.Cancel();
+                    lodPages_.reset();
+                }
+                if (datasetLoader_.StartLodPages(dataset.graphPath, dataset.rangesPath,
+                                                 actions.lodPagesKeepInRam)) {
+                    std::cout << "Loading " << dataset.graphPath << " as LOD pages in background\n";
+                }
+            } else {
+                LoadDataset(dataset.graphPath, dataset.rangesPath, actions.datasetStreaming);
+            }
+        }
+
+        if (actions.startLodPageZoomSweep && lodPages_) {
+            auto csvPath = lodPages_->File().Path();
+            csvPath.replace_extension(".lod_zoom_sweep.csv");
+            lodPageSweep_.Start(csvPath, camera_);
+        }
+        if (actions.cancelLodPageZoomSweep) {
+            lodPageSweep_.Cancel();
         }
 
         if (actions.applyStreamingBudgets && pageStreamer_) {
@@ -1273,6 +1338,9 @@ int Application::Run() {
 
         window_.SwapBuffers();
 
+        if (auto lodDataset = datasetLoader_.TakeLodPagesCompleted()) {
+            InstallLodPageDataset(std::move(*lodDataset));
+        }
         if (auto streamingDataset = datasetLoader_.TakeStreamingCompleted()) {
             InstallStreamingDataset(std::move(*streamingDataset));
         }

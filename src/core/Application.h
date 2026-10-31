@@ -1,12 +1,14 @@
 #pragma once
 
 #include "benchmark/CorrectnessValidator.h"
+#include "benchmark/LodPageZoomSweep.h"
 #include "benchmark/StreamingBenchmarkLogger.h"
 #include "core/Window.h"
 #include "data/AsyncDatasetLoader.h"
 #include "data/DatasetCatalog.h"
 #include "data/ch/CHGraph.h"
 #include "gpu/OpenGLContext.h"
+#include "gpu/lod/LodPageRuntime.h"
 #include "gpu/streaming/PersistentStreamingPipeline.h"
 #include "gpu/streaming/RefinementRequestCollector.h"
 #include "gpu/filtering/RangeFilterStrategyManager.h"
@@ -43,6 +45,7 @@ public:
 private:
     void InstallDataset(data::CHGraph graph);
     void InstallStreamingDataset(data::StreamingDataset dataset);
+    void InstallLodPageDataset(streaming::lod::LodPageDataset dataset);
     void UpdateStreamingRuntime(int framebufferWidth, int framebufferHeight,
                                 float targetLodLevel, float deltaSeconds);
     [[nodiscard]] streaming::runtime::StreamingViewRequest BuildStreamingView(
@@ -143,6 +146,9 @@ private:
     double lastCursorX_ = 0.0;
     double lastCursorY_ = 0.0;
     bool wasPanning_ = false;
+    std::filesystem::path shaderDirectory_;
+    std::unique_ptr<gpu::lod::LodPageRuntime> lodPages_;
+    benchmark::LodPageZoomSweep lodPageSweep_;
 };
 
 } // namespace chmv::core
