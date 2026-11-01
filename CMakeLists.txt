@@ -47,6 +47,8 @@ add_library(chmv_data
     src/streaming/index/CHIndex.cpp
     src/streaming/lod/LodPageBuilder.cpp
     src/streaming/lod/LodPageFile.cpp
+    src/streaming/lod/LodPageHierarchy.cpp
+    src/streaming/lod/LodPageIo.cpp
     src/streaming/lod/LodPagePlanner.cpp
     src/streaming/lod/LodPageReader.cpp
     src/streaming/lod/LodPageSource.cpp

@@ -145,11 +145,17 @@ void LodPageRuntime::Update(const renderer::MapCamera2D& camera, const renderer:
     ring.maxX = static_cast<float>(centerX + halfX * (1.0 + 2.0 * kPrefetchMargin));
     ring.maxY = static_cast<float>(centerY + halfY * (1.0 + 2.0 * kPrefetchMargin));
 
+    // A camera that has not moved asks for exactly the same pages as last frame.
     const auto planBegin = Clock::now();
-    required_.clear();
-    prefetch_.clear();
-    chmv::streaming::lod::CollectLodPages(file_->Groups(), file_->Pages(), query, required_);
-    chmv::streaming::lod::CollectLodPages(file_->Groups(), file_->Pages(), ring, prefetch_);
+    if (!planned_ || query != plannedQuery_ || ring != plannedRing_) {
+        required_.clear();
+        prefetch_.clear();
+        chmv::streaming::lod::CollectLodPages(file_->Groups(), file_->Pages(), query, required_);
+        chmv::streaming::lod::CollectLodPages(file_->Groups(), file_->Pages(), ring, prefetch_);
+        plannedQuery_ = query;
+        plannedRing_ = ring;
+        planned_ = true;
+    }
     stats_.planMs = Milliseconds(planBegin);
 
     // Pin what the target needs and, if the pool has room for both, what is on screen now;
@@ -190,17 +196,23 @@ void LodPageRuntime::Update(const renderer::MapCamera2D& camera, const renderer:
     if (complete) {
         committed_ = {query.level, query.threshold, true};
         drawPages_ = required_;
+        drawPagesFromTarget_ = true;
     } else if (committed_.valid) {
         // Keep showing the last complete level/tolerance (for the current view rectangle)
         // until the new one is fully resident.
         auto previous = query;
         previous.level = committed_.level;
         previous.threshold = committed_.threshold;
-        drawPages_.clear();
-        chmv::streaming::lod::CollectLodPages(file_->Groups(), file_->Pages(), previous,
-                                              drawPages_);
+        if (previous != drawQuery_ || drawPagesFromTarget_) {
+            drawPages_.clear();
+            chmv::streaming::lod::CollectLodPages(file_->Groups(), file_->Pages(), previous,
+                                                  drawPages_);
+            drawQuery_ = previous;
+            drawPagesFromTarget_ = false;
+        }
     } else {
         drawPages_ = required_;
+        drawPagesFromTarget_ = true;
     }
     const auto drawState =
         committed_.valid ? committed_ : DrawState{query.level, query.threshold, true};

@@ -12,6 +12,7 @@
 #include "streaming/index/CHIndex.h"
 #include "streaming/lod/LodPageBuilder.h"
 #include "streaming/lod/LodPageFile.h"
+#include "streaming/lod/LodPageIo.h"
 #include "streaming/lod/LodPagePlanner.h"
 #include "streaming/runtime/GraphPageStreamer.h"
 #include "streaming/runtime/RuntimeData.h"
@@ -1090,6 +1091,22 @@ void RequireLodCutsMatchDfs(const chmv::streaming::lod::LodPageFile& file, const
 
 void TestLodPageBuilder() {
     namespace lod = chmv::streaming::lod;
+    {
+        // Section hashes must not depend on how the writes were chunked.
+        std::vector<std::uint8_t> bytes(1000);
+        for (std::size_t i = 0; i < bytes.size(); ++i) {
+            bytes[i] = static_cast<std::uint8_t>(i * 7u + 3u);
+        }
+        lod::StreamHash whole;
+        whole.Update(bytes.data(), bytes.size());
+        lod::StreamHash pieces;
+        std::size_t offset = 0;
+        for (const std::size_t size : {1u, 3u, 8u, 13u, 975u}) {
+            pieces.Update(bytes.data() + offset, size);
+            offset += size;
+        }
+        Require(whole.Finish() == pieces.Finish(), "stream hash depends on chunking");
+    }
     {
         const LodTestGraph source({}, "0 0 0\n1 0 0\n2 0 0\n3 0 0\n4 1 1\n5 1 1\n6 2 2\n");
         const auto filePath = lod::LodPageFile::DefaultPath(source.graphPath);

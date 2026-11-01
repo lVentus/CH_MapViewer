@@ -10,7 +10,9 @@ enum class BuildStage {
     ReadNodes,
     ReadEdges,
     ReadRanges,
-    ComputeHierarchy,
+    ResolveShortcuts,
+    ComputeErrors,
+    ComputeContexts,
     LayoutPages,
     WritePages,
     Verify,
@@ -31,25 +33,34 @@ struct BuildResult {
     std::uint64_t coverGapEdges = 0;
     std::uint64_t extraContextRecords = 0;
     std::uint32_t verifiedCuts = 0;
+    std::uint32_t pagePasses = 0;
+    std::uint64_t memoryBudgetBytes = 0;
     double seconds = 0.0;
 };
 
-// Builds the self-contained LOD page file from a .sch/.ranges pair. The result is written
-// under a temporary name, checked against a DFS reference cut, and only then moved to
-// outputPath, so an interrupted build never leaves a half-written file behind.
+// Builds the self-contained LOD page file from a .sch/.ranges pair, out of core: edge data
+// lives in the output file and in scratch files next to it, memory holds only node positions
+// and a few bytes per edge. The result is written under a temporary name, checked against
+// DFS reference cuts, and only then moved to outputPath, so an interrupted build never leaves
+// a half-written file behind.
 class LodPageBuilder {
 public:
     using ProgressCallback = std::function<void(const BuildProgress&)>;
 
-    // Rough peak heap use of Build(), used to refuse datasets that would not fit.
+    // Least free RAM a build needs; more only makes it use fewer passes.
     [[nodiscard]] static std::uint64_t EstimateMemoryBytes(std::uint64_t nodeCount,
                                                            std::uint64_t edgeCount);
+    // Free disk space next to the output: the file itself plus scratch files.
+    [[nodiscard]] static std::uint64_t EstimateDiskBytes(std::uint64_t nodeCount,
+                                                         std::uint64_t edgeCount);
 
-    // The callback may throw to cancel the build.
+    // memoryBudgetBytes = 0 uses three quarters of the RAM that is free right now. The callback
+    // may throw to cancel the build.
     [[nodiscard]] static BuildResult Build(const std::filesystem::path& graphPath,
                                            const std::filesystem::path& rangesPath,
                                            const std::filesystem::path& outputPath,
-                                           const ProgressCallback& progress = {});
+                                           const ProgressCallback& progress = {},
+                                           std::uint64_t memoryBudgetBytes = 0);
 };
 
 } // namespace chmv::streaming::lod

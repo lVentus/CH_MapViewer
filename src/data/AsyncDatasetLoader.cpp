@@ -72,7 +72,9 @@ DatasetLoadPhase ToDatasetPhase(streaming::lod::BuildStage stage) {
     case BuildStage::ReadEdges:
     case BuildStage::ReadRanges:
         return DatasetLoadPhase::ReadingSourceForLodPages;
-    case BuildStage::ComputeHierarchy:
+    case BuildStage::ResolveShortcuts:
+    case BuildStage::ComputeErrors:
+    case BuildStage::ComputeContexts:
         return DatasetLoadPhase::ComputingLodPageHierarchy;
     case BuildStage::LayoutPages:
         return DatasetLoadPhase::LayingOutLodPages;
@@ -92,13 +94,15 @@ struct PreprocessProgressRange {
 PreprocessProgressRange LodBuildStageRange(streaming::lod::BuildStage stage) {
     using streaming::lod::BuildStage;
     switch (stage) {
-    case BuildStage::ReadNodes:        return {0.00f, 0.05f};
-    case BuildStage::ReadEdges:        return {0.05f, 0.30f};
-    case BuildStage::ReadRanges:       return {0.30f, 0.38f};
-    case BuildStage::ComputeHierarchy: return {0.38f, 0.55f};
-    case BuildStage::LayoutPages:      return {0.55f, 0.70f};
-    case BuildStage::WritePages:       return {0.70f, 0.85f};
-    case BuildStage::Verify:           return {0.85f, 0.97f};
+    case BuildStage::ReadNodes:        return {0.00f, 0.03f};
+    case BuildStage::ReadEdges:        return {0.03f, 0.25f};
+    case BuildStage::ReadRanges:       return {0.25f, 0.30f};
+    case BuildStage::ResolveShortcuts: return {0.30f, 0.42f};
+    case BuildStage::ComputeErrors:    return {0.42f, 0.48f};
+    case BuildStage::ComputeContexts:  return {0.48f, 0.54f};
+    case BuildStage::LayoutPages:      return {0.54f, 0.64f};
+    case BuildStage::WritePages:       return {0.64f, 0.86f};
+    case BuildStage::Verify:           return {0.86f, 0.97f};
     }
     return {0.0f, 1.0f};
 }

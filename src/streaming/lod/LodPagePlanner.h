@@ -17,6 +17,8 @@ struct LodPageQuery {
     float maxY = 0.0f;
     std::uint32_t level = 0;
     std::uint32_t threshold = 0;
+
+    [[nodiscard]] bool operator==(const LodPageQuery&) const = default;
 };
 
 // Conservative per-page (or per-group) test: false only if no record inside can be drawn.

@@ -4,6 +4,7 @@
 #include "gpu/lod/LodPageRenderer.h"
 #include "renderer/RoadStyle.h"
 #include "streaming/lod/LodPageFile.h"
+#include "streaming/lod/LodPagePlanner.h"
 #include "streaming/lod/LodPageReader.h"
 
 #include <array>
@@ -126,6 +127,12 @@ private:
     std::vector<std::uint8_t> corrupt_;
     std::vector<chmv::streaming::lod::LodPageData> loaded_;
     std::uint32_t frame_ = 0;
+    // Last planned queries; an unchanged camera skips planning.
+    chmv::streaming::lod::LodPageQuery plannedQuery_;
+    chmv::streaming::lod::LodPageQuery plannedRing_;
+    chmv::streaming::lod::LodPageQuery drawQuery_;
+    bool planned_ = false;
+    bool drawPagesFromTarget_ = true;
     DrawState committed_;
     DrawState filtered_;
     double uploadBytesPerMs_ = 0.0;

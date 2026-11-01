@@ -2,16 +2,13 @@
 
 #include "data/ch/CHProjection.h"
 #include "data/ch/CHTypes.h"
-#include "streaming/runtime/GraphPageStreamer.h"
 
 #include <algorithm>
 #include <array>
 #include <charconv>
 #include <cmath>
 #include <cstring>
-#include <iomanip>
 #include <limits>
-#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -29,7 +26,7 @@ constexpr std::uint64_t kProgressStep = 1u << 20;
 class SourceTokens {
 public:
     explicit SourceTokens(const std::filesystem::path& path)
-        : name_(path.filename().string()), input_(path, std::ios::binary), buffer_(4u << 20u) {
+        : name_(path.filename()), input_(path, std::ios::binary), buffer_(4u << 20u) {
         if (!input_) {
             throw std::runtime_error("could not open " + path.string());
         }
@@ -42,7 +39,7 @@ public:
             }
             if (position_ == end_) {
                 if (!Refill(end_)) {
-                    throw std::runtime_error(name_ + ": unexpected end of file");
+                    throw std::runtime_error(Name() + ": unexpected end of file");
                 }
                 continue;
             }
@@ -72,7 +69,8 @@ public:
         return {buffer_.data() + begin, position_ - begin};
     }
 
-    [[nodiscard]] const std::string& Name() const { return name_; }
+    // Converted to narrow text only when a message needs it.
+    [[nodiscard]] std::string Name() const { return name_.string(); }
 
 private:
     static bool IsSpace(char ch) { return ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r'; }
@@ -101,7 +99,7 @@ private:
         }
     }
 
-    std::string name_;
+    std::filesystem::path name_;
     std::ifstream input_;
     std::vector<char> buffer_;
     std::size_t position_ = 0;
@@ -189,44 +187,11 @@ template <typename T>
     return static_cast<std::uint32_t>(value);
 }
 
-template <typename T> class ColumnWriter {
-public:
-    ColumnWriter(LodPageOutput& output, const SectionEntry& section)
-        : output_(&output), offset_(section.offset), end_(section.offset + section.bytes) {
-        buffer_.reserve(kBufferElements);
-    }
-
-    void Push(T value) {
-        buffer_.push_back(value);
-        if (buffer_.size() == kBufferElements) {
-            Flush();
-        }
-    }
-
-    void Flush() {
-        if (buffer_.empty()) {
-            return;
-        }
-        const auto bytes = static_cast<std::uint64_t>(buffer_.size() * sizeof(T));
-        if (offset_ + bytes > end_) {
-            throw std::logic_error("LOD page column overflow");
-        }
-        output_->WriteAt(offset_, buffer_.data(), bytes);
-        offset_ += bytes;
-        buffer_.clear();
-    }
-
-private:
-    static constexpr std::size_t kBufferElements = 1u << 16u;
-    LodPageOutput* output_;
-    std::uint64_t offset_;
-    std::uint64_t end_;
-    std::vector<T> buffer_;
-};
-
 template <typename T>
-void WriteColumn(LodPageOutput& output, const SectionEntry& section, const std::vector<T>& values) {
+void WriteSection(LodPageOutput& output, const SectionEntry& section, StreamHash& hash,
+                  const std::vector<T>& values) {
     output.WriteAt(section.offset, values.data(), values.size() * sizeof(T));
+    hash.Update(values.data(), values.size() * sizeof(T));
 }
 
 void Report(const LodPageBuilder::ProgressCallback& progress, BuildStage stage,
@@ -265,72 +230,56 @@ void PlaceCHSections(FileHeader& header, std::uint64_t& offset) {
     }
 }
 
+[[nodiscard]] StreamHash& HashOf(SectionHashes& hashes, Section section) {
+    return hashes[static_cast<std::size_t>(section)];
+}
+
 } // namespace
 
-LodPageOutput::LodPageOutput(const std::filesystem::path& path)
-    : path_(path), stream_(path, std::ios::binary | std::ios::out | std::ios::trunc) {
-    if (!stream_) {
-        throw std::runtime_error("could not create " + path.string());
-    }
-}
-
-void LodPageOutput::WriteAt(std::uint64_t offset, const void* data, std::uint64_t bytes) {
-    stream_.seekp(static_cast<std::streamoff>(offset));
-    stream_.write(static_cast<const char*>(data), static_cast<std::streamsize>(bytes));
-    if (!stream_) {
-        throw std::runtime_error("write failed: " + path_.string() + " (disk full?)");
-    }
-}
-
-void LodPageOutput::Close() {
-    stream_.close();
-    if (stream_.fail()) {
-        throw std::runtime_error("could not finish writing " + path_.string());
-    }
-}
-
-LodPageHierarchy ReadLodPageSource(const std::filesystem::path& graphPath,
-                                   const std::filesystem::path& rangesPath, FileHeader& header,
-                                   LodPageOutput& output, std::uint64_t& nextSectionOffset,
-                                   const LodPageBuilder::ProgressCallback& progress) {
+LodPageNodes ReadLodPageSource(const std::filesystem::path& graphPath,
+                               const std::filesystem::path& rangesPath, FileHeader& header,
+                               LodPageOutput& output, SectionHashes& hashes,
+                               std::uint64_t& nextSectionOffset,
+                               const SourceCountsCallback& checkCounts,
+                               const LodPageBuilder::ProgressCallback& progress) {
     SourceTokens graph(graphPath);
     const auto nodeCount = ParseNumber<std::uint64_t>(graph, graph.Next(), "node count");
     const auto edgeCount = ParseNumber<std::uint64_t>(graph, graph.Next(), "edge count");
-    if (nodeCount >= kNoEdge || edgeCount >= kNoEdge) {
-        throw std::runtime_error("graph is too large for 32-bit node/edge ids");
+    if (nodeCount == 0u || nodeCount >= kNoEdge || edgeCount >= kNoEdge) {
+        throw std::runtime_error(graph.Name() + ": node/edge counts must fit 32-bit ids");
     }
-    const auto needed = LodPageBuilder::EstimateMemoryBytes(nodeCount, edgeCount);
-    const auto available = runtime::QuerySystemMemoryInfo().availablePhysicalBytes;
-    if (available != 0u && needed > available) {
-        constexpr double kGiB = 1024.0 * 1024.0 * 1024.0;
-        std::ostringstream message;
-        message << std::fixed << std::setprecision(1)
-                << "building LOD pages for this graph needs about "
-                << static_cast<double>(needed) / kGiB << " GiB of free RAM, only "
-                << static_cast<double>(available) / kGiB
-                << " GiB available (the external-memory build is not implemented yet)";
-        throw std::runtime_error(message.str());
+    if (edgeCount == 0u) {
+        throw std::runtime_error(graph.Name() + ": graph has no edges");
+    }
+    if (checkCounts) {
+        checkCounts(nodeCount, edgeCount);
     }
 
     header.nodeCount = nodeCount;
     header.edgeCount = edgeCount;
     PlaceCHSections(header, nextSectionOffset);
 
-    LodPageHierarchy hierarchy;
-    hierarchy.nodeCount = nodeCount;
-    hierarchy.edgeCount = edgeCount;
+    LodPageNodes nodes;
+    nodes.nodeCount = nodeCount;
+    nodes.edgeCount = edgeCount;
     const auto n = static_cast<std::size_t>(nodeCount);
     const auto m = static_cast<std::size_t>(edgeCount);
 
-    // Latitude goes to nodeY and longitude to nodeX; both become projected fixed point below.
-    hierarchy.nodeX.resize(n);
-    hierarchy.nodeY.resize(n);
+    // Latitude goes to y and longitude to x; both become projected fixed point below.
+    nodes.x.resize(n);
+    nodes.y.resize(n);
+    nodes.level.resize(n);
     {
-        ColumnWriter<std::uint64_t> osmIds(output, header.At(Section::NodeOsmId));
-        ColumnWriter<std::int32_t> latitudes(output, header.At(Section::NodeLatitude));
-        ColumnWriter<std::int32_t> longitudes(output, header.At(Section::NodeLongitude));
-        ColumnWriter<float> elevations(output, header.At(Section::NodeElevation));
-        ColumnWriter<std::uint32_t> levels(output, header.At(Section::NodeLevel));
+        ColumnWriter<std::uint64_t> osmIds(output, header.At(Section::NodeOsmId),
+                                           HashOf(hashes, Section::NodeOsmId));
+        ColumnWriter<std::int32_t> latitudes(output, header.At(Section::NodeLatitude),
+                                             HashOf(hashes, Section::NodeLatitude));
+        ColumnWriter<std::int32_t> longitudes(output, header.At(Section::NodeLongitude),
+                                              HashOf(hashes, Section::NodeLongitude));
+        ColumnWriter<float> elevations(output, header.At(Section::NodeElevation),
+                                       HashOf(hashes, Section::NodeElevation));
+        ColumnWriter<std::uint32_t> levels(output, header.At(Section::NodeLevel),
+                                           HashOf(hashes, Section::NodeLevel));
         for (std::size_t i = 0; i < n; ++i) {
             const auto id = ParseNumber<std::uint64_t>(graph, graph.Next(), "node id");
             if (id != i) {
@@ -342,10 +291,16 @@ LodPageHierarchy ReadLodPageSource(const std::filesystem::path& graphPath,
             const auto longitude = ParseDegrees(graph, graph.Next());
             latitudes.Push(latitude);
             longitudes.Push(longitude);
-            hierarchy.nodeY[i] = latitude;
-            hierarchy.nodeX[i] = longitude;
+            nodes.y[i] = latitude;
+            nodes.x[i] = longitude;
             elevations.Push(ParseNumber<float>(graph, graph.Next(), "elevation"));
-            levels.Push(ParseNumber<std::uint32_t>(graph, graph.Next(), "node level"));
+            const auto level = ParseNumber<std::uint32_t>(graph, graph.Next(), "node level");
+            if (level > 0xffffu) {
+                throw std::runtime_error(graph.Name() + ": node level above 65535");
+            }
+            levels.Push(level);
+            nodes.level[i] = static_cast<std::uint16_t>(level);
+            nodes.maxNodeLevel = std::max(nodes.maxNodeLevel, level);
             Report(progress, BuildStage::ReadNodes, i + 1u, nodeCount);
         }
         osmIds.Flush();
@@ -355,82 +310,90 @@ LodPageHierarchy ReadLodPageSource(const std::filesystem::path& graphPath,
         levels.Flush();
     }
 
-    hierarchy.source.resize(m);
-    hierarchy.target.resize(m);
-    hierarchy.childA.resize(m);
-    hierarchy.childB.resize(m);
-    hierarchy.type.resize(m);
     {
-        ColumnWriter<std::uint32_t> weights(output, header.At(Section::EdgeWeight));
-        ColumnWriter<std::int16_t> maxSpeeds(output, header.At(Section::EdgeMaxSpeed));
+        ColumnWriter<std::uint32_t> sources(output, header.At(Section::EdgeSource),
+                                            HashOf(hashes, Section::EdgeSource));
+        ColumnWriter<std::uint32_t> targets(output, header.At(Section::EdgeTarget),
+                                            HashOf(hashes, Section::EdgeTarget));
+        ColumnWriter<std::uint32_t> weights(output, header.At(Section::EdgeWeight),
+                                            HashOf(hashes, Section::EdgeWeight));
+        ColumnWriter<std::int16_t> types(output, header.At(Section::EdgeType),
+                                         HashOf(hashes, Section::EdgeType));
+        ColumnWriter<std::int16_t> maxSpeeds(output, header.At(Section::EdgeMaxSpeed),
+                                             HashOf(hashes, Section::EdgeMaxSpeed));
+        ColumnWriter<std::uint32_t> childrenA(output, header.At(Section::EdgeChildA),
+                                              HashOf(hashes, Section::EdgeChildA));
+        ColumnWriter<std::uint32_t> childrenB(output, header.At(Section::EdgeChildB),
+                                              HashOf(hashes, Section::EdgeChildB));
+        const auto readChild = [&]() {
+            const auto value = ParseNumber<std::int64_t>(graph, graph.Next(), "child edge");
+            if (value >= static_cast<std::int64_t>(edgeCount)) {
+                throw std::runtime_error(graph.Name() + ": child edge out of range");
+            }
+            return value < 0 ? kNoEdge : static_cast<std::uint32_t>(value);
+        };
         for (std::size_t e = 0; e < m; ++e) {
             const auto source = ParseNumber<std::uint32_t>(graph, graph.Next(), "edge source");
             const auto target = ParseNumber<std::uint32_t>(graph, graph.Next(), "edge target");
             if (source >= nodeCount || target >= nodeCount) {
                 throw std::runtime_error(graph.Name() + ": edge endpoint out of range");
             }
-            hierarchy.source[e] = source;
-            hierarchy.target[e] = target;
+            sources.Push(source);
+            targets.Push(target);
             weights.Push(ParseWeight(graph, graph.Next()));
-            hierarchy.type[e] = ParseRanged<std::int16_t>(graph, graph.Next(), "edge type");
+            types.Push(ParseRanged<std::int16_t>(graph, graph.Next(), "edge type"));
             maxSpeeds.Push(ParseRanged<std::int16_t>(graph, graph.Next(), "max speed"));
-            for (auto* child : {&hierarchy.childA, &hierarchy.childB}) {
-                const auto value = ParseNumber<std::int64_t>(graph, graph.Next(), "child edge");
-                if (value >= static_cast<std::int64_t>(edgeCount)) {
-                    throw std::runtime_error(graph.Name() + ": child edge out of range");
-                }
-                (*child)[e] = value < 0 ? kNoEdge : static_cast<std::uint32_t>(value);
-            }
-            if ((hierarchy.childA[e] == kNoEdge) != (hierarchy.childB[e] == kNoEdge)) {
+            const auto childA = readChild();
+            const auto childB = readChild();
+            if ((childA == kNoEdge) != (childB == kNoEdge)) {
                 throw std::runtime_error(graph.Name() + ": edge " + std::to_string(e) +
                                          " has only one child");
             }
+            childrenA.Push(childA);
+            childrenB.Push(childB);
             Report(progress, BuildStage::ReadEdges, e + 1u, edgeCount);
         }
+        sources.Flush();
+        targets.Flush();
         weights.Flush();
+        types.Flush();
         maxSpeeds.Flush();
+        childrenA.Flush();
+        childrenB.Flush();
     }
-    WriteColumn(output, header.At(Section::EdgeSource), hierarchy.source);
-    WriteColumn(output, header.At(Section::EdgeTarget), hierarchy.target);
-    WriteColumn(output, header.At(Section::EdgeType), hierarchy.type);
-    WriteColumn(output, header.At(Section::EdgeChildA), hierarchy.childA);
-    WriteColumn(output, header.At(Section::EdgeChildB), hierarchy.childB);
 
-    hierarchy.birth.assign(m, -1);
-    hierarchy.death.assign(m, -1);
     {
+        // The ranges file may list edges in any order, so both columns are assembled in memory.
+        std::vector<std::int16_t> birth(m, -1);
+        std::vector<std::int16_t> death(m, -1);
         SourceTokens ranges(rangesPath);
         for (std::size_t i = 0; i < m; ++i) {
             const auto edge = ParseNumber<std::uint32_t>(ranges, ranges.Next(), "range edge id");
             if (edge >= edgeCount) {
                 throw std::runtime_error(ranges.Name() + ": range edge id out of range");
             }
-            hierarchy.birth[edge] = ParseRanged<std::int16_t>(ranges, ranges.Next(), "birth");
-            hierarchy.death[edge] = ParseRanged<std::int16_t>(ranges, ranges.Next(), "death");
+            birth[edge] = ParseRanged<std::int16_t>(ranges, ranges.Next(), "birth");
+            death[edge] = ParseRanged<std::int16_t>(ranges, ranges.Next(), "death");
             Report(progress, BuildStage::ReadRanges, i + 1u, edgeCount);
         }
-    }
-    WriteColumn(output, header.At(Section::EdgeBirth), hierarchy.birth);
-    WriteColumn(output, header.At(Section::EdgeDeath), hierarchy.death);
-    for (const auto birth : hierarchy.birth) {
-        hierarchy.maxLevel = std::max<std::int32_t>(hierarchy.maxLevel, birth);
-    }
-    if (hierarchy.maxLevel > kMaxStoredLevel) {
-        throw std::runtime_error("CH level above 65534 is not supported");
+        WriteSection(output, header.At(Section::EdgeBirth), HashOf(hashes, Section::EdgeBirth),
+                     birth);
+        WriteSection(output, header.At(Section::EdgeDeath), HashOf(hashes, Section::EdgeDeath),
+                     death);
+        for (const auto value : birth) {
+            nodes.maxRangeLevel = std::max<std::int32_t>(nodes.maxRangeLevel, value);
+        }
     }
 
-    if (n == 0u) {
-        throw std::runtime_error(graph.Name() + ": graph has no nodes");
-    }
     auto minLatitude = std::numeric_limits<std::int32_t>::max();
     auto maxLatitude = std::numeric_limits<std::int32_t>::min();
     auto minLongitude = minLatitude;
     auto maxLongitude = maxLatitude;
     for (std::size_t i = 0; i < n; ++i) {
-        minLatitude = std::min(minLatitude, hierarchy.nodeY[i]);
-        maxLatitude = std::max(maxLatitude, hierarchy.nodeY[i]);
-        minLongitude = std::min(minLongitude, hierarchy.nodeX[i]);
-        maxLongitude = std::max(maxLongitude, hierarchy.nodeX[i]);
+        minLatitude = std::min(minLatitude, nodes.y[i]);
+        maxLatitude = std::max(maxLatitude, nodes.y[i]);
+        minLongitude = std::min(minLongitude, nodes.x[i]);
+        maxLongitude = std::max(maxLongitude, nodes.x[i]);
     }
 
     // Same projection as the full-resident loader: ComputeCHProjection only looks at bounds.
@@ -451,17 +414,19 @@ LodPageHierarchy ReadLodPageSource(const std::filesystem::path& graphPath,
 
     constexpr double kLimit = 1073741823.0;
     for (std::size_t i = 0; i < n; ++i) {
-        const auto point = projection.Project(hierarchy.nodeY[i] / kDegreeScale,
-                                              hierarchy.nodeX[i] / kDegreeScale);
+        const auto point = projection.Project(nodes.y[i] / kDegreeScale, nodes.x[i] / kDegreeScale);
         const auto x = std::round(point.x * kFixedCoordinateScale);
         const auto y = std::round(point.y * kFixedCoordinateScale);
         if (std::abs(x) > kLimit || std::abs(y) > kLimit) {
             throw std::runtime_error("projected coordinate outside the fixed-point range");
         }
-        hierarchy.nodeX[i] = static_cast<std::int32_t>(x);
-        hierarchy.nodeY[i] = static_cast<std::int32_t>(y);
+        nodes.x[i] = static_cast<std::int32_t>(x);
+        nodes.y[i] = static_cast<std::int32_t>(y);
     }
-    return hierarchy;
+    if (nodes.maxRangeLevel > kMaxStoredLevel) {
+        throw std::runtime_error("CH level above 65534 is not supported");
+    }
+    return nodes;
 }
 
 } // namespace chmv::streaming::lod

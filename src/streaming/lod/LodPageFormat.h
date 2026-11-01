@@ -29,7 +29,7 @@ static_assert(std::endian::native == std::endian::little,
               "LOD page files are little-endian and mapped directly");
 
 inline constexpr std::array<char, 8> kFileMagic{'C', 'H', 'L', 'O', 'D', 'P', 'G', 'S'};
-inline constexpr std::uint32_t kFormatVersion = 1;
+inline constexpr std::uint32_t kFormatVersion = 2;
 inline constexpr std::uint64_t kHeaderBytes = 4096;
 inline constexpr std::uint64_t kSectionAlignment = 4096;
 
@@ -180,6 +180,8 @@ struct FileHeader {
     std::uint32_t referenceFramebufferHeight = 0;
     std::uint32_t pageSlotWords = 0;
     std::array<SectionEntry, kSectionCount> sections{};
+    // Hash of every section as written (StreamHash), so a copy can be checked later.
+    std::array<std::uint64_t, kSectionCount> sectionHashes{};
 
     [[nodiscard]] const SectionEntry& At(Section section) const {
         return sections[static_cast<std::size_t>(section)];
