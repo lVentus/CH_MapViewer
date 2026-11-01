@@ -70,7 +70,7 @@ public:
     void Process(const LodPagePool& pool, const LodPagePass& pass,
                  filtering::IRangeFilterStrategy& filter, unfolding::IUnfoldingStrategy& unfold);
     void Draw(const LodPagePool& pool, const renderer::MapCamera2D& camera, int width, int height,
-              const std::array<float, 4>& color, const renderer::RoadStyleConfig& styles);
+              const renderer::RoadStyleConfig& styles);
     // Runs the pass `iterations` times and waits for the timings.
     [[nodiscard]] LodPageBenchmarkResult Benchmark(const LodPagePool& pool, const LodPagePass& pass,
                                                    filtering::IRangeFilterStrategy& filter,

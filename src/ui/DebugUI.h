@@ -1,10 +1,9 @@
 #pragma once
 
-#include "renderer/RoadStyle.h"
-
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <string>
 
 namespace chmv::benchmark {
 class LodPageZoomSweep;
@@ -42,7 +41,6 @@ namespace chmv::ui {
 
 struct DebugUIActions {
     std::optional<std::size_t> datasetRequest;
-    bool rebuildPageFile = false;
     bool validate = false;
     bool runBenchmark = false;
     bool startZoomSweep = false;
@@ -60,7 +58,8 @@ struct DebugUIState {
     gpu::unfolding::UnfoldingStrategyManager& unfolds;
     float& pixelTolerance;
     bool& preloadAll;
-    renderer::RoadStyleConfig& roadStyles;
+    const std::string& roadStyleStatus;
+    bool roadStyleError = false;
     const gpu::lod::LodPageRuntimeStats* stats = nullptr;
     const gpu::lod::LodPageValidation* validation = nullptr;
     const gpu::lod::LodPageBenchmarkResult* benchmark = nullptr;
@@ -86,12 +85,10 @@ private:
     static void DrawPipeline(const DebugUIState& state, DebugUIActions& actions);
     static void DrawPageStats(const gpu::lod::LodPageRuntimeStats& stats);
     void DrawMemory(const DebugUIState& state, DebugUIActions& actions);
-    void DrawRoadStyles(const DebugUIState& state);
     static void DrawZoomSweep(const DebugUIState& state, DebugUIActions& actions);
 
     std::size_t selectedDataset_ = 0;
     int gpuBudgetMiB_ = 0;
-    int selectedRoadStyleType_ = 0;
 };
 
 } // namespace chmv::ui

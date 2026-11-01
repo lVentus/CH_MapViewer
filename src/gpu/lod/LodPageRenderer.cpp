@@ -326,8 +326,7 @@ std::array<std::uint32_t, kStatusWords> LodPageRenderer::ReadStatus() const {
 }
 
 void LodPageRenderer::Draw(const LodPagePool& pool, const renderer::MapCamera2D& camera, int width,
-                           int height, const std::array<float, 4>& color,
-                           const renderer::RoadStyleConfig& styles) {
+                           int height, const renderer::RoadStyleConfig& styles) {
     if (width <= 0 || height <= 0) {
         return;
     }
@@ -345,20 +344,12 @@ void LodPageRenderer::Draw(const LodPagePool& pool, const renderer::MapCamera2D&
                 static_cast<float>(height) / static_cast<float>(width));
     glUniform2f(glGetUniformLocation(program, "uViewportSize"), static_cast<float>(width),
                 static_cast<float>(height));
-    glUniform4f(glGetUniformLocation(program, "uColor"), color[0], color[1], color[2], color[3]);
-
-    const auto colorsLocation = glGetUniformLocation(program, "uRoadColors[0]");
-    const auto widthsLocation = glGetUniformLocation(program, "uRoadWidths[0]");
-    const bool styleValid = colorsLocation >= 0 && widthsLocation >= 0;
-    glUniform1ui(glGetUniformLocation(program, "uRoadStyleDisabled"), styles.enabled ? 0u : 1u);
-    glUniform1ui(glGetUniformLocation(program, "uRoadStyleConfigValid"), styleValid ? 1u : 0u);
-    glUniform1f(glGetUniformLocation(program, "uRoadWidthScale"), styles.globalWidthScale);
-    if (styleValid) {
-        glUniform4fv(colorsLocation, static_cast<GLsizei>(styles.colors.size()),
-                     styles.colors.front().data());
-        glUniform1fv(widthsLocation, static_cast<GLsizei>(styles.widthsPixels.size()),
-                     styles.widthsPixels.data());
-    }
+    const auto colors = styles.TypeColors();
+    const auto widths = styles.TypeWidths();
+    glUniform4fv(glGetUniformLocation(program, "uRoadColors[0]"),
+                 static_cast<GLsizei>(colors.size()), colors.front().data());
+    glUniform1fv(glGetUniformLocation(program, "uRoadWidths[0]"),
+                 static_cast<GLsizei>(widths.size()), widths.data());
 
     drawTimer_.Begin();
     glEnable(GL_BLEND);
