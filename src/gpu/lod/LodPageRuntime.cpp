@@ -1,18 +1,24 @@
 #include "gpu/lod/LodPageRuntime.h"
 
-#include "gpu/streaming/PersistentStreamingPipeline.h"
+#include "data/SystemMemory.h"
+#include "gpu/GpuMemoryInfo.h"
+#include "gpu/filtering/IRangeFilterStrategy.h"
+#include "gpu/unfolding/IUnfoldingStrategy.h"
 #include "renderer/LODController.h"
 #include "renderer/MapCamera2D.h"
-#include "streaming/lod/LodPagePlanner.h"
-#include "streaming/runtime/GraphPageStreamer.h"
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <iostream>
+#include <iterator>
 #include <span>
+#include <unordered_map>
 
 namespace chmv::gpu::lod {
 namespace {
+
+namespace format = chmv::streaming::lod;
 
 using Clock = std::chrono::steady_clock;
 constexpr std::uint64_t kMiB = 1024ull * 1024ull;
@@ -22,13 +28,14 @@ constexpr double kMovingUploadSliceMs = 4.0;
 constexpr double kStillUploadSliceMs = 12.0;
 // Pages for a ring of half a screen around the view are loaded after the view itself.
 constexpr double kPrefetchMargin = 0.5;
-// Roads just outside the screen still reach into it with half their stroke width
-// (at most 5.6 px default width times the 4x width scale).
-constexpr double kStrokeMarginPixels = 16.0;
+// Roads just outside the screen still reach into it with half their stroke width.
+constexpr double kStrokeMarginPixels = renderer::kMaxRoadWidthPixels / 2.0;
+// Pages queued per frame while preloading everything, after the view's own.
+constexpr std::uint32_t kPreloadPagesPerFrame = 4096;
 
 // The shaders trust the page blob, so a page that does not match its directory entry is never
 // uploaded.
-[[nodiscard]] bool PageMatchesEntry(const chmv::streaming::lod::PageEntry& entry,
+[[nodiscard]] bool PageMatchesEntry(const format::PageEntry& entry,
                                     std::span<const std::uint32_t> words) {
     if (words.size() != entry.wordCount ||
         words[0] != (static_cast<std::uint32_t>(entry.recordCount) |
@@ -36,9 +43,41 @@ constexpr double kStrokeMarginPixels = 16.0;
         return false;
     }
     for (std::uint32_t i = 0; i < entry.recordCount; ++i) {
-        const auto endpoints =
-            words[chmv::streaming::lod::kPageHeaderWords + i * chmv::streaming::lod::kRecordWords];
+        const auto endpoints = words[format::kPageHeaderWords + i * format::kRecordWords];
         if ((endpoints & 0xffffu) >= entry.vertexCount || (endpoints >> 16u) >= entry.vertexCount) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// The traversal kernels trust children blocks as well: marked records exist, and every
+// reference names an existing record of an existing page.
+[[nodiscard]] bool ChildrenMatchEntry(std::span<const format::PageEntry> pages,
+                                      const format::PageEntry& visit,
+                                      std::uint32_t recordCount,
+                                      std::span<const std::uint32_t> children) {
+    if (children.size() != visit.wordCount || children.size() < format::kChildMaskWords) {
+        return false;
+    }
+    std::uint32_t marked = 0;
+    for (std::uint32_t word = 0; word < format::kChildMaskWords; ++word) {
+        const auto bits = children[word];
+        const auto first = word * 32u;
+        const auto valid = recordCount <= first        ? 0u
+                           : recordCount >= first + 32u ? 0xffffffffu
+                                                        : (1u << (recordCount - first)) - 1u;
+        if ((bits & ~valid) != 0u) {
+            return false;
+        }
+        marked += static_cast<std::uint32_t>(std::popcount(bits));
+    }
+    if (children.size() != format::kChildMaskWords + 2u * marked) {
+        return false;
+    }
+    for (const auto ref : children.subspan(format::kChildMaskWords)) {
+        if (ref != format::kNoChildRef &&
+            ((ref >> 8u) >= pages.size() || (ref & 0xffu) >= pages[ref >> 8u].recordCount)) {
             return false;
         }
     }
@@ -51,23 +90,53 @@ constexpr double kStrokeMarginPixels = 16.0;
 
 // GPU pool size: the requested budget, or else what the driver/OS report right now: a third of
 // free VRAM on discrete GPUs, an eighth of free RAM on integrated ones (their "VRAM" is that
-// RAM). Never more than the dataset needs.
-[[nodiscard]] std::uint32_t ChoosePoolSlots(std::uint64_t pageCount, std::uint64_t requested) {
+// RAM). To preload every page it may take up to three quarters of free VRAM (half of free RAM).
+// Never more than the dataset needs.
+// heldBytes: the pool being replaced, still counted as used by the driver/OS.
+[[nodiscard]] std::uint32_t ChoosePoolSlots(std::uint64_t pageCount, std::uint64_t requested,
+                                            std::uint32_t slotWords, bool preloadAll,
+                                            std::uint64_t heldBytes) {
+    const auto slotBytes = std::uint64_t{slotWords} * 4u;
     std::uint64_t budget = requested;
     if (budget == 0u) {
-        const auto gpuMemory = streaming::QueryGpuMemoryInfo();
-        const auto systemMemory = chmv::streaming::runtime::QuerySystemMemoryInfo();
+        const auto gpuMemory = QueryGpuMemoryInfo();
+        const auto systemMemory = chmv::data::QuerySystemMemoryInfo();
         budget = 512u * kMiB;
-        if (gpuMemory.architecture == streaming::GPUMemoryArchitecture::Unified &&
+        std::uint64_t most = budget;
+        if (gpuMemory.architecture == GPUMemoryArchitecture::Unified &&
             systemMemory.availablePhysicalBytes != 0u) {
-            budget = systemMemory.availablePhysicalBytes / 8u;
+            const auto available = systemMemory.availablePhysicalBytes + heldBytes;
+            budget = available / 8u;
+            most = available / 2u;
         } else if (gpuMemory.reportedAvailableBytes != 0u) {
-            budget = gpuMemory.reportedAvailableBytes / 3u;
+            const auto available = gpuMemory.reportedAvailableBytes + heldBytes;
+            budget = available / 3u;
+            most = available / 4u * 3u;
+        }
+        if (preloadAll && pageCount * slotBytes <= most) {
+            budget = pageCount * slotBytes;
         }
         budget = std::max<std::uint64_t>(budget, 64u * kMiB);
     }
-    const auto slotBytes = std::uint64_t{chmv::streaming::lod::kPageSlotWords} * 4u;
     return static_cast<std::uint32_t>(std::min<std::uint64_t>(pageCount, budget / slotBytes));
+}
+
+[[nodiscard]] bool ChordInView(std::span<const std::uint32_t> words, std::uint32_t record,
+                               const std::array<double, 4>& view) {
+    const auto recordCount = words[0] & 0xffffu;
+    const auto endpoints = words[format::kPageHeaderWords + record * format::kRecordWords];
+    const auto vertexBase = format::kPageHeaderWords + recordCount * format::kRecordWords;
+    const auto coordinate = [&](std::uint32_t vertex, std::uint32_t axis) {
+        return static_cast<double>(std::bit_cast<std::int32_t>(
+                   words[vertexBase + vertex * format::kVertexWords + axis])) /
+               format::kFixedCoordinateScale;
+    };
+    const auto a = endpoints & 0xffffu;
+    const auto b = endpoints >> 16u;
+    return std::max(coordinate(a, 0), coordinate(b, 0)) >= view[0] &&
+           std::min(coordinate(a, 0), coordinate(b, 0)) <= view[2] &&
+           std::max(coordinate(a, 1), coordinate(b, 1)) >= view[1] &&
+           std::min(coordinate(a, 1), coordinate(b, 1)) <= view[3];
 }
 
 } // namespace
@@ -76,29 +145,98 @@ LodPageRuntime::LodPageRuntime(const std::filesystem::path& shaderDirectory,
                                chmv::streaming::lod::LodPageDataset dataset,
                                std::uint64_t poolBudgetBytes)
     : file_(std::move(dataset.file)), pageImage_(std::move(dataset.pageImage)),
-      renderer_(shaderDirectory) {
-    const auto pageCount = static_cast<std::uint32_t>(file_->Pages().size());
-    pool_.Initialize(pageCount, ChoosePoolSlots(pageCount, poolBudgetBytes),
-                     chmv::streaming::lod::kPageSlotWords);
-    const auto slots = pool_.SlotCount();
+      childrenImage_(std::move(dataset.childrenImage)), renderer_(shaderDirectory),
+      poolBudgetBytes_(poolBudgetBytes) {
+    const auto& header = file_->Header();
+    const auto pageCount = static_cast<std::size_t>(header.pageCount);
     requestStamp_.assign(pageCount, 0);
     requiredStamp_.assign(pageCount, 0);
     heldStamp_.assign(pageCount, 0);
     corrupt_.assign(pageCount, 0);
-    if (!pageImage_) {
-        reader_ = std::make_unique<chmv::streaming::lod::LodPageReader>(file_);
-    }
-
-    const auto& header = file_->Header();
     stats_.pageCount = header.pageCount;
     stats_.recordCount = header.recordCount;
     stats_.pageSectionBytes = file_->PageSectionBytes();
-    stats_.ramImage = pageImage_ != nullptr;
-    stats_.poolSlots = slots;
-    stats_.poolBytes = std::uint64_t{slots} * chmv::streaming::lod::kPageSlotWords * 4u;
+    stats_.fileBytes = file_->FileBytes();
+    stats_.compressedFile = file_->Compressed();
+}
+
+void LodPageRuntime::SetUpPool(bool hierarchy) {
+    const auto& header = file_->Header();
+    const auto pageCount = static_cast<std::uint32_t>(header.pageCount);
+    const auto childWords = hierarchy ? format::kChildSlotWords : 0u;
+    const auto slotWords = format::kPageSlotWords + childWords;
+    const auto heldBytes = std::uint64_t{pool_.SlotCount()} * pool_.SlotWords() * 4u;
+    pool_.Initialize(pageCount,
+                     ChoosePoolSlots(pageCount, poolBudgetBytes_, slotWords, preloadAll_, heldBytes),
+                     format::kPageSlotWords, childWords);
+    hierarchy_ = hierarchy;
+    poolReady_ = true;
+
+    // Pages come from RAM when everything the mode needs is there, otherwise from disk.
+    const bool fromRam = pageImage_ && (!hierarchy || childrenImage_);
+    reader_.reset();
+    if (!fromRam) {
+        reader_ = std::make_unique<chmv::streaming::lod::LodPageReader>(file_, hierarchy);
+    }
+    std::fill(requestStamp_.begin(), requestStamp_.end(), 0u);
+    std::fill(requiredStamp_.begin(), requiredStamp_.end(), 0u);
+    std::fill(heldStamp_.begin(), heldStamp_.end(), 0u);
+    // Pages are checked again on upload: a bad children block only matters with a hierarchy.
+    std::fill(corrupt_.begin(), corrupt_.end(), std::uint8_t{0});
+    stats_.corruptPages = 0;
+    loaded_.clear();
+    demand_.clear();
+    drawPages_.clear();
+    drawSlots_.clear();
+    filteredPages_.clear();
+    planned_ = false;
+    drawPagesFromTarget_ = true;
+    committed_ = {};
+    filteredQuery_.reset();
+    preloadCursor_ = 0;
+
+    stats_.ramImage = fromRam;
+    stats_.hierarchy = hierarchy;
+    stats_.poolSlots = pool_.SlotCount();
+    stats_.poolBytes = std::uint64_t{pool_.SlotCount()} * pool_.SlotWords() * 4u;
+    stats_.preloadAll = preloadAll_;
+    stats_.preloadFits = pool_.SlotCount() >= pageCount;
     std::cout << "LOD pages: " << header.pageCount << " pages, " << header.recordCount
-              << " records; GPU pool " << slots << " slots (" << stats_.poolBytes / kMiB
-              << " MiB); pages " << (pageImage_ ? "served from RAM" : "read from disk") << '\n';
+              << " records; GPU pool " << pool_.SlotCount() << " slots ("
+              << stats_.poolBytes / kMiB << " MiB" << (hierarchy ? ", with children" : "")
+              << "); pages " << (fromRam ? "served from RAM" : "read from disk") << '\n';
+}
+
+void LodPageRuntime::SetPreloadAll(bool preload) {
+    if (preload != preloadAll_) {
+        preloadAll_ = preload;
+        // The pool may have to grow (or may give memory back).
+        poolReady_ = false;
+    }
+}
+
+void LodPageRuntime::SetPoolBudget(std::uint64_t bytes) {
+    if (bytes != poolBudgetBytes_) {
+        poolBudgetBytes_ = bytes;
+        poolReady_ = false;
+    }
+}
+
+std::span<const chmv::streaming::lod::PageEntry> LodPageRuntime::Directory() const {
+    return hierarchy_ ? file_->VisitPages() : file_->Pages();
+}
+
+std::span<const chmv::streaming::lod::PageGroup> LodPageRuntime::Groups() const {
+    return hierarchy_ ? file_->VisitGroups() : file_->Groups();
+}
+
+LodPagePass LodPageRuntime::Pass() const {
+    LodPagePass pass;
+    pass.slots = drawSlots_;
+    pass.directory = Directory();
+    pass.query = drawQuery_;
+    pass.hierarchyHeight = file_->Header().maxHierarchyHeight;
+    return pass;
 }
 
 bool LodPageRuntime::CameraMoved(const renderer::MapCamera2D& camera, int width, int height) {
@@ -111,14 +249,21 @@ bool LodPageRuntime::CameraMoved(const renderer::MapCamera2D& camera, int width,
 }
 
 void LodPageRuntime::Update(const renderer::MapCamera2D& camera, const renderer::LODController& lod,
-                            int width, int height, float pixelTolerance) {
+                            int width, int height, float pixelTolerance,
+                            filtering::IRangeFilterStrategy& filter,
+                            unfolding::IUnfoldingStrategy& unfold) {
     const auto begin = Clock::now();
     ++frame_;
-    pool_.BeginFrame();
     renderer_.Poll();
     if (width <= 0 || height <= 0) {
         return;
     }
+    // A traversal needs the children blocks in the pool and pages planned by what it visits.
+    const bool hierarchy = unfold.Traverses();
+    if (!poolReady_ || hierarchy != hierarchy_) {
+        SetUpPool(hierarchy);
+    }
+    pool_.BeginFrame();
 
     // Everything this frame needs follows from the camera: view rectangle, level, tolerance.
     const auto& header = file_->Header();
@@ -136,8 +281,11 @@ void LodPageRuntime::Update(const renderer::MapCamera2D& camera, const renderer:
     query.maxY = static_cast<float>(centerY + halfY + margin);
     query.level = static_cast<std::uint32_t>(std::clamp<long>(
         std::lround(lod.ContinuousLevel(camera.ZoomFactor())), 0L, header.maxLevel));
-    query.threshold = chmv::streaming::lod::EncodeErrorTolerance(
-        static_cast<double>(std::max(pixelTolerance, 0.01f)) * pixel);
+    query.threshold = unfolding::ThresholdFor(
+        unfold.Mode(), format::EncodeErrorTolerance(
+                           static_cast<double>(std::max(pixelTolerance, 0.01f)) * pixel));
+    const std::array<double, 4> view{centerX - halfX, centerY - halfY, centerX + halfX,
+                                     centerY + halfY};
 
     auto ring = query;
     ring.minX = static_cast<float>(centerX - halfX * (1.0 + 2.0 * kPrefetchMargin));
@@ -150,8 +298,8 @@ void LodPageRuntime::Update(const renderer::MapCamera2D& camera, const renderer:
     if (!planned_ || query != plannedQuery_ || ring != plannedRing_) {
         required_.clear();
         prefetch_.clear();
-        chmv::streaming::lod::CollectLodPages(file_->Groups(), file_->Pages(), query, required_);
-        chmv::streaming::lod::CollectLodPages(file_->Groups(), file_->Pages(), ring, prefetch_);
+        chmv::streaming::lod::CollectLodPages(Groups(), Directory(), query, required_);
+        chmv::streaming::lod::CollectLodPages(Groups(), Directory(), ring, prefetch_);
         plannedQuery_ = query;
         plannedRing_ = ring;
         planned_ = true;
@@ -182,13 +330,15 @@ void LodPageRuntime::Update(const renderer::MapCamera2D& camera, const renderer:
             }
         }
     }
+    QueuePreload();
 
     stats_.cameraMoving = CameraMoved(camera, width, height);
     UploadMissing(stats_.cameraMoving);
 
+    // Corrupt pages never arrive; they must not keep the view incomplete forever.
     std::uint32_t missingRequired = 0;
     for (const auto page : required_) {
-        missingRequired += pool_.Resident(page) ? 0u : 1u;
+        missingRequired += pool_.Resident(page) || corrupt_[page] != 0u ? 0u : 1u;
     }
     const bool complete = missingRequired == 0u;
     // Only a full pool that keeps the view itself from loading is worth reporting.
@@ -196,6 +346,7 @@ void LodPageRuntime::Update(const renderer::MapCamera2D& camera, const renderer:
     if (complete) {
         committed_ = {query.level, query.threshold, true};
         drawPages_ = required_;
+        drawQuery_ = query;
         drawPagesFromTarget_ = true;
     } else if (committed_.valid) {
         // Keep showing the last complete level/tolerance (for the current view rectangle)
@@ -205,17 +356,16 @@ void LodPageRuntime::Update(const renderer::MapCamera2D& camera, const renderer:
         previous.threshold = committed_.threshold;
         if (previous != drawQuery_ || drawPagesFromTarget_) {
             drawPages_.clear();
-            chmv::streaming::lod::CollectLodPages(file_->Groups(), file_->Pages(), previous,
-                                                  drawPages_);
+            chmv::streaming::lod::CollectLodPages(Groups(), Directory(), previous, drawPages_);
             drawQuery_ = previous;
             drawPagesFromTarget_ = false;
         }
     } else {
         drawPages_ = required_;
+        drawQuery_ = query;
         drawPagesFromTarget_ = true;
     }
-    const auto drawState =
-        committed_.valid ? committed_ : DrawState{query.level, query.threshold, true};
+    drawView_ = view;
 
     drawSlots_.clear();
     std::vector<std::uint64_t> filterKey;
@@ -227,12 +377,23 @@ void LodPageRuntime::Update(const renderer::MapCamera2D& camera, const renderer:
             filterKey.push_back((std::uint64_t{page} << 32u) | slot);
         }
     }
-    stats_.filtered = !filtered_.valid || filtered_.level != drawState.level ||
-                      filtered_.threshold != drawState.threshold || filterKey != filteredPages_;
+    // A traversal culls with the view, so its result changes with the view too; the interval
+    // rules only depend on level, threshold and pages.
+    const auto sameQuery = [&](const chmv::streaming::lod::LodPageQuery& done) {
+        return done.level == drawQuery_.level && done.threshold == drawQuery_.threshold &&
+               (!unfold.Traverses() || done == drawQuery_);
+    };
+    const DrawState drawState{drawQuery_.level, drawQuery_.threshold, true};
+    const bool retry = renderer_.TakeRetry();
+    stats_.filtered = retry || !filteredQuery_ || !sameQuery(*filteredQuery_) ||
+                      filterKey != filteredPages_ || filteredBy_ != &filter ||
+                      unfoldedBy_ != &unfold;
     if (stats_.filtered) {
-        renderer_.Filter(pool_, drawSlots_, drawState.level, drawState.threshold);
-        filtered_ = drawState;
+        renderer_.Process(pool_, Pass(), filter, unfold);
+        filteredQuery_ = drawQuery_;
         filteredPages_ = std::move(filterKey);
+        filteredBy_ = &filter;
+        unfoldedBy_ = &unfold;
         ++stats_.filterDispatches;
     }
 
@@ -258,11 +419,14 @@ void LodPageRuntime::Update(const renderer::MapCamera2D& camera, const renderer:
     stats_.missingRequiredPages = missingRequired;
     stats_.prefetchPages = static_cast<std::uint32_t>(prefetch_.size());
     stats_.drawPages = static_cast<std::uint32_t>(drawSlots_.size());
+    stats_.candidates = renderer_.Candidates();
     stats_.drawnSegments = renderer_.DrawnSegments();
+    stats_.status = renderer_.Status();
     stats_.complete = complete;
     stats_.residentPages = pool_.ResidentCount();
     stats_.evictions = pool_.Evictions();
     stats_.gpuFilterMs = renderer_.FilterMilliseconds();
+    stats_.gpuUnfoldMs = renderer_.UnfoldMilliseconds();
     stats_.gpuDrawMs = renderer_.DrawMilliseconds();
     if (reader_) {
         const auto reader = reader_->Stats();
@@ -273,6 +437,46 @@ void LodPageRuntime::Update(const renderer::MapCamera2D& camera, const renderer:
         stats_.readerError = reader.error;
     }
     stats_.updateMs = Milliseconds(begin);
+}
+
+// With preloading, every page the view does not need yet is queued behind the view's own, a
+// bounded window per frame, until all are resident. The window only moves on once its first
+// pages are in, so pages being read or held stay wanted until they arrive. Only when the pool
+// can hold every page; otherwise preloading would just evict pages the view needs.
+void LodPageRuntime::QueuePreload() {
+    const auto pageCount = pool_.PageCount();
+    if (!preloadAll_ || pool_.SlotCount() < pageCount) {
+        return;
+    }
+    while (preloadCursor_ < pageCount &&
+           (pool_.Resident(preloadCursor_) || corrupt_[preloadCursor_] != 0u)) {
+        ++preloadCursor_;
+    }
+    std::uint32_t queued = 0;
+    for (auto page = preloadCursor_; page < pageCount && queued < kPreloadPagesPerFrame; ++page) {
+        if (!pool_.Resident(page) && corrupt_[page] == 0u) {
+            ++queued;
+            if (requestStamp_[page] != frame_) {
+                requestStamp_[page] = frame_;
+                missing_.push_back(page);
+            }
+        }
+    }
+}
+
+bool LodPageRuntime::Upload(std::uint32_t page, std::span<const std::uint32_t> words,
+                            std::span<const std::uint32_t> children) {
+    const auto& entry = file_->Pages()[page];
+    if (!PageMatchesEntry(entry, words) ||
+        (hierarchy_ && !ChildrenMatchEntry(file_->Pages(), file_->VisitPages()[page],
+                                           entry.recordCount, children))) {
+        if (corrupt_[page] == 0u) {
+            corrupt_[page] = 1u;
+            ++stats_.corruptPages;
+        }
+        return true;
+    }
+    return pool_.Upload(page, words, hierarchy_ ? children : std::span<const std::uint32_t>{});
 }
 
 void LodPageRuntime::UploadMissing(bool cameraMoving) {
@@ -286,33 +490,36 @@ void LodPageRuntime::UploadMissing(bool cameraMoving) {
     std::uint64_t uploaded = 0;
     std::uint32_t pages = 0;
     stats_.poolFull = false;
-    const auto upload = [&](std::uint32_t page, std::span<const std::uint32_t> words) {
+    const auto upload = [&](std::uint32_t page, std::span<const std::uint32_t> words,
+                            std::span<const std::uint32_t> children) {
         if (pool_.Resident(page)) {
             return true;
         }
-        if (!PageMatchesEntry(file_->Pages()[page], words)) {
-            corrupt_[page] = 1u;
-            ++stats_.corruptPages;
-            return true;
-        }
-        if (!pool_.Upload(page, words)) {
+        if (!Upload(page, words, children)) {
             stats_.poolFull = true;
             return false;
         }
-        uploaded += words.size_bytes();
-        ++pages;
+        if (pool_.Resident(page)) {
+            uploaded += words.size_bytes() + children.size_bytes();
+            ++pages;
+        }
         return true;
     };
 
-    if (pageImage_) {
+    if (!reader_) {
         for (const auto page : missing_) {
             if (uploaded >= budget) {
                 break;
             }
-            const auto& entry = file_->Pages()[page];
             const std::span<const std::uint32_t> words(
-                pageImage_->data() + file_->PageWordOffset(page), entry.wordCount);
-            if (!upload(page, words)) {
+                pageImage_->data() + file_->PageWordOffset(page), file_->Pages()[page].wordCount);
+            std::span<const std::uint32_t> children;
+            if (hierarchy_) {
+                children = std::span<const std::uint32_t>(
+                    childrenImage_->data() + file_->ChildrenWordOffset(page),
+                    file_->VisitPages()[page].wordCount);
+            }
+            if (!upload(page, words, children)) {
                 break;
             }
         }
@@ -321,7 +528,7 @@ void LodPageRuntime::UploadMissing(bool cameraMoving) {
         // they are still wanted; the view's own pages go first.
         std::uint64_t held = 0;
         for (const auto& page : loaded_) {
-            held += page.words.size() * 4u;
+            held += (page.words.size() + page.children.size()) * 4u;
         }
         if (held < budget) {
             reader_->Take(loaded_, budget - held);
@@ -335,7 +542,7 @@ void LodPageRuntime::UploadMissing(bool cameraMoving) {
                               });
         std::size_t done = 0;
         while (done < loaded_.size() && uploaded < budget &&
-               upload(loaded_[done].page, loaded_[done].words)) {
+               upload(loaded_[done].page, loaded_[done].words, loaded_[done].children)) {
             ++done;
         }
         loaded_.erase(loaded_.begin(), loaded_.begin() + static_cast<std::ptrdiff_t>(done));
@@ -368,17 +575,126 @@ void LodPageRuntime::UploadMissing(bool cameraMoving) {
 }
 
 void LodPageRuntime::Draw(const renderer::MapCamera2D& camera, int width, int height,
-                          const std::array<float, 4>& color,
                           const renderer::RoadStyleConfig& styles) {
-    renderer_.Draw(pool_, camera, width, height, color, styles);
+    if (poolReady_) {
+        renderer_.Draw(pool_, camera, width, height, styles);
+    }
 }
 
-std::vector<std::pair<std::uint32_t, std::uint32_t>> LodPageRuntime::ReadDrawnRecords() const {
-    std::vector<std::pair<std::uint32_t, std::uint32_t>> records;
-    for (const auto item : renderer_.ReadSegments()) {
-        records.emplace_back(pool_.PageOfSlot(item >> 8u), item & 0xffu);
+LodPageBenchmarkResult LodPageRuntime::Benchmark(filtering::IRangeFilterStrategy& filter,
+                                                 unfolding::IUnfoldingStrategy& unfold,
+                                                 std::uint32_t iterations) {
+    if (!poolReady_) {
+        return {};
     }
-    return records;
+    return renderer_.Benchmark(pool_, Pass(), filter, unfold, iterations);
+}
+
+LodPageValidation LodPageRuntime::Validate() const {
+    const auto begin = Clock::now();
+    LodPageValidation result;
+    result.level = drawQuery_.level;
+    result.threshold = drawQuery_.threshold;
+    result.pages = static_cast<std::uint32_t>(drawSlots_.size());
+    result.status = renderer_.ReadStatus();
+    if (!poolReady_) {
+        return result;
+    }
+
+    struct PageData {
+        std::vector<std::uint32_t> words;
+        std::vector<std::uint32_t> edges;
+    };
+    std::unordered_map<std::uint32_t, PageData> cache;
+    const auto pageData = [&](std::uint32_t page) -> const PageData& {
+        auto [it, added] = cache.try_emplace(page);
+        if (added) {
+            const auto& entry = file_->Pages()[page];
+            if (pageImage_) {
+                const auto* first = pageImage_->data() + file_->PageWordOffset(page);
+                it->second.words.assign(first, first + entry.wordCount);
+            } else {
+                it->second.words = file_->ReadPage(page);
+            }
+            it->second.edges = file_->ReadRecordEdges(entry.firstRecord, entry.recordCount);
+        }
+        return it->second;
+    };
+    const auto record = [&](const PageData& data, std::uint32_t local) {
+        return std::span<const std::uint32_t>(data.words).subspan(
+            format::kPageHeaderWords + local * format::kRecordWords, format::kRecordWords);
+    };
+
+    // Candidates: the same set whatever the filter.
+    std::vector<std::uint64_t> gpuCandidates;
+    for (const auto item : renderer_.ReadCandidates()) {
+        gpuCandidates.push_back((std::uint64_t{pool_.PageOfSlot(item >> 8u)} << 8u) |
+                                (item & 0xffu));
+    }
+    std::vector<std::uint64_t> cpuCandidates;
+    for (const auto slot : drawSlots_) {
+        const auto page = pool_.PageOfSlot(slot);
+        const auto& data = pageData(page);
+        for (std::uint32_t local = 0; local < file_->Pages()[page].recordCount; ++local) {
+            const auto words = record(data, local);
+            const auto inRange = [&](std::uint32_t range) {
+                return drawQuery_.level >= (range & 0xffffu) && drawQuery_.level <= (range >> 16u);
+            };
+            if (inRange(words[1]) || inRange(words[2])) {
+                cpuCandidates.push_back((std::uint64_t{page} << 8u) | local);
+            }
+        }
+    }
+    std::sort(gpuCandidates.begin(), gpuCandidates.end());
+    std::sort(cpuCandidates.begin(), cpuCandidates.end());
+    std::vector<std::uint64_t> difference;
+    std::set_symmetric_difference(gpuCandidates.begin(), gpuCandidates.end(),
+                                  cpuCandidates.begin(), cpuCandidates.end(),
+                                  std::back_inserter(difference));
+    result.gpuCandidates = gpuCandidates.size();
+    result.cpuCandidates = cpuCandidates.size();
+    result.candidateMismatches = difference.size();
+
+    // Drawn roads inside the view, as CH edges.
+    std::vector<std::uint32_t> gpuEdges;
+    const auto segments = renderer_.ReadSegments();
+    result.gpuSegments = segments.size();
+    for (const auto item : segments) {
+        const auto page = pool_.PageOfSlot(item >> 8u);
+        const auto& data = pageData(page);
+        if (ChordInView(data.words, item & 0xffu, drawView_)) {
+            gpuEdges.push_back(data.edges[item & 0xffu]);
+        }
+    }
+    // The reference: the dual-interval rule on every page the main directory plans.
+    std::vector<std::uint32_t> pages;
+    chmv::streaming::lod::CollectLodPages(file_->Groups(), file_->Pages(), drawQuery_, pages);
+    std::vector<std::uint32_t> cpuEdges;
+    for (const auto page : pages) {
+        const auto& data = pageData(page);
+        for (std::uint32_t local = 0; local < file_->Pages()[page].recordCount; ++local) {
+            const auto words = record(data, local);
+            if (format::RecordDrawn(words[1], words[2], words[3], drawQuery_.level,
+                                    drawQuery_.threshold) &&
+                ChordInView(data.words, local, drawView_)) {
+                cpuEdges.push_back(data.edges[local]);
+            }
+        }
+    }
+    std::sort(gpuEdges.begin(), gpuEdges.end());
+    std::sort(cpuEdges.begin(), cpuEdges.end());
+    std::vector<std::uint32_t> missing;
+    std::vector<std::uint32_t> extra;
+    std::set_difference(cpuEdges.begin(), cpuEdges.end(), gpuEdges.begin(), gpuEdges.end(),
+                        std::back_inserter(missing));
+    std::set_difference(gpuEdges.begin(), gpuEdges.end(), cpuEdges.begin(), cpuEdges.end(),
+                        std::back_inserter(extra));
+    result.gpuSegmentsInView = gpuEdges.size();
+    result.cpuSegmentsInView = cpuEdges.size();
+    result.missingOnGpu = missing.size();
+    result.extraOnGpu = extra.size();
+    result.cpuMilliseconds = Milliseconds(begin);
+    return result;
 }
 
 } // namespace chmv::gpu::lod

@@ -1,0 +1,52 @@
+#version 430 core
+
+// Page culling: the GPU itself decides which resident pages the view needs, with the same test
+// the CPU planner applies to the page directory (MayDraw in LodPagePlanner.h). One invocation
+// per pool slot; the kept slots go to a list for the full scan.
+
+layout(local_size_x = 256) in;
+
+#include "lod_page_common.glsl"
+
+// Per slot: box (float bits), minLevel | maxLevel << 16, minErrorCode | maxParentCode << 16,
+// two spare words, then the 16 band minima and the 16 band maxima as bytes.
+layout(std430, binding = 5) readonly buffer SlotEntries { uvec4 entries[]; };
+layout(std430, binding = 3) buffer SlotList {
+    uint slotCount;
+    uint slotGroups[3];
+    uint slots[];
+};
+
+uniform uint uPoolSlots;
+uniform vec4 uQueryBox;
+uniform uint uLevel;
+uniform uint uThreshold;
+
+uint bandByte(uvec4 words, uint band) {
+    return (words[band >> 2u] >> ((band & 3u) * 8u)) & 0xffu;
+}
+
+bool mayDraw(uint slot) {
+    vec4 box = uintBitsToFloat(entries[slot * 4u]);
+    uvec4 meta = entries[slot * 4u + 1u];
+    uint minLevel = meta.x & 0xffffu;
+    uint maxLevel = meta.x >> 16u;
+    uint minErrorCode = meta.y & 0xffffu;
+    uint maxParentCode = meta.y >> 16u;
+    if (box.z < uQueryBox.x || box.x > uQueryBox.z || box.w < uQueryBox.y ||
+        box.y > uQueryBox.w || uLevel < minLevel || uLevel > maxLevel ||
+        uThreshold < minErrorCode || uThreshold >= maxParentCode) {
+        return false;
+    }
+    uint band = (uLevel - minLevel) * 16u / (maxLevel - minLevel + 1u);
+    uint code = uThreshold >> 8u;
+    return code >= bandByte(entries[slot * 4u + 2u], band) &&
+           code <= bandByte(entries[slot * 4u + 3u], band);
+}
+
+void main() {
+    uint slot = linearInvocation();
+    if (slot < uPoolSlots && mayDraw(slot)) {
+        slots[atomicAdd(slotCount, 1u)] = slot;
+    }
+}

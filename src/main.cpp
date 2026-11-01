@@ -47,9 +47,16 @@ int main(int argc, char** argv) {
         chmv::core::Application app(FindAssetDirectory(argv[0]));
 
         if (argc == 3) {
-            app.LoadDataset(argv[1], argv[2]);
+            chmv::data::DatasetEntry dataset;
+            dataset.graphPath = argv[1];
+            dataset.rangesPath = argv[2];
+            app.LoadDataset(dataset);
+        } else if (argc == 2 && std::filesystem::path(argv[1]).extension() == ".chlod") {
+            chmv::data::DatasetEntry dataset;
+            dataset.pageFilePath = argv[1];
+            app.LoadDataset(dataset);
         } else if (argc != 1) {
-            std::cerr << "Usage: CH_MapViewer [graph.sch graph.sch.ranges]\n";
+            std::cerr << "Usage: CH_MapViewer [graph.sch graph.sch.ranges | graph.chlod]\n";
             return 1;
         }
 

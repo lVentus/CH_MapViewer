@@ -1,1 +1,9 @@
-Compute and rendering shaders live here. Each unfolding strategy should keep its shaders close to the strategy name and avoid sharing strategy-specific state through global shader includes.
+Compute and rendering shaders of the LOD page pipeline.
+
+- `lod_page_*.glsl` are included by the kernels (`#include "name"`, resolved by ComputeProgram)
+  and describe shared layout only: the page pool, GPU lists, status counters, the record order
+  of the birth-ordered filter and the hierarchy walk. No strategy keeps state in them.
+- `lod_filter_*.comp` belong to the filter strategies (full scan, birth-ordered, GPU page
+  culling), `lod_unfold_*.comp` to the expansion strategies (interval rules, DFS, BFS).
+- `lod_list_groups.comp` and `lod_draw_finish.comp` turn GPU counts into indirect dispatch and
+  draw arguments; `lod_page_road.vert/.frag` draw the segment list.

@@ -27,39 +27,30 @@ if(WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 4)
     )
 endif()
 
+include(cmake/Zstd.cmake)
+
 add_library(chmv_data
-    src/benchmark/CorrectnessValidator.cpp
     src/data/AsyncDatasetLoader.cpp
     src/data/DatasetCatalog.cpp
-    src/data/ch/CHGraph.cpp
+    src/data/SystemMemory.cpp
     src/data/ch/CHProjection.cpp
-    src/data/ch/CHLoader.cpp
-    src/data/preprocessing/GeometryErrorPreprocessor.cpp
-    src/pipeline/CPUReferencePipeline.cpp
     src/renderer/LODController.cpp
     src/renderer/MapCamera2D.cpp
-    src/reference/CPURangeFilter.cpp
-    src/reference/CPUReferenceUnfolder.cpp
-    src/streaming/analysis/DatasetLayoutAnalyzer.cpp
-    src/streaming/analysis/DatasetLayoutReport.cpp
-    src/streaming/preprocess/DatasetPreprocessor.cpp
-    src/streaming/preprocess/ExternalPreprocess.cpp
-    src/streaming/index/CHIndex.cpp
+    src/renderer/RoadStyle.cpp
     src/streaming/lod/LodPageBuilder.cpp
+    src/streaming/lod/LodPageCompression.cpp
     src/streaming/lod/LodPageFile.cpp
     src/streaming/lod/LodPageHierarchy.cpp
     src/streaming/lod/LodPageIo.cpp
     src/streaming/lod/LodPagePlanner.cpp
     src/streaming/lod/LodPageReader.cpp
     src/streaming/lod/LodPageSource.cpp
-    src/streaming/runtime/GraphPageStreamer.cpp
-    src/streaming/runtime/RuntimeData.cpp
 )
 
 target_include_directories(chmv_data PUBLIC src)
 
 target_compile_features(chmv_data PUBLIC cxx_std_20)
-target_link_libraries(chmv_data PUBLIC Threads::Threads)
+target_link_libraries(chmv_data PUBLIC Threads::Threads PRIVATE chmv_zstd)
 
 if(DEFINED CHMV_MSVC_RUNTIME_LIBRARY)
     set_property(TARGET chmv_data PROPERTY MSVC_RUNTIME_LIBRARY "${CHMV_MSVC_RUNTIME_LIBRARY}")
@@ -77,30 +68,28 @@ if(CHMV_BUILD_APP)
 
     add_executable(CH_MapViewer
         src/main.cpp
+        src/benchmark/GPUTimer.cpp
+        src/benchmark/LodPageZoomSweep.cpp
         src/core/Application.cpp
         src/core/Window.cpp
-        src/gpu/OpenGLContext.cpp
-        src/gpu/GPUBuffer.cpp
         src/gpu/ComputeProgram.cpp
+        src/gpu/GPUBuffer.cpp
+        src/gpu/GpuMemoryInfo.cpp
         src/gpu/GraphicsProgram.cpp
-        src/gpu/filtering/RangeFilterStrategyManager.cpp
-        src/gpu/filtering/FullScanRangeFilterStrategy.cpp
+        src/gpu/OpenGLContext.cpp
         src/gpu/filtering/BirthOrderedRangeFilterStrategy.cpp
-        src/gpu/streaming/RefinementRequestCollector.cpp
-        src/gpu/streaming/PersistentStreamingPipeline.cpp
+        src/gpu/filtering/FullScanRangeFilterStrategy.cpp
+        src/gpu/filtering/PageCullingRangeFilterStrategy.cpp
+        src/gpu/filtering/RangeFilterStrategyManager.cpp
+        src/gpu/lod/LodPageLists.cpp
         src/gpu/lod/LodPagePool.cpp
         src/gpu/lod/LodPageRenderer.cpp
         src/gpu/lod/LodPageRuntime.cpp
-        src/benchmark/GPUTimer.cpp
-        src/benchmark/LodPageZoomSweep.cpp
-        src/benchmark/StreamingBenchmarkLogger.cpp
-        src/gpu/unfolding/UnfoldingStrategyManager.cpp
-        src/gpu/unfolding/NoUnfoldingStrategy.cpp
-        src/gpu/unfolding/IterativeDFSUnfoldingStrategy.cpp
         src/gpu/unfolding/AdaptiveDFSUnfoldingStrategy.cpp
-        src/pipeline/GPUDrivenPipeline.cpp
+        src/gpu/unfolding/BFSUnfoldingStrategy.cpp
+        src/gpu/unfolding/ExpansionKernels.cpp
+        src/gpu/unfolding/UnfoldingStrategyManager.cpp
         src/renderer/Renderer.cpp
-        src/renderer/RoadRenderer.cpp
         src/ui/DebugUI.cpp
     )
 
@@ -129,6 +118,9 @@ if(CHMV_BUILD_APP)
         COMMAND ${CMAKE_COMMAND} -E copy_directory
             ${CMAKE_CURRENT_SOURCE_DIR}/assets/shaders
             $<TARGET_FILE_DIR:CH_MapViewer>/assets/shaders
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${CMAKE_CURRENT_SOURCE_DIR}/assets/road_styles.cfg
+            $<TARGET_FILE_DIR:CH_MapViewer>/assets/road_styles.cfg
     )
 endif()
 
@@ -139,6 +131,8 @@ if(CHMV_BUILD_TESTS)
         tests/TestMain.cpp
     )
     target_link_libraries(chmv_tests PRIVATE chmv_data)
+    target_compile_definitions(chmv_tests PRIVATE
+        CHMV_ROAD_STYLES="${CMAKE_CURRENT_SOURCE_DIR}/assets/road_styles.cfg")
     target_include_directories(chmv_tests PRIVATE src)
     if(DEFINED CHMV_MSVC_RUNTIME_LIBRARY)
         set_property(TARGET chmv_tests PROPERTY MSVC_RUNTIME_LIBRARY "${CHMV_MSVC_RUNTIME_LIBRARY}")

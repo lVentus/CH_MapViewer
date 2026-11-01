@@ -1,32 +1,28 @@
-#include "benchmark/CorrectnessValidator.h"
 #include "data/AsyncDatasetLoader.h"
 #include "data/DatasetCatalog.h"
-#include "data/ch/CHLoader.h"
-#include "data/preprocessing/GeometryErrorPreprocessor.h"
-#include "geometry/GeometryRefinement.h"
-#include "pipeline/CPUReferencePipeline.h"
-#include "reference/CPURangeFilter.h"
-#include "reference/CPUReferenceUnfolder.h"
-#include "streaming/analysis/DatasetLayoutAnalyzer.h"
-#include "streaming/preprocess/DatasetPreprocessor.h"
-#include "streaming/index/CHIndex.h"
+#include "data/ch/CHTypes.h"
+#include "renderer/RoadStyle.h"
 #include "streaming/lod/LodPageBuilder.h"
+#include "streaming/lod/LodPageCompression.h"
 #include "streaming/lod/LodPageFile.h"
+#include "streaming/lod/LodPageFormat.h"
 #include "streaming/lod/LodPageIo.h"
 #include "streaming/lod/LodPagePlanner.h"
-#include "streaming/runtime/GraphPageStreamer.h"
-#include "streaming/runtime/RuntimeData.h"
+#include "streaming/lod/LodPageReader.h"
 
 #include <algorithm>
 #include <bit>
 #include <chrono>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
 #include <string>
 #include <thread>
-#include <tuple>
 #include <vector>
 
 namespace {
@@ -35,963 +31,6 @@ void Require(bool condition, const char* message) {
     if (!condition) {
         throw std::runtime_error(message);
     }
-}
-
-chmv::data::CHGraph LoadTestGraph() {
-    const auto base = std::filesystem::temp_directory_path() / "chmv_test";
-    const auto graphPath = base.string() + ".sch";
-    const auto rangePath = base.string() + ".sch.ranges";
-
-    {
-        std::ofstream graph(graphPath);
-        graph << "# small graph\n";
-        graph << "3\n";
-        graph << "3\n";
-        graph << "0 100 48.0 9.0 0 2\n";
-        graph << "1 101 48.1 9.2 0 1\n";
-        graph << "2 102 48.2 9.2 0 0\n";
-        graph << "0 1 1.0 1 50 -1 -1\n";
-        graph << "1 2 1.0 1 50 -1 -1\n";
-        graph << "0 2 2.0 1 50 0 1\n";
-    }
-
-    {
-        std::ofstream ranges(rangePath);
-        ranges << "0 2 0\n";
-        ranges << "1 2 0\n";
-        ranges << "2 2 1\n";
-    }
-
-    auto graph = chmv::data::CHLoader::Load(graphPath, rangePath);
-    chmv::data::preprocessing::GeometryErrorPreprocessor::Run(graph);
-    std::filesystem::remove(graphPath);
-    std::filesystem::remove(rangePath);
-    return graph;
-}
-
-void TestLoaderAndReferenceUnfolding() {
-    const auto graph = LoadTestGraph();
-    Require(graph.NodeCount() == 3, "node count mismatch");
-    Require(graph.EdgeCount() == 3, "edge count mismatch");
-    Require(graph.ShortcutCount() == 1, "shortcut count mismatch");
-    Require(graph.Range(2).IsAlive(1), "range should be alive at level 1");
-    Require(!graph.Range(2).IsAlive(0), "range should not be alive at level 0");
-
-    const chmv::reference::CPUReferenceUnfolder unfolder(graph);
-    const std::vector<std::uint32_t> roots{2};
-    const auto output = unfolder.UnfoldFully(roots);
-
-    Require(output.size() == 2, "unexpected unfolded edge count");
-    Require(output[0] == 0 && output[1] == 1, "unexpected unfolding order");
-}
-
-void TestCPURangeFilterAndPipeline() {
-    const auto graph = LoadTestGraph();
-
-    chmv::reference::CPURangeFilter filter;
-    std::vector<std::uint32_t> alive;
-    const auto filterStats = filter.Filter(graph, 1, alive);
-    Require(alive.size() == 3, "unexpected CPU range-filter result");
-    Require(filterStats.scannedEdgeCount == 3, "unexpected ordered scan count");
-
-    chmv::pipeline::CPUReferencePipeline pipeline;
-    const chmv::geometry::RefinementParameters paperRefinement{};
-    const auto paperResult = pipeline.Process(graph, 1, paperRefinement);
-    Require(paperResult.stats.aliveEdgeCount == 3, "unexpected CPU pipeline alive count");
-    Require(paperResult.edgeIds.size() == 3, "paper pipeline should render lifetime edges directly");
-    Require(!paperResult.stats.cacheHit, "first CPU pipeline result must not be cached");
-
-    const auto cachedPaper = pipeline.Process(graph, 1, paperRefinement);
-    Require(cachedPaper.stats.cacheHit, "unchanged CPU paper result should be cached");
-
-    const chmv::geometry::RefinementParameters fullRefinement{
-        chmv::geometry::RefinementMode::Full, 0.0f, 1.0f};
-    const auto refinedResult = pipeline.Process(graph, 1, fullRefinement);
-    Require(refinedResult.edgeIds.size() == 4, "unexpected CPU geometry-refined edge count");
-    Require(!refinedResult.stats.cacheHit, "changing geometry refinement must invalidate the cache");
-
-    Require(graph.Edge(2).geometryError > 0.0f, "shortcut geometry error was not precomputed");
-    const chmv::geometry::RefinementParameters adaptiveRefinement{
-        chmv::geometry::RefinementMode::Adaptive, 100.0f, 0.01f};
-    const auto adaptiveResult = pipeline.Process(graph, 1, adaptiveRefinement);
-    Require(adaptiveResult.edgeIds.size() == 4, "adaptive refinement did not unfold visible error");
-}
-
-void TestOrderedRangeRetrieval() {
-    chmv::data::CHGraph graph;
-    graph.Edges().resize(4);
-    graph.Ranges() = {
-        {3, 0},
-        {2, 1},
-        {1, 1},
-        {0, 0},
-    };
-
-    chmv::reference::CPURangeFilter filter;
-    std::vector<std::uint32_t> output;
-    const auto stats = filter.Filter(graph, 2, output);
-
-    Require(stats.scannedEdgeCount == 2, "ordered retrieval scanned too many edges");
-    Require(output.size() == 2, "ordered retrieval output count mismatch");
-    Require(output[0] == 0 && output[1] == 1, "ordered retrieval output mismatch");
-}
-
-
-void TestAsyncDatasetLoader() {
-    const auto root = std::filesystem::temp_directory_path() / "chmv_async_test_root";
-    std::filesystem::remove_all(root);
-    std::filesystem::create_directories(root);
-    const auto graphPath = root / "sample.sch";
-    const auto rangePath = root / "sample.sch.ranges";
-
-    {
-        std::ofstream graph(graphPath);
-        graph << "2\n1\n";
-        graph << "0 100 48.0 9.0 0 1\n";
-        graph << "1 101 48.1 9.1 0 0\n";
-        graph << "0 1 1.0 1 50 -1 -1\n";
-    }
-    {
-        std::ofstream ranges(rangePath);
-        ranges << "0 1 0\n";
-    }
-
-    chmv::data::AsyncDatasetLoader loader;
-    Require(loader.Start(graphPath, rangePath), "async loader did not start");
-
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-    while (loader.Snapshot().phase != chmv::data::DatasetLoadPhase::Ready &&
-           loader.Snapshot().phase != chmv::data::DatasetLoadPhase::Failed &&
-           std::chrono::steady_clock::now() < deadline) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-
-    const auto snapshot = loader.Snapshot();
-    Require(snapshot.phase == chmv::data::DatasetLoadPhase::Ready,
-            "out-of-core OFF did not produce a full-resident binary graph");
-    Require(snapshot.progress == 1.0f, "async loader progress did not reach 100 percent");
-
-    auto fullResidentGraph = loader.TakeCompleted();
-    Require(fullResidentGraph.has_value(), "full-resident binary graph result missing");
-    Require(fullResidentGraph->NodeCount() == 2 && fullResidentGraph->EdgeCount() == 1,
-            "full-resident binary graph count mismatch");
-    Require(fullResidentGraph->Ranges()[0].birthLevel == 1 &&
-                fullResidentGraph->Ranges()[0].deathLevel == 0,
-            "full-resident binary range mismatch");
-    Require(chmv::streaming::preprocess::DatasetPreprocessor::HasValidPreprocess(graphPath, rangePath),
-            "async loader should create and validate Preprocess automatically");
-
-    chmv::data::AsyncDatasetLoader streamingLoader;
-    Require(streamingLoader.StartStreaming(graphPath, rangePath),
-            "streaming async loader did not start");
-    const auto streamingDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-    while (streamingLoader.Snapshot().phase != chmv::data::DatasetLoadPhase::PreprocessedForStreaming &&
-           streamingLoader.Snapshot().phase != chmv::data::DatasetLoadPhase::Failed &&
-           std::chrono::steady_clock::now() < streamingDeadline) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-    Require(streamingLoader.Snapshot().phase == chmv::data::DatasetLoadPhase::PreprocessedForStreaming,
-            "streaming async loader did not expose the preprocessed runtime dataset");
-    auto streamingDataset = streamingLoader.TakeStreamingCompleted();
-    Require(streamingDataset.has_value(), "streaming async loader result missing");
-    Require(streamingDataset->index.nodeCount == 2 && streamingDataset->index.edgeCount == 1,
-            "streaming async loader index mismatch");
-
-    std::filesystem::remove_all(root);
-}
-
-
-void TestDatasetLayoutAnalyzer() {
-    const auto base = std::filesystem::temp_directory_path() / "chmv_layout_analysis_test";
-    const auto graphPath = base.string() + ".sch";
-    const auto rangePath = base.string() + ".sch.ranges";
-    const auto outputPath = base.string() + ".output";
-
-    {
-        std::ofstream graph(graphPath);
-        graph << "4\n4\n";
-        graph << "0 100 48.0 9.0 0 3\n";
-        graph << "1 101 48.0 9.1 0 2\n";
-        graph << "2 102 48.1 9.1 0 1\n";
-        graph << "3 103 48.1 9.2 0 0\n";
-        graph << "0 1 1.0 1 50 -1 -1\n";
-        graph << "1 2 1.0 1 50 -1 -1\n";
-        graph << "2 3 1.0 1 50 -1 -1\n";
-        graph << "0 2 2.0 1 50 0 1\n";
-    }
-    {
-        std::ofstream ranges(rangePath);
-        ranges << "0 3 0\n";
-        ranges << "1 3 0\n";
-        ranges << "2 -1 -1\n";
-        ranges << "3 3 2\n";
-    }
-
-    chmv::streaming::analysis::DatasetLayoutAnalysisConfig config;
-    config.spatialGridSize = 16;
-    config.lodBandWidth = 2;
-    config.sourceBlockNodeCount = 2;
-    config.sourceBlockEdgeCount = 2;
-    config.virtualPageEdgeCount = 2;
-
-    const auto report = chmv::streaming::analysis::DatasetLayoutAnalyzer::Analyze(
-        graphPath, rangePath, config);
-    Require(report.nodeCount == 4 && report.edgeCount == 4,
-            "layout analyzer dataset counts mismatch");
-    Require(report.shortcutCount == 1, "layout analyzer shortcut count mismatch");
-    Require(report.drawableEdgeCount == 3 && report.nonDrawableEdgeCount == 1,
-            "layout analyzer drawable counts mismatch");
-    Require(report.nodeRecordSequentialRatio == 1.0,
-            "layout analyzer node order detection mismatch");
-    Require(report.rangeRecordSequentialRatio == 1.0,
-            "layout analyzer range order detection mismatch");
-    Require(report.nodeSourceBlocks.size() == 2,
-            "layout analyzer node source block count mismatch");
-    Require(report.graphSourceBlocks.size() == 2,
-            "layout analyzer source block count mismatch");
-    Require(report.streamingEdgeBlocks.size() == 2,
-            "layout analyzer streaming block count mismatch");
-    Require(report.lodMaskWordsPerBlock == 1,
-            "layout analyzer LOD mask width mismatch");
-    Require(report.virtualPageCount == 2,
-            "layout analyzer virtual page count mismatch");
-    Require(report.runtimeGraphPages.size() == 2,
-            "runtime graph page count mismatch");
-    Require(report.runtimeGraphPageEdgeIds.size() == 3,
-            "runtime graph page membership mismatch");
-    Require(report.drawableShortcutCount == 1,
-            "layout analyzer drawable shortcut count mismatch");
-    Require(report.drawableShortcutChildReferenceCount == 2,
-            "layout analyzer child reference count mismatch");
-
-    chmv::streaming::analysis::DatasetLayoutAnalyzer::WriteReport(report, outputPath);
-    Require(std::filesystem::exists(std::filesystem::path(outputPath) / "summary.txt"),
-            "layout analyzer summary was not written");
-    Require(std::filesystem::exists(
-                std::filesystem::path(outputPath) / "virtual_page_locality.csv"),
-            "layout analyzer virtual-page report was not written");
-    Require(std::filesystem::exists(
-                std::filesystem::path(outputPath) / "runtime_graph_pages.csv"),
-            "layout analyzer runtime-page report was not written");
-    Require(std::filesystem::exists(
-                std::filesystem::path(outputPath) / "cache_manifest.txt"),
-            "layout analyzer cache manifest was not written");
-    Require(chmv::streaming::analysis::DatasetLayoutAnalyzer::DefaultReportDirectory(graphPath) ==
-                std::filesystem::path(graphPath).parent_path() / "layout-analysis",
-            "layout analyzer default report directory mismatch");
-    Require(chmv::streaming::analysis::DatasetLayoutAnalyzer::HasValidCachedReport(
-                graphPath, rangePath, config, outputPath),
-            "layout analyzer should reuse a matching cached report");
-    Require(chmv::streaming::analysis::DatasetLayoutAnalyzer::ReadCachedSummary(outputPath).find(
-                "CH_MapViewer dataset layout analysis") != std::string::npos,
-            "layout analyzer cached summary could not be read");
-
-    const auto indexPath = chmv::streaming::index::CHIndex::DefaultPath(graphPath);
-    Require(indexPath == std::filesystem::path(base.string() + ".chidx"),
-            "streaming index default path mismatch");
-    chmv::streaming::index::CHIndex::Write(report, indexPath);
-    Require(chmv::streaming::index::CHIndex::IsValid(
-                indexPath, graphPath, rangePath, config),
-            "streaming index should match source files");
-    const auto index = chmv::streaming::index::CHIndex::Load(indexPath);
-    Require(index.nodeCount == 4 && index.edgeCount == 4,
-            "streaming index dataset counts mismatch");
-    Require(index.nodeBlocks.size() == 2 && index.graphEdgeBlocks.size() == 2 &&
-                index.rangeEdgeBlocks.size() == 2,
-            "streaming index source block counts mismatch");
-    Require(index.graphEdgeBlocks[0].byteOffset == report.graphSourceBlocks[0].byteOffset,
-            "streaming index graph offset mismatch");
-    Require(index.rangeEdgeBlocks[0].byteOffset == report.rangeSourceBlocks[0].byteOffset,
-            "streaming index range offset mismatch");
-    Require(index.graphPages.size() == report.runtimeGraphPages.size(),
-            "streaming index graph page count mismatch");
-    Require(index.GraphPageHasAliveEdges(0, 2),
-            "streaming index page LOD mask lost alive edges");
-    const auto page0Edges = chmv::streaming::index::CHIndex::ReadGraphPageEdgeIds(index, 0);
-    Require(page0Edges.size() == index.graphPages[0].edgeCount,
-            "streaming index page membership decode mismatch");
-
-    auto changedConfig = config;
-    ++changedConfig.lodBandWidth;
-    Require(!chmv::streaming::analysis::DatasetLayoutAnalyzer::HasValidCachedReport(
-                graphPath, rangePath, changedConfig, outputPath),
-            "layout analyzer should invalidate cache when configuration changes");
-
-    {
-        std::ofstream ranges(rangePath, std::ios::app);
-        ranges << "# cache invalidation\n";
-    }
-    Require(!chmv::streaming::analysis::DatasetLayoutAnalyzer::HasValidCachedReport(
-                graphPath, rangePath, config, outputPath),
-            "layout analyzer should invalidate cache when source files change");
-    Require(!chmv::streaming::index::CHIndex::IsValid(
-                indexPath, graphPath, rangePath, config),
-            "streaming index should invalidate when source files change");
-
-    std::filesystem::remove(graphPath);
-    std::filesystem::remove(rangePath);
-    std::filesystem::remove(indexPath);
-    std::filesystem::remove_all(outputPath);
-}
-
-
-
-
-void TestHierarchicalSpatialOwnership() {
-    const auto base = std::filesystem::temp_directory_path() / "chmv_spatial_owner_test";
-    const auto graphPath = base.string() + ".sch";
-    const auto rangePath = base.string() + ".sch.ranges";
-
-    {
-        std::ofstream graph(graphPath);
-        graph << "3\n2\n";
-        graph << "0 100 0.0 0.0 0 1\n";
-        graph << "1 101 0.0 0.1 0 1\n";
-        graph << "2 102 0.0 1.0 0 1\n";
-        graph << "0 1 1.0 1 50 -1 -1\n";
-        graph << "0 2 1.0 1 50 -1 -1\n";
-    }
-    {
-        std::ofstream ranges(rangePath);
-        ranges << "0 1 0\n";
-        ranges << "1 1 0\n";
-    }
-
-    chmv::streaming::analysis::DatasetLayoutAnalysisConfig config;
-    config.spatialGridSize = 8;
-    config.lodBandWidth = 1;
-    config.sourceBlockNodeCount = 2;
-    config.sourceBlockEdgeCount = 2;
-    config.virtualPageEdgeCount = 1;
-    const auto report = chmv::streaming::analysis::DatasetLayoutAnalyzer::Analyze(
-        graphPath, rangePath, config);
-
-    Require(report.runtimeGraphPageEdgeIds.size() == 2,
-            "hierarchical spatial ownership lost or duplicated an edge");
-    std::vector<std::uint32_t> membership = report.runtimeGraphPageEdgeIds;
-    std::sort(membership.begin(), membership.end());
-    Require(membership == std::vector<std::uint32_t>({0, 1}),
-            "hierarchical spatial ownership should store each drawable edge exactly once");
-
-    bool crossingAtAncestor = false;
-    bool localPushedDeeper = false;
-    for (const auto& page : report.runtimeGraphPages) {
-        const auto begin = report.runtimeGraphPageEdgeIds.begin() + page.edgeIdOffset;
-        const auto end = begin + page.edgeCount;
-        if (std::find(begin, end, 1u) != end && page.spatialLevel == 0) {
-            crossingAtAncestor = true;
-        }
-        if (std::find(begin, end, 0u) != end && page.spatialLevel > 0) {
-            localPushedDeeper = true;
-        }
-    }
-    Require(crossingAtAncestor,
-            "cross-tile edge should remain at its enclosing spatial ancestor");
-    Require(localPushedDeeper,
-            "local edge should descend into a finer spatial page when the parent is overloaded");
-
-    std::filesystem::remove(graphPath);
-    std::filesystem::remove(rangePath);
-}
-
-void TestDatasetPreprocessor() {
-    const auto root = std::filesystem::temp_directory_path() / "chmv_preprocess_test_root";
-    std::filesystem::remove_all(root);
-    std::filesystem::create_directories(root / "dataset");
-    const auto graphPath = root / "dataset" / "sample.sch";
-    const auto rangePath = root / "dataset" / "sample.sch.ranges";
-
-    {
-        std::ofstream graph(graphPath);
-        graph << "5\n7\n";
-        graph << "0 100 48.00 9.00 0 4\n";
-        graph << "1 101 48.00 9.10 0 3\n";
-        graph << "2 102 48.10 9.10 0 2\n";
-        graph << "3 103 48.20 9.10 0 1\n";
-        graph << "4 104 48.20 9.20 0 0\n";
-        graph << "0 1 1.0 1 50 -1 -1\n";
-        graph << "1 2 1.0 1 50 -1 -1\n";
-        graph << "2 3 1.0 1 50 -1 -1\n";
-        graph << "3 4 1.0 1 50 -1 -1\n";
-        graph << "0 2 2.0 1 50 0 1\n";
-        graph << "2 4 2.0 1 50 2 3\n";
-        graph << "0 4 4.0 1 50 4 5\n";
-    }
-    {
-        std::ofstream ranges(rangePath);
-        ranges << "0 4 0\n";
-        ranges << "1 4 0\n";
-        ranges << "2 -1 -1\n";
-        ranges << "3 -1 -1\n";
-        ranges << "4 6 2\n";
-        ranges << "5 6 2\n";
-        ranges << "6 8 7\n";
-    }
-
-    const auto readAll = [](const std::filesystem::path& path) {
-        std::ifstream input(path, std::ios::binary);
-        return std::string(std::istreambuf_iterator<char>(input),
-                           std::istreambuf_iterator<char>());
-    };
-    const auto sourceGraphBytes = readAll(graphPath);
-    const auto sourceRangeBytes = readAll(rangePath);
-    const auto sourceGraph = chmv::data::CHLoader::Load(graphPath, rangePath);
-
-    chmv::streaming::analysis::DatasetLayoutAnalysisConfig config;
-    config.spatialGridSize = 16;
-    config.lodBandWidth = 2;
-    config.sourceBlockNodeCount = 2;
-    config.sourceBlockEdgeCount = 2;
-    config.virtualPageEdgeCount = 2;
-
-    chmv::streaming::preprocess::PreprocessOptions preprocessOptions;
-    preprocessOptions.memoryBudgetBytes = 4ull * 1024ull * 1024ull;
-    preprocessOptions.writeDetailedAnalysis = false;
-    const auto result = chmv::streaming::preprocess::DatasetPreprocessor::Run(
-        graphPath, rangePath, config, true, {}, preprocessOptions);
-    Require(!result.reused, "forced preprocess should rebuild the preprocessed dataset");
-    Require(std::filesystem::is_regular_file(result.paths.graphPath),
-            "preprocess graph was not written");
-    Require(std::filesystem::is_regular_file(result.paths.rangesPath),
-            "preprocess ranges were not written");
-    Require(std::filesystem::is_regular_file(result.paths.indexPath),
-            "preprocess index was not written");
-    Require(std::filesystem::is_regular_file(result.paths.runtimeDataPath),
-            "preprocess runtime binary was not written");
-    Require(result.paths.graphPath == graphPath && result.paths.rangesPath == rangePath,
-            "preprocess should keep the source dataset filenames unchanged");
-    Require(result.paths.originalGraphPath.empty() && result.paths.originalRangesPath.empty(),
-            "v8 preprocess must not create legacy .org source copies");
-    Require(readAll(graphPath) == sourceGraphBytes && readAll(rangePath) == sourceRangeBytes,
-            "preprocess modified the original source bytes");
-    Require(chmv::streaming::preprocess::DatasetPreprocessor::HasValidPreprocess(
-                graphPath, rangePath, config),
-            "preprocess cache should validate against unchanged sources");
-    const auto preprocessedIndex = chmv::streaming::index::CHIndex::Load(result.paths.indexPath);
-    Require(preprocessedIndex.formatVersion >= 8u && preprocessedIndex.HasRuntimeBinary(),
-            "preprocess index did not persist the v8 runtime-binary mapping");
-    Require(preprocessedIndex.HasSpatialDirectory(),
-            "preprocess index did not persist the v8 CSR spatial directory");
-    Require(preprocessedIndex.HasRootPayload(),
-            "preprocess runtime binary did not persist the root payload");
-    Require(preprocessedIndex.rootPayloadRecordCount == sourceGraph.DrawableEdgeCount(),
-            "preprocess root-payload count does not match drawable roots");
-    const auto runtimeHeader = chmv::streaming::runtime::RuntimeData::ReadHeader(
-        result.paths.runtimeDataPath);
-    Require(runtimeHeader.nodeCount == sourceGraph.NodeCount() &&
-                runtimeHeader.edgeCount == sourceGraph.EdgeCount() &&
-                runtimeHeader.rootRecordCount == sourceGraph.DrawableEdgeCount(),
-            "runtime binary header does not match the source CH counts");
-    std::ifstream runtimeInput(result.paths.runtimeDataPath, std::ios::binary);
-    std::vector<chmv::streaming::runtime::RuntimeEdgeRecord> runtimeEdges(
-        static_cast<std::size_t>(runtimeHeader.edgeCount));
-    chmv::streaming::runtime::RuntimeData::ReadRecords(
-        runtimeInput, runtimeHeader.edgeSectionOffset,
-        std::span<chmv::streaming::runtime::RuntimeEdgeRecord>(runtimeEdges));
-    std::size_t runtimeShortcutCount = 0;
-    std::size_t runtimeDrawableCount = 0;
-    for (const auto& edge : runtimeEdges) {
-        Require(edge.source < runtimeHeader.nodeCount && edge.target < runtimeHeader.nodeCount,
-                "runtime binary produced an invalid endpoint reference");
-        const bool shortcut = edge.childA != chmv::data::InvalidEdgeId ||
-                              edge.childB != chmv::data::InvalidEdgeId;
-        if (shortcut) {
-            Require(edge.childA < runtimeHeader.edgeCount && edge.childB < runtimeHeader.edgeCount,
-                    "runtime binary produced an invalid shortcut reference");
-            ++runtimeShortcutCount;
-        }
-        if (edge.birthLevel >= 0) ++runtimeDrawableCount;
-    }
-    Require(runtimeShortcutCount == sourceGraph.ShortcutCount(),
-            "runtime binary changed the shortcut count");
-    Require(runtimeDrawableCount == sourceGraph.DrawableEdgeCount(),
-            "runtime binary changed the drawable lifetime count");
-    const auto firstRootPage = chmv::streaming::index::CHIndex::ReadGraphPageRootRecords(
-        preprocessedIndex, 0u);
-    Require(firstRootPage.size() == preprocessedIndex.graphPages.front().edgeCount,
-            "preprocess root payload is not page-contiguous");
-
-    const auto preprocessedGraph = chmv::data::CHLoader::Load(
-        result.paths.graphPath, result.paths.rangesPath);
-    Require(preprocessedGraph.NodeCount() == sourceGraph.NodeCount() &&
-                preprocessedGraph.EdgeCount() == sourceGraph.EdgeCount(),
-            "preprocess changed graph counts");
-    Require(preprocessedGraph.ShortcutCount() == sourceGraph.ShortcutCount(),
-            "preprocess changed shortcut count");
-
-    auto nodeIds = [](const chmv::data::CHGraph& graph) {
-        std::vector<std::uint64_t> ids;
-        ids.reserve(graph.Nodes().size());
-        for (const auto& node : graph.Nodes()) {
-            ids.push_back(node.osmId);
-        }
-        std::sort(ids.begin(), ids.end());
-        return ids;
-    };
-    Require(nodeIds(sourceGraph) == nodeIds(preprocessedGraph),
-            "preprocess changed the node set");
-
-    using EdgeKey = std::tuple<std::uint64_t, std::uint64_t, std::uint32_t,
-                               std::int32_t, std::int32_t, std::int32_t,
-                               std::int32_t, bool>;
-    const auto edgeKeys = [](const chmv::data::CHGraph& graph) {
-        std::vector<EdgeKey> keys;
-        keys.reserve(graph.Edges().size());
-        for (std::size_t edgeId = 0; edgeId < graph.Edges().size(); ++edgeId) {
-            const auto& edge = graph.Edges()[edgeId];
-            const auto& range = graph.Ranges()[edgeId];
-            keys.emplace_back(graph.Nodes()[edge.source].osmId,
-                              graph.Nodes()[edge.target].osmId,
-                              std::bit_cast<std::uint32_t>(edge.weight), edge.type,
-                              edge.maxSpeed, range.birthLevel, range.deathLevel,
-                              edge.IsShortcut());
-        }
-        std::sort(keys.begin(), keys.end());
-        return keys;
-    };
-    Require(edgeKeys(sourceGraph) == edgeKeys(preprocessedGraph),
-            "preprocess changed edge/range semantics");
-    for (const auto& edge : preprocessedGraph.Edges()) {
-        if (edge.IsShortcut()) {
-            Require(edge.childA < preprocessedGraph.EdgeCount() &&
-                        edge.childB < preprocessedGraph.EdgeCount(),
-                    "preprocess produced an invalid shortcut reference");
-        }
-    }
-
-    const auto reportDirectory =
-        chmv::streaming::analysis::DatasetLayoutAnalyzer::DefaultReportDirectory(graphPath);
-    Require(std::filesystem::is_regular_file(reportDirectory / "preprocess_summary.txt"),
-            "preprocess should always write the lightweight index-derived summary");
-
-    chmv::streaming::preprocess::PreprocessOptions reuseOptions = preprocessOptions;
-    reuseOptions.writeDetailedAnalysis = true;
-    const auto reused = chmv::streaming::preprocess::DatasetPreprocessor::Run(
-        graphPath, rangePath, config, false, {}, reuseOptions);
-    Require(reused.reused, "matching preprocess should be reused");
-    Require(std::filesystem::is_regular_file(reportDirectory / "summary.txt"),
-            "reusing a small preprocess should restore the detailed layout reports");
-
-    chmv::data::DatasetCatalog catalog(root);
-    Require(catalog.Entries().size() == 1,
-            "dataset catalog should hide internal preprocess copies");
-
-    std::filesystem::remove_all(root);
-}
-
-void TestGraphPageStreamer() {
-    const auto base = std::filesystem::temp_directory_path() / "chmv_streaming_test";
-    const auto graphPath = base.string() + ".sch";
-    const auto rangePath = base.string() + ".sch.ranges";
-    const auto indexPath = base.string() + ".chidx";
-
-    {
-        std::ofstream graph(graphPath);
-        graph << "4\n4\n";
-        graph << "0 100 48.0 9.0 0 3\n";
-        graph << "1 101 48.0 9.1 0 2\n";
-        graph << "2 102 48.1 9.1 0 1\n";
-        graph << "3 103 48.1 9.2 0 0\n";
-        graph << "0 1 1.0 1 50 -1 -1\n";
-        graph << "1 2 1.0 1 50 -1 -1\n";
-        graph << "2 3 1.0 1 50 -1 -1\n";
-        graph << "0 2 2.0 1 50 0 1\n";
-    }
-    {
-        std::ofstream ranges(rangePath);
-        ranges << "0 3 0\n";
-        ranges << "1 3 0\n";
-        ranges << "2 -1 -1\n";
-        ranges << "3 3 2\n";
-    }
-
-    chmv::streaming::analysis::DatasetLayoutAnalysisConfig analysisConfig;
-    analysisConfig.spatialCellSizeMeters = 4096.0;
-    analysisConfig.lodBandWidth = 2;
-    analysisConfig.sourceBlockNodeCount = 2;
-    analysisConfig.sourceBlockEdgeCount = 2;
-    analysisConfig.virtualPageEdgeCount = 2;
-    chmv::streaming::preprocess::PreprocessOptions preprocessOptions;
-    preprocessOptions.memoryBudgetBytes = 64ull * 1024ull * 1024ull;
-    preprocessOptions.writeDetailedAnalysis = false;
-    const auto preprocessResult = chmv::streaming::preprocess::DatasetPreprocessor::Run(
-        graphPath, rangePath, analysisConfig, true, {}, preprocessOptions);
-    auto index = chmv::streaming::index::CHIndex::Load(preprocessResult.paths.indexPath);
-    Require(index.formatVersion >= 8u && index.HasRuntimeBinary() && index.HasRootPayload(),
-            "preprocess index did not persist the v8 runtime payload mapping");
-    Require(index.HasSpatialDirectory(),
-            "preprocess index did not persist the v8 CSR spatial directory");
-    Require(std::abs(index.spatialCellSizeMeters - analysisConfig.spatialCellSizeMeters) < 1e-9,
-            "preprocess index did not persist the fixed world-space cell size");
-    const auto streamedGraph = chmv::data::CHLoader::Load(graphPath, rangePath);
-    std::uint32_t runtimeShortcutId = chmv::data::InvalidEdgeId;
-    std::uint32_t runtimeRequestedChild = chmv::data::InvalidEdgeId;
-    for (std::uint32_t pageId = 0; pageId < index.graphPages.size() &&
-                                   runtimeShortcutId == chmv::data::InvalidEdgeId; ++pageId) {
-        for (const auto& record : chmv::streaming::index::CHIndex::ReadGraphPageRootRecords(index, pageId)) {
-            if (record.childA != chmv::data::InvalidEdgeId && record.childB != chmv::data::InvalidEdgeId) {
-                runtimeShortcutId = record.globalEdgeId;
-                runtimeRequestedChild = record.childA;
-                break;
-            }
-        }
-    }
-    Require(runtimeShortcutId != chmv::data::InvalidEdgeId &&
-                runtimeRequestedChild != chmv::data::InvalidEdgeId,
-            "v8 runtime root payload lost the drawable shortcut");
-
-    chmv::streaming::runtime::GraphPageStreamerConfig streamingConfig;
-    Require(streamingConfig.spatialPrefetchRadius == 3,
-            "runtime streaming must default to a 7x7 fixed-grid spatial neighborhood");
-    Require(streamingConfig.lodPrefetchNearSpatialRadius == 1 &&
-                streamingConfig.lodPrefetchNearDistance == 3 &&
-                streamingConfig.lodPrefetchGpuWarmDistance == 8,
-            "runtime streaming must keep a wider persistent GPU warm LOD band");
-    Require(!streamingConfig.prefetchLodChildren,
-            "runtime streaming must not prefetch LOD children before GPU misses request them");
-    streamingConfig.ramBudgetBytes = 16ull * 1024ull * 1024ull;
-    streamingConfig.spatialPrefetchRadius = 1;
-    {
-        chmv::streaming::runtime::GraphPageStreamer streamer(
-            std::move(index), graphPath, rangePath, streamingConfig);
-        chmv::streaming::runtime::StreamingViewRequest view;
-        view.lodLevel = 2;
-        view.minLatitude = 47.9;
-        view.minLongitude = 8.9;
-        view.maxLatitude = 48.2;
-        view.maxLongitude = 9.3;
-        const auto token = streamer.RequestView(view);
-        Require(token.requiredPageCount > 0, "streaming view did not request pages");
-        const auto repeatedToken = streamer.RequestView(view);
-        Require(repeatedToken.generation == token.generation,
-                "identical streaming demand should not restart the request generation");
-        Require(streamer.WaitForView(token.generation, std::chrono::seconds(2)),
-                "streaming demand pages did not become resident");
-        const auto stats = streamer.Snapshot();
-        Require(stats.currentDemandReady, "streaming demand should be ready");
-        Require(stats.requiredResidentCount == stats.requiredPageCount,
-                "streaming required residency mismatch");
-        Require(stats.totalCpuCacheBytes <= stats.ramBudgetBytes,
-                "combined streaming caches exceeded the configured hard RAM budget");
-        Require(stats.residentBytes <= stats.dataCacheBudgetBytes,
-                "page/refinement cache exceeded its partition of the RAM budget");
-        Require(stats.totalPageLoads > 0, "streaming cache did not load a page");
-        const auto pageLoadsBeforeHit = stats.totalPageLoads;
-        static_cast<void>(streamer.RequestView(view));
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        Require(streamer.Snapshot().totalPageLoads == pageLoadsBeforeHit,
-                "stable view unexpectedly re-read an already resident graph page");
-        Require(!streamer.DesiredPageIds().empty(),
-                "streaming runtime should expose the current 7x7 residency page set");
-        const auto viewportWindow = streamer.CurrentViewportWindow();
-        const auto residencyWindow = streamer.CurrentRefinementWindow();
-        Require(viewportWindow.minX >= residencyWindow.minX &&
-                    viewportWindow.minY >= residencyWindow.minY &&
-                    viewportWindow.maxX <= residencyWindow.maxX &&
-                    viewportWindow.maxY <= residencyWindow.maxY,
-                "strict viewport window must be contained by the residency neighborhood");
-
-        const auto requestedChild = runtimeRequestedChild;
-        const auto requestedBlock = requestedChild / analysisConfig.sourceBlockEdgeCount;
-        const chmv::streaming::runtime::RefinementEdgeRequest refinementRequest{
-            runtimeShortcutId, requestedChild};
-        const auto refinementToken = streamer.RequestRefinementEdges(
-            std::span<const chmv::streaming::runtime::RefinementEdgeRequest>(
-                &refinementRequest, 1));
-        Require(refinementToken.uniqueBlockCount == 1,
-                "refinement request should resolve one physical edge source block");
-        const auto refinementDeadline =
-            std::chrono::steady_clock::now() + std::chrono::seconds(2);
-        while (!streamer.FindResidentRefinementBlock(requestedBlock) &&
-               std::chrono::steady_clock::now() < refinementDeadline) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        }
-        const auto block = streamer.FindResidentRefinementBlock(requestedBlock);
-        Require(block && !block->edges.empty(),
-                "requested refinement block did not become resident");
-        Require(std::any_of(block->edges.begin(), block->edges.end(),
-                            [requestedChild](const auto& edge) {
-                                return edge.globalEdgeId == requestedChild;
-                            }),
-                "refinement block does not contain the requested child edge");
-
-        // Direct GPU block faults are block-granular and must survive a camera generation
-        // change. A small pan must not cancel hierarchy I/O that is still useful to the
-        // persistent GPU cache.
-        const std::uint32_t directBlock = 0;
-        streamer.RequestBackingBlocks(std::span<const std::uint32_t>(&directBlock, 1));
-        auto movedView = view;
-        movedView.minLongitude += 0.01;
-        movedView.maxLongitude += 0.01;
-        static_cast<void>(streamer.RequestView(movedView));
-        const auto backingDeadline =
-            std::chrono::steady_clock::now() + std::chrono::seconds(2);
-        while (!streamer.FindResidentRefinementBlock(directBlock) &&
-               std::chrono::steady_clock::now() < backingDeadline) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        }
-        Require(streamer.FindResidentRefinementBlock(directBlock) != nullptr,
-                "persistent backing-block request was lost across a view generation");
-        streamer.ReleaseBackingBlocks(std::span<const std::uint32_t>(&directBlock, 1));
-
-        const auto loadsBeforeCacheHit = streamer.Snapshot().totalRefinementBlockLoads;
-        streamer.RequestBackingBlocks(std::span<const std::uint32_t>(&directBlock, 1));
-        const auto hitDeadline =
-            std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
-        while (!streamer.FindResidentRefinementBlock(directBlock) &&
-               std::chrono::steady_clock::now() < hitDeadline) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        }
-        const auto hitStats = streamer.Snapshot();
-        Require(hitStats.totalRefinementBlockLoads == loadsBeforeCacheHit,
-                "RAM backing-block cache hit unexpectedly re-read the source file");
-        Require(hitStats.refinementBlockCacheHits > 0,
-                "RAM backing-block cache did not report the cache hit");
-        streamer.ReleaseBackingBlocks(std::span<const std::uint32_t>(&directBlock, 1));
-
-        streamer.ReconfigureBudgets(64ull * 1024ull * 1024ull,
-                                    8ull * 1024ull * 1024ull);
-        const auto boundedStats = streamer.Snapshot();
-        Require(boundedStats.totalCpuCacheBytes <= boundedStats.ramBudgetBytes,
-                "runtime budget reconfiguration did not hard-bound total CPU cache memory");
-    }
-
-    const auto preprocessPaths = chmv::streaming::preprocess::DatasetPreprocessor::DefaultPaths(
-        graphPath, rangePath);
-    std::filesystem::remove(preprocessPaths.graphPath);
-    std::filesystem::remove(preprocessPaths.rangesPath);
-    std::filesystem::remove(preprocessPaths.runtimeDataPath);
-    std::filesystem::remove(preprocessPaths.indexPath);
-    std::filesystem::remove(preprocessPaths.manifestPath);
-}
-
-
-void TestFixedGridBoundaryAndForwardShortcut() {
-    const auto base = std::filesystem::temp_directory_path() / "chmv_fixed_grid_boundary_test";
-    const auto graphPath = base.string() + ".sch";
-    const auto rangePath = base.string() + ".sch.ranges";
-
-    // 4096 * 4096 m is an exact power-of-two fixed-grid boundary in Web Mercator.
-    // A tiny road crossing it must remain a small-scale page; the old aligned-quadtree
-    // assignment would incorrectly promote this case to an enormous ancestor cell.
-    constexpr double boundaryLongitude = -29.2877044222542;
-    {
-        std::ofstream graph(graphPath);
-        graph << "3\n3\n";
-        graph << "0 100 0.0 " << (boundaryLongitude - 0.001) << " 0 3\n";
-        graph << "1 101 0.0 " << (boundaryLongitude + 0.001) << " 0 2\n";
-        graph << "2 102 0.0 " << (boundaryLongitude + 0.002) << " 0 1\n";
-        // Parent deliberately precedes its children to exercise the general DFS fallback.
-        graph << "0 2 2.0 1 50 1 2\n";
-        graph << "0 1 1.0 1 50 -1 -1\n";
-        graph << "1 2 1.0 1 50 -1 -1\n";
-    }
-    {
-        std::ofstream ranges(rangePath);
-        ranges << "0 3 0\n";
-        ranges << "1 -1 -1\n";
-        ranges << "2 -1 -1\n";
-    }
-
-    chmv::streaming::analysis::DatasetLayoutAnalysisConfig config;
-    config.spatialCellSizeMeters = 4096.0;
-    config.sourceBlockNodeCount = 2;
-    config.sourceBlockEdgeCount = 2;
-    config.virtualPageEdgeCount = 2;
-    chmv::streaming::preprocess::PreprocessOptions options;
-    options.memoryBudgetBytes = 64ull * 1024ull * 1024ull;
-    options.writeDetailedAnalysis = false;
-    const auto result = chmv::streaming::preprocess::DatasetPreprocessor::Run(
-        graphPath, rangePath, config, true, {}, options);
-    auto index = chmv::streaming::index::CHIndex::Load(result.paths.indexPath);
-    Require(index.graphPages.size() == 1,
-            "fixed-grid boundary test should create exactly one drawable page");
-    Require(index.graphPages.front().spatialLevel <= 1,
-            "short edge crossing a power-of-two boundary was promoted to a coarse spatial scale");
-
-    chmv::streaming::runtime::GraphPageStreamerConfig streamingConfig;
-    streamingConfig.ramBudgetBytes = 32ull * 1024ull * 1024ull;
-    streamingConfig.spatialPrefetchRadius = 0;
-    {
-        chmv::streaming::runtime::GraphPageStreamer streamer(
-            std::move(index), graphPath, rangePath, streamingConfig);
-        chmv::streaming::runtime::StreamingViewRequest view;
-        view.lodLevel = 2;
-        view.minLatitude = -0.001;
-        view.maxLatitude = 0.001;
-        view.minLongitude = boundaryLongitude - 0.0015;
-        view.maxLongitude = boundaryLongitude - 0.0005;
-        const auto token = streamer.RequestView(view);
-        Require(token.requiredPageCount == 1,
-                "fixed-grid sparse lookup missed a page crossing a cell boundary");
-        Require(streamer.WaitForView(token.generation, std::chrono::seconds(2)),
-                "fixed-grid boundary page did not become resident");
-    }
-
-    const auto paths = chmv::streaming::preprocess::DatasetPreprocessor::DefaultPaths(
-        graphPath, rangePath);
-    std::filesystem::remove(paths.graphPath);
-    std::filesystem::remove(paths.rangesPath);
-    std::filesystem::remove(paths.runtimeDataPath);
-    std::filesystem::remove(paths.indexPath);
-    std::filesystem::remove(paths.manifestPath);
-}
-
-
-void TestMixedOrderShortcutGeometryBounds() {
-    const auto base = std::filesystem::temp_directory_path() / "chmv_mixed_order_bounds_test";
-    const auto graphPath = base.string() + ".sch";
-    const auto rangePath = base.string() + ".sch.ranges";
-
-    // A valid shortcut DAG whose EdgeIDs alternate dependency direction. The root's own
-    // endpoints are close together, while the child path detours far north. If preprocessing
-    // ever treats direct endpoint bounds as final, the root would incorrectly stay in L0.
-    {
-        std::ofstream graph(graphPath);
-        graph << "5\n7\n";
-        graph << "0 100 48.0000 9.0000 0 5\n";
-        graph << "1 101 48.0000 9.0010 0 4\n";
-        graph << "2 102 48.1000 9.0000 0 3\n";
-        graph << "3 103 48.2500 9.0000 0 2\n";
-        graph << "4 104 48.1000 9.0010 0 1\n";
-        // 0 -> (1,4), 4 -> (2,5), 2 -> (3,6). This requires alternating sweeps.
-        graph << "0 1 4.0 1 50 1 4\n";   // edge 0, root shortcut
-        graph << "0 2 1.0 1 50 -1 -1\n"; // edge 1
-        graph << "2 4 2.0 1 50 3 6\n";   // edge 2
-        graph << "2 3 1.0 1 50 -1 -1\n"; // edge 3
-        graph << "2 1 3.0 1 50 2 5\n";   // edge 4
-        graph << "4 1 1.0 1 50 -1 -1\n"; // edge 5
-        graph << "3 4 1.0 1 50 -1 -1\n"; // edge 6
-    }
-    {
-        std::ofstream ranges(rangePath);
-        ranges << "0 8 0\n";
-        for (std::uint32_t edge = 1; edge < 7; ++edge) {
-            ranges << edge << " -1 -1\n";
-        }
-    }
-
-    chmv::streaming::analysis::DatasetLayoutAnalysisConfig config;
-    config.spatialCellSizeMeters = 4096.0;
-    config.sourceBlockNodeCount = 2;
-    config.sourceBlockEdgeCount = 2;
-    config.virtualPageEdgeCount = 2;
-    chmv::streaming::preprocess::PreprocessOptions options;
-    options.memoryBudgetBytes = 64ull * 1024ull * 1024ull;
-    options.writeDetailedAnalysis = false;
-    const auto result = chmv::streaming::preprocess::DatasetPreprocessor::Run(
-        graphPath, rangePath, config, true, {}, options);
-
-    const auto graph = chmv::data::CHLoader::Load(result.paths.graphPath, result.paths.rangesPath);
-    const auto index = chmv::streaming::index::CHIndex::Load(result.paths.indexPath);
-    std::uint32_t rootEdge = std::numeric_limits<std::uint32_t>::max();
-    for (std::uint32_t edgeId = 0; edgeId < graph.EdgeCount(); ++edgeId) {
-        if (graph.Ranges()[edgeId].birthLevel == 8) {
-            rootEdge = edgeId;
-            break;
-        }
-    }
-    Require(rootEdge != std::numeric_limits<std::uint32_t>::max(),
-            "mixed-order bounds test lost its drawable shortcut root");
-    Require(index.HasSpatialDirectory() && index.pageSpatialBounds.size() == index.graphPages.size(),
-            "v8 index did not persist page spatial accelerators");
-    Require(!index.graphPages.empty() && index.graphPages.front().spatialLevel >= 2u,
-            "mixed-order shortcut root was assigned from endpoint-only bounds");
-
-    const auto paths = chmv::streaming::preprocess::DatasetPreprocessor::DefaultPaths(
-        graphPath, rangePath);
-    std::filesystem::remove(paths.graphPath);
-    std::filesystem::remove(paths.rangesPath);
-    std::filesystem::remove(paths.runtimeDataPath);
-    std::filesystem::remove(paths.indexPath);
-    std::filesystem::remove(paths.manifestPath);
-}
-
-
-void TestFixedGridPhysicalPagePacking() {
-    const auto root = std::filesystem::temp_directory_path() / "chmv_fixed_grid_packing_test";
-    std::filesystem::remove_all(root);
-    std::filesystem::create_directories(root);
-    const auto graphPath = root / "packing.sch";
-    const auto rangePath = root / "packing.sch.ranges";
-
-    constexpr double pi = 3.14159265358979323846;
-    constexpr double radius = 6378137.0;
-    constexpr double halfExtent = pi * radius;
-    constexpr double cellMeters = 4096.0;
-    const auto longitudeForMeters = [](double xMeters) {
-        return (xMeters - halfExtent) / radius * 180.0 / pi;
-    };
-
-    constexpr std::uint32_t edgeCount = 8;
-    constexpr std::uint32_t nodeCount = edgeCount * 2u;
-    {
-        std::ofstream graph(graphPath);
-        graph << nodeCount << '\n' << edgeCount << '\n';
-        for (std::uint32_t edge = 0; edge < edgeCount; ++edge) {
-            // Span several former 64x64 physical pack regions. Spatial lookup must stay exact,
-            // but those artificial boundaries must no longer split a mostly-empty physical page.
-            const auto cellX = 4780u + edge * 20u;
-            const auto centerMeters = (static_cast<double>(cellX) + 0.5) * cellMeters;
-            const auto lonA = longitudeForMeters(centerMeters - 100.0);
-            const auto lonB = longitudeForMeters(centerMeters + 100.0);
-            const auto a = edge * 2u;
-            const auto b = a + 1u;
-            graph << a << ' ' << (1000u + a) << " 0 " << lonA << " 0 1\n";
-            graph << b << ' ' << (1000u + b) << " 0 " << lonB << " 0 1\n";
-        }
-        for (std::uint32_t edge = 0; edge < edgeCount; ++edge) {
-            graph << edge * 2u << ' ' << edge * 2u + 1u
-                  << " 1 1 50 -1 -1\n";
-        }
-    }
-    {
-        std::ofstream ranges(rangePath);
-        for (std::uint32_t edge = 0; edge < edgeCount; ++edge) {
-            ranges << edge << " 5 0\n";
-        }
-    }
-
-    chmv::streaming::analysis::DatasetLayoutAnalysisConfig config;
-    config.spatialCellSizeMeters = cellMeters;
-    config.sourceBlockNodeCount = 16;
-    config.sourceBlockEdgeCount = 16;
-    config.virtualPageEdgeCount = 16;
-    chmv::streaming::preprocess::PreprocessOptions options;
-    options.memoryBudgetBytes = 64ull * 1024ull * 1024ull;
-    options.writeDetailedAnalysis = false;
-    const auto result = chmv::streaming::preprocess::DatasetPreprocessor::Run(
-        graphPath, rangePath, config, true, {}, options);
-    const auto index = chmv::streaming::index::CHIndex::Load(result.paths.indexPath);
-
-    Require(index.graphPages.size() == 1,
-            "one LOD group should pack densely across former fixed 64x64 region boundaries");
-    Require(index.graphPages.front().edgeCount == edgeCount,
-            "packed physical page lost drawable edges");
-    Require(index.HasSpatialDirectory(),
-            "packed physical page must retain the v8 exact cell-to-page directory");
-    Require(index.spatialPageIds.size() == edgeCount,
-            "packed physical page must retain exact cell-to-page lookup references");
-    Require(std::all_of(index.spatialPageIds.begin(), index.spatialPageIds.end(),
-                        [](const auto pageId) { return pageId == 0; }),
-            "spatial cells should all reference the shared dense packed page");
-
-    std::filesystem::remove_all(root);
-}
-
-void TestCorrectnessValidator() {
-    const std::vector<std::uint32_t> cpu{1, 2, 2, 4};
-    const std::vector<std::uint32_t> gpuPass{4, 2, 1, 2};
-    const auto pass = chmv::benchmark::CorrectnessValidator::Compare(cpu, gpuPass);
-    Require(pass.Passed(), "validator should ignore output order");
-    Require(pass.cpuDuplicateCount == 1 && pass.gpuDuplicateCount == 1,
-            "duplicate counts mismatch");
-
-    const std::vector<std::uint32_t> gpuFail{1, 2, 3, 4};
-    const auto fail = chmv::benchmark::CorrectnessValidator::Compare(cpu, gpuFail);
-    Require(!fail.Passed(), "validator should detect different edge multisets");
-    Require(fail.missingEdgeCount == 1, "missing edge count mismatch");
-    Require(fail.unexpectedEdgeCount == 1, "unexpected edge count mismatch");
 }
 
 // Five nodes along a bent road: originals 0-3 at level 0, shortcuts 4 (0-2) and 5 (2-4) at
@@ -1019,6 +58,35 @@ struct LodTestGraph {
         std::ofstream(rangesPath) << ranges;
     }
     ~LodTestGraph() {
+        std::filesystem::remove(graphPath);
+        std::filesystem::remove(rangesPath);
+        std::filesystem::remove(chmv::streaming::lod::LodPageFile::DefaultPath(graphPath));
+    }
+};
+
+// A straight road of `edges` original edges, all drawn at every level: enough records for
+// several compressed blocks and page frames.
+struct ChainGraph {
+    std::filesystem::path graphPath;
+    std::filesystem::path rangesPath;
+
+    explicit ChainGraph(std::uint32_t edges) {
+        const auto base = std::filesystem::temp_directory_path() / "chmv_chain_test";
+        graphPath = base.string() + ".sch";
+        rangesPath = base.string() + ".sch.ranges";
+        std::ofstream graph(graphPath);
+        graph << "# chain\n" << edges + 1u << "\n" << edges << "\n";
+        for (std::uint32_t node = 0; node <= edges; ++node) {
+            graph << node << ' ' << 1000u + node << " 48." << 1000000u + node * 37u << " 9."
+                  << 1000000u + (node * node) % 9973u << " 0 0\n";
+        }
+        std::ofstream ranges(rangesPath);
+        for (std::uint32_t edge = 0; edge < edges; ++edge) {
+            graph << edge << ' ' << edge + 1u << ' ' << 1u + edge % 7u << " 1 50 -1 -1\n";
+            ranges << edge << " 0 0\n";
+        }
+    }
+    ~ChainGraph() {
         std::filesystem::remove(graphPath);
         std::filesystem::remove(rangesPath);
         std::filesystem::remove(chmv::streaming::lod::LodPageFile::DefaultPath(graphPath));
@@ -1089,6 +157,220 @@ void RequireLodCutsMatchDfs(const chmv::streaming::lod::LodPageFile& file, const
     }
 }
 
+// The same cut by walking the hierarchy section from the roots, as the traversal kernels do;
+// every page reached must be found by the planner through the visit directory.
+std::vector<std::uint32_t> TraversalCut(const chmv::streaming::lod::LodPageFile& file,
+                                        std::uint32_t level, std::uint32_t threshold) {
+    namespace lod = chmv::streaming::lod;
+    const auto words = file.ReadPageWords({});
+    const auto children = file.ReadChildrenWords({});
+    const auto recordEdges = file.ReadSection<std::uint32_t>(lod::Section::RecordEdge);
+    lod::LodPageQuery everywhere{-1e9f, -1e9f, 1e9f, 1e9f, level, threshold};
+    std::vector<std::uint32_t> planned;
+    lod::CollectLodPages(file.VisitGroups(), file.VisitPages(), everywhere, planned);
+    const auto record = [&](std::uint32_t ref) {
+        return words.data() + file.PageWordOffset(ref >> 8u) + lod::kPageHeaderWords +
+               (ref & 0xffu) * lod::kRecordWords;
+    };
+    std::vector<std::uint32_t> edges;
+    std::vector<std::uint32_t> stack;
+    for (std::uint32_t p = 0; p < file.Pages().size(); ++p) {
+        for (std::uint32_t i = 0; i < file.Pages()[p].recordCount; ++i) {
+            const auto levels = record((p << 8u) | i)[1];
+            if (level < (levels & 0xffffu) || level > (levels >> 16u)) {
+                continue;
+            }
+            stack.push_back((p << 8u) | i);
+            while (!stack.empty()) {
+                const auto ref = stack.back();
+                stack.pop_back();
+                const auto page = ref >> 8u;
+                const auto local = ref & 0xffu;
+                Require(std::find(planned.begin(), planned.end(), page) != planned.end(),
+                        "the visit directory misses a page the traversal reaches");
+                const auto* block = children.data() + file.ChildrenWordOffset(page);
+                const bool marked = ((block[local >> 5u] >> (local & 31u)) & 1u) != 0u;
+                if (marked && (record(ref)[3] & 0xffffu) > threshold) {
+                    std::uint32_t rank = 0;
+                    for (std::uint32_t b = 0; b < local; ++b) {
+                        rank += (block[b >> 5u] >> (b & 31u)) & 1u;
+                    }
+                    stack.push_back(block[lod::kChildMaskWords + 2u * rank]);
+                    stack.push_back(block[lod::kChildMaskWords + 2u * rank + 1u]);
+                } else {
+                    edges.push_back(recordEdges[file.Pages()[page].firstRecord + local]);
+                }
+            }
+        }
+    }
+    std::sort(edges.begin(), edges.end());
+    return edges;
+}
+
+void RequireTraversalsMatchDfs(const chmv::streaming::lod::LodPageFile& file,
+                               const char* message) {
+    const auto codes = {std::uint32_t{0}, std::uint32_t{chmv::streaming::lod::kErrorCodeMax}};
+    for (std::uint32_t level = 0; level <= 3; ++level) {
+        for (const auto threshold : codes) {
+            Require(TraversalCut(file, level, threshold) == DfsCut(file, level, threshold),
+                    message);
+        }
+    }
+}
+
+void TestErrorBounds() {
+    namespace lod = chmv::streaming::lod;
+    Require(lod::ErrorBound(0) == 0u, "error code 0 means no error at all");
+    Require(lod::ErrorBound(lod::kErrorCodeInfinite) == lod::kMaxErrorBound,
+            "an infinite error covers the whole map");
+    std::uint32_t previous = 0;
+    for (std::uint32_t code = 1; code <= lod::kErrorCodeMax; ++code) {
+        const auto bound = lod::ErrorBound(code);
+        const auto error = std::exp2(static_cast<double>(code) / lod::kErrorCodeStepsPerOctave -
+                                     lod::kErrorCodeBiasOctaves) *
+                           lod::kFixedCoordinateScale;
+        Require(bound >= previous, "error bounds must grow with the code");
+        Require(static_cast<double>(bound) >= std::min(error, double{lod::kMaxErrorBound}),
+                "an error bound must not be below the error it stands for");
+        Require(static_cast<double>(bound) <= error * 1.0001 + 1.0,
+                "an error bound should round up by at most one unit");
+        previous = bound;
+    }
+}
+
+void TestCompression() {
+    namespace lod = chmv::streaming::lod;
+    // Slowly changing words, and a tail shorter than one element.
+    std::vector<std::byte> input(10003);
+    for (std::size_t i = 0; i < input.size(); ++i) {
+        input[i] = static_cast<std::byte>((i / 4u) >> (i % 4u * 3u));
+    }
+    for (const std::uint32_t shuffle : {0u, 2u, 4u, 8u}) {
+        std::vector<std::byte> frame;
+        lod::AppendFrame(input, lod::kBlockLevel, shuffle, frame);
+        std::vector<std::byte> output(input.size());
+        Require(lod::DecodeFrame(frame, shuffle, output) && output == input,
+                "a frame must decode to what was compressed");
+        std::vector<std::byte> shorter(input.size() - 1u);
+        Require(!lod::DecodeFrame(frame, shuffle, shorter), "a frame of another size is refused");
+        auto damaged = frame;
+        damaged[damaged.size() / 2u] ^= std::byte{0x5a};
+        Require(!lod::DecodeFrame(damaged, shuffle, output), "a damaged frame is refused");
+    }
+    std::vector<std::byte> smaller;
+    const auto shuffle = lod::AppendSmallerFrame(input, lod::kBlockLevel, 4u, smaller);
+    std::vector<std::byte> output(input.size());
+    Require(lod::DecodeFrame(smaller, shuffle, output) && output == input,
+            "the smaller of both frames decodes as well");
+}
+
+// Every way of reading a compressed file gives the same bytes; damage is found, not drawn.
+void TestCompressedPageFile() {
+    namespace lod = chmv::streaming::lod;
+    const ChainGraph source(20000);
+    const auto filePath = lod::LodPageFile::DefaultPath(source.graphPath);
+    const auto result = lod::LodPageBuilder::Build(source.graphPath, source.rangesPath, filePath);
+    const auto file = lod::LodPageFile::Open(filePath);
+    Require(file->Compressed() && result.fileBytes == std::filesystem::file_size(filePath) &&
+                result.fileBytes < result.uncompressedBytes,
+            "the page file is stored compressed");
+    Require(file->Header().At(lod::Section::RecordEdge).bytes > lod::kSmallBlockBytes &&
+                file->Pages().size() > 50u,
+            "the chain spans several blocks and pages");
+    RequireLodCutsMatchDfs(*file, "compressed chain differs from DFS");
+
+    const auto words = file->ReadPageWords({});
+    const auto children = file->ReadChildrenWords({});
+    const auto recordEdges = file->ReadSection<std::uint32_t>(lod::Section::RecordEdge);
+    for (std::uint32_t p = 0; p < file->Pages().size(); ++p) {
+        const auto& entry = file->Pages()[p];
+        const auto page = file->ReadPage(p);
+        Require(std::equal(page.begin(), page.end(),
+                           words.begin() + static_cast<std::ptrdiff_t>(file->PageWordOffset(p))) &&
+                    page.size() == entry.wordCount,
+                "a single page reads as in the whole section");
+        const auto edges = file->ReadRecordEdges(entry.firstRecord, entry.recordCount);
+        Require(std::equal(edges.begin(), edges.end(),
+                           recordEdges.begin() + static_cast<std::ptrdiff_t>(entry.firstRecord)),
+                "record edges of a page read as in the whole section");
+    }
+    for (std::size_t index = 0; index < lod::kStoredCount; ++index) {
+        Require(file->HashSection(index, {}) == file->Header().Hash(index),
+                "every section decodes to its hash");
+    }
+    {
+        lod::LodPageReader reader(file, true);
+        std::vector<std::uint32_t> all(file->Pages().size());
+        for (std::uint32_t p = 0; p < all.size(); ++p) {
+            all[p] = p;
+        }
+        reader.SetDemand(all);
+        std::vector<lod::LodPageData> read;
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        while (read.size() < all.size() && std::chrono::steady_clock::now() < deadline) {
+            reader.Take(read, ~std::uint64_t{0});
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        Require(read.size() == all.size(), "the reader delivers every page");
+        for (const auto& page : read) {
+            const auto first =
+                words.begin() + static_cast<std::ptrdiff_t>(file->PageWordOffset(page.page));
+            const auto block =
+                children.begin() + static_cast<std::ptrdiff_t>(file->ChildrenWordOffset(page.page));
+            Require(page.words.size() == file->Pages()[page.page].wordCount &&
+                        std::equal(page.words.begin(), page.words.end(), first) &&
+                        page.children.size() == file->VisitPages()[page.page].wordCount &&
+                        std::equal(page.children.begin(), page.children.end(), block),
+                    "the reader decodes pages and children blocks exactly");
+        }
+    }
+
+    // One damaged page frame: refused on its own, zero in the whole section.
+    auto damagedPath = filePath;
+    damagedPath += ".damaged";
+    std::filesystem::copy_file(filePath, damagedPath,
+                               std::filesystem::copy_options::overwrite_existing);
+    const std::uint32_t victim = 3;
+    {
+        const auto range = file->PageStorage(victim);
+        std::fstream damage(damagedPath, std::ios::in | std::ios::out | std::ios::binary);
+        damage.seekg(static_cast<std::streamoff>(range.offset + range.bytes / 2u));
+        char byte = 0;
+        damage.read(&byte, 1);
+        byte = static_cast<char>(byte ^ 0x5a);
+        damage.seekp(static_cast<std::streamoff>(range.offset + range.bytes / 2u));
+        damage.write(&byte, 1);
+    }
+    {
+        const auto damaged = lod::LodPageFile::Open(damagedPath);
+        bool refused = false;
+        try {
+            (void)damaged->ReadPage(victim);
+        } catch (const std::runtime_error&) {
+            refused = true;
+        }
+        Require(refused, "a damaged page is refused");
+        const auto damagedWords = damaged->ReadPageWords({});
+        const auto offset = static_cast<std::ptrdiff_t>(file->PageWordOffset(victim));
+        const auto count = static_cast<std::ptrdiff_t>(file->Pages()[victim].wordCount);
+        Require(
+            std::all_of(damagedWords.begin() + offset, damagedWords.begin() + offset + count,
+                        [](std::uint32_t word) { return word == 0u; }) &&
+                std::equal(damagedWords.begin(), damagedWords.begin() + offset, words.begin()) &&
+                std::equal(damagedWords.begin() + offset + count, damagedWords.end(),
+                           words.begin() + offset + count),
+            "only the damaged page is lost from the whole section");
+        refused = false;
+        try {
+            (void)damaged->HashSection(lod::StoredIndex(lod::Section::Pages), {});
+        } catch (const std::runtime_error&) {
+            refused = true;
+        }
+        Require(refused, "checking a damaged page section fails");
+    }
+    std::filesystem::remove(damagedPath);
+}
+
 void TestLodPageBuilder() {
     namespace lod = chmv::streaming::lod;
     {
@@ -1135,6 +417,7 @@ void TestLodPageBuilder() {
         Require(LodPageCut(*file, 2, 0) == std::vector<std::uint32_t>{0, 1, 2, 3},
                 "level 2, exact: fully unfolded");
         RequireLodCutsMatchDfs(*file, "page cut differs from DFS");
+        RequireTraversalsMatchDfs(*file, "traversal differs from DFS");
 
         lod::LodPageQuery everywhere{-1e9f, -1e9f, 1e9f, 1e9f, 2, 0};
         std::vector<std::uint32_t> pages;
@@ -1149,8 +432,9 @@ void TestLodPageBuilder() {
         const auto result = lod::LodPageBuilder::Build(source.graphPath, source.rangesPath,
                                                        filePath);
         Require(result.extraContextRecords != 0, "second visit needs its own records");
-        RequireLodCutsMatchDfs(*lod::LodPageFile::Open(filePath),
-                               "root + parent at the same level differs from DFS");
+        const auto file = lod::LodPageFile::Open(filePath);
+        RequireLodCutsMatchDfs(*file, "root + parent at the same level differs from DFS");
+        RequireTraversalsMatchDfs(*file, "traversal with a revisited shortcut differs from DFS");
     }
     {
         // Shortcut 7 (0-3 via 2) is a second parent of shortcut 4, alive at the same level as 6.
@@ -1159,28 +443,207 @@ void TestLodPageBuilder() {
             "0 0 0\n1 0 0\n2 0 0\n3 0 0\n4 1 1\n5 1 1\n6 2 2\n7 2 2\n");
         const auto filePath = lod::LodPageFile::DefaultPath(source.graphPath);
         (void)lod::LodPageBuilder::Build(source.graphPath, source.rangesPath, filePath);
-        RequireLodCutsMatchDfs(*lod::LodPageFile::Open(filePath),
-                               "two parents at the same level differ from DFS");
+        const auto file = lod::LodPageFile::Open(filePath);
+        RequireLodCutsMatchDfs(*file, "two parents at the same level differ from DFS");
+        RequireTraversalsMatchDfs(*file, "traversal with two parents differs from DFS");
     }
+}
+
+// The same file as the builder writes it before compressing, marked as a version 3 file.
+void WriteUncompressed(const chmv::streaming::lod::LodPageFile& file,
+                       const std::filesystem::path& path) {
+    namespace lod = chmv::streaming::lod;
+    auto header = file.Header();
+    header.version = lod::kUncompressedFormatVersion;
+    header.compression = lod::Compression::None;
+    header.stored = {};
+    header.pageFrames = {};
+    header.childFrames = {};
+    std::uint64_t end = lod::kHeaderBytes;
+    for (std::size_t index = 0; index < lod::kStoredCount; ++index) {
+        end = std::max(end, header.Layout(index).offset + header.Layout(index).bytes);
+    }
+    std::vector<char> bytes(static_cast<std::size_t>(end));
+    std::memcpy(bytes.data(), &header, sizeof(header));
+    for (std::size_t index = 0; index < lod::kStoredCount; ++index) {
+        const auto& layout = header.Layout(index);
+        file.ReadRange(index, 0u, bytes.data() + layout.offset, layout.bytes);
+    }
+    std::ofstream(path, std::ios::binary).write(bytes.data(), static_cast<std::streamsize>(end));
+}
+
+void TestAsyncDatasetLoader() {
+    const auto root = std::filesystem::temp_directory_path() / "chmv_async_test_root";
+    std::filesystem::remove_all(root);
+    std::filesystem::create_directories(root);
+    const auto graphPath = root / "sample.sch";
+    const auto rangePath = root / "sample.sch.ranges";
+    {
+        std::ofstream graph(graphPath);
+        graph << "2\n1\n";
+        graph << "0 100 48.0 9.0 0 1\n";
+        graph << "1 101 48.1 9.1 0 0\n";
+        graph << "0 1 1.0 1 50 -1 -1\n";
+    }
+    std::ofstream(rangePath) << "0 1 0\n";
+
+    const auto pageFile = chmv::streaming::lod::LodPageFile::DefaultPath(graphPath);
+    const auto finish = [](chmv::data::AsyncDatasetLoader& loader) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        while (loader.Snapshot().phase != chmv::data::DatasetLoadPhase::Ready &&
+               loader.Snapshot().phase != chmv::data::DatasetLoadPhase::Failed &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        return loader.Snapshot();
+    };
+    const auto load = [&](bool withSources = true) {
+        chmv::data::AsyncDatasetLoader loader;
+        Require(withSources ? loader.Start(graphPath, rangePath) : loader.StartPageFile(pageFile),
+                "async loader did not start");
+        const auto snapshot = finish(loader);
+        Require(snapshot.phase == chmv::data::DatasetLoadPhase::Ready, "dataset did not load");
+        Require(snapshot.progress == 1.0f, "async loader progress did not reach 100 percent");
+        auto dataset = loader.TakeCompleted();
+        Require(dataset.has_value() && dataset->file != nullptr, "loaded dataset missing");
+        Require(dataset->file->Header().nodeCount == 2 && dataset->file->Header().edgeCount == 1,
+                "loaded dataset counts");
+        return std::filesystem::last_write_time(dataset->file->Path());
+    };
+    const auto built = load();
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    Require(load() == built, "an up-to-date page file is reused");
+
+    // A file of an older format is rebuilt on load (opening it as it is would fail).
+    {
+        namespace lod = chmv::streaming::lod;
+        std::fstream file(lod::LodPageFile::DefaultPath(graphPath),
+                          std::ios::in | std::ios::out | std::ios::binary);
+        const std::uint32_t older = lod::kFormatVersion - 1u;
+        file.seekp(static_cast<std::streamoff>(offsetof(lod::FileHeader, version)));
+        file.write(reinterpret_cast<const char*>(&older), sizeof(older));
+    }
+    (void)load();
+
+    // Damage past the header is found on open: the file is rebuilt from its sources.
+    {
+        namespace lod = chmv::streaming::lod;
+        const auto stored = lod::LodPageFile::Open(pageFile)
+                                ->Header()
+                                .stored[lod::StoredIndex(lod::Section::PageDirectory)];
+        std::fstream file(pageFile, std::ios::in | std::ios::out | std::ios::binary);
+        file.seekp(static_cast<std::streamoff>(stored.offset + stored.bytes - 2u));
+        file.put('\x5a');
+    }
+    (void)load();
+    {
+        namespace lod = chmv::streaming::lod;
+        const auto file = lod::LodPageFile::Open(pageFile);
+        const auto index = lod::StoredIndex(lod::Section::PageDirectory);
+        Require(file->HashSection(index, {}) == file->Header().Hash(index),
+                "a damaged page file is rebuilt");
+    }
+
+    // A version 3 file (the same file uncompressed) is compressed, not rebuilt: the sources keep
+    // their size and time but could not be read any more.
+    {
+        namespace lod = chmv::streaming::lod;
+        WriteUncompressed(*lod::LodPageFile::Open(pageFile), pageFile);
+        Require(!lod::LodPageFile::Open(pageFile)->Compressed(), "the copy is uncompressed");
+        const auto time = std::filesystem::last_write_time(graphPath);
+        const auto size = std::filesystem::file_size(graphPath);
+        std::ofstream(graphPath, std::ios::binary) << std::string(size, 'x');
+        std::filesystem::last_write_time(graphPath, time);
+    }
+    const auto rebuilt = load();
+    Require(chmv::streaming::lod::LodPageFile::Open(pageFile)->Compressed() &&
+                chmv::streaming::lod::LodPageFile::Open(pageFile)->Header().version ==
+                    chmv::streaming::lod::kFormatVersion,
+            "a version 3 file is compressed on load");
+    {
+        const chmv::data::DatasetCatalog catalog(root);
+        Require(catalog.Entries().size() == 1u && catalog.Entries()[0].HasSources() &&
+                    catalog.Entries()[0].pageFilePath == pageFile,
+                "a source pair is listed once, together with its page file");
+    }
+
+    // Without its sources the page file is listed and loaded on its own.
+    std::filesystem::remove(graphPath);
+    std::filesystem::remove(rangePath);
+    {
+        const chmv::data::DatasetCatalog catalog(root);
+        Require(catalog.Entries().size() == 1u && !catalog.Entries()[0].HasSources() &&
+                    catalog.Entries()[0].pageFilePath == pageFile,
+                "a page file without its sources is listed by itself");
+    }
+    Require(load(false) == rebuilt, "a page file without its sources is used as it is");
+
+    // An older one cannot be rebuilt then: the load fails and says what is missing.
+    {
+        namespace lod = chmv::streaming::lod;
+        std::fstream file(pageFile, std::ios::in | std::ios::out | std::ios::binary);
+        const std::uint32_t older = lod::kFormatVersion - 1u;
+        file.seekp(static_cast<std::streamoff>(offsetof(lod::FileHeader, version)));
+        file.write(reinterpret_cast<const char*>(&older), sizeof(older));
+    }
+    {
+        chmv::data::AsyncDatasetLoader loader;
+        Require(loader.StartPageFile(pageFile), "async loader did not start");
+        const auto snapshot = finish(loader);
+        Require(snapshot.phase == chmv::data::DatasetLoadPhase::Failed &&
+                    snapshot.error.find(".sch/.ranges") != std::string::npos,
+                "an outdated page file without sources fails with a reason");
+    }
+    std::filesystem::remove_all(root);
+}
+
+void TestRoadStyles() {
+    namespace renderer = chmv::renderer;
+    const auto shipped = renderer::LoadRoadStyles(CHMV_ROAD_STYLES);
+    Require(shipped.classes.size() == 9u, "the shipped road styles have nine classes");
+    const auto nameOf = [&](std::uint32_t type) {
+        return shipped.classes[shipped.classOfType[type]].name;
+    };
+    Require(nameOf(1) == "motorway" && nameOf(2) == "motorway" && nameOf(10) == "trunk" &&
+                nameOf(12) == "minor" && nameOf(22) == "path",
+            "road types map to the classes of all.cfg");
+    Require(nameOf(0) == "other" && nameOf(chmv::data::RoadStyleFallbackType) == "other",
+            "unlisted types use the * class");
+    Require(shipped.TypeWidths()[1] == 4.5f, "width of a class reaches its types");
+
+    const auto path = std::filesystem::temp_directory_path() / "chmv_road_styles_test.cfg";
+    const auto parse = [&](const std::string& text) {
+        std::ofstream(path) << text;
+        return renderer::LoadRoadStyles(path);
+    };
+    const auto custom = parse("# comment\nbig #ff000080 3 1 2 # inline\nrest #00ff00 1 *\n");
+    Require(custom.classes.size() == 2u && custom.classOfType[2] == 0u &&
+                custom.classOfType[5] == 1u && custom.classes[0].color[3] < 0.51f,
+            "colors with alpha and comments");
+    for (const auto* broken : {"a #ff0000 1 1\n", "a #ff0000 1 1 *\nb #00ff00 1 1\n",
+                               "a red 1 *\n", "a #ff0000 0 *\n", "a #ff0000 1\n",
+                               "a #ff0000 1 63 *\n", "a #ff0000 1 * \nb #00ff00 1 *\n"}) {
+        bool failed = false;
+        try {
+            (void)parse(broken);
+        } catch (const std::runtime_error&) {
+            failed = true;
+        }
+        Require(failed, "a broken road style file must be refused");
+    }
+    std::filesystem::remove(path);
 }
 
 } // namespace
 
 int main() {
     try {
-        TestLoaderAndReferenceUnfolding();
-        TestCPURangeFilterAndPipeline();
-        TestOrderedRangeRetrieval();
-        TestAsyncDatasetLoader();
-        TestDatasetLayoutAnalyzer();
-        TestHierarchicalSpatialOwnership();
-        TestDatasetPreprocessor();
-        TestGraphPageStreamer();
-        TestFixedGridBoundaryAndForwardShortcut();
-        TestMixedOrderShortcutGeometryBounds();
-        TestFixedGridPhysicalPagePacking();
-        TestCorrectnessValidator();
+        TestErrorBounds();
+        TestRoadStyles();
+        TestCompression();
         TestLodPageBuilder();
+        TestCompressedPageFile();
+        TestAsyncDatasetLoader();
         std::cout << "All tests passed.\n";
         return 0;
     } catch (const std::exception& error) {

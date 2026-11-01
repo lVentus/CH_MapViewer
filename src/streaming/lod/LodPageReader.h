@@ -18,6 +18,8 @@ namespace chmv::streaming::lod {
 struct LodPageData {
     std::uint32_t page = 0;
     std::vector<std::uint32_t> words;
+    // The page's children block, when the reader was asked for them.
+    std::vector<std::uint32_t> children;
 };
 
 struct LodPageReaderStats {
@@ -30,14 +32,15 @@ struct LodPageReaderStats {
     std::string error;
 };
 
-// Reads pages from disk on a few background threads. The render thread hands over the complete,
-// prioritized list of pages it is still missing whenever that list changes; the newest list
-// always replaces the old one, so a fast camera never builds up a backlog of stale reads.
-// Several reads are in flight at once (SSDs need queue depth), and pages that lie close
+// Reads (and decodes) pages from disk on a few background threads. The render thread hands over
+// the complete, prioritized list of pages it is still missing whenever that list changes; the
+// newest list always replaces the old one, so a fast camera never builds up a backlog of stale
+// reads. Several reads are in flight at once (SSDs need queue depth), and pages that lie close
 // together in the file are fetched with one read.
 class LodPageReader {
 public:
-    explicit LodPageReader(std::shared_ptr<const LodPageFile> file);
+    // withChildren also reads every page's children block (the file must have the hierarchy).
+    explicit LodPageReader(std::shared_ptr<const LodPageFile> file, bool withChildren = false);
     ~LodPageReader();
 
     LodPageReader(const LodPageReader&) = delete;
@@ -53,6 +56,7 @@ private:
     void ReadBatch(std::ifstream& input, std::vector<std::uint32_t>& batch);
 
     std::shared_ptr<const LodPageFile> file_;
+    bool withChildren_ = false;
     mutable std::mutex mutex_;
     std::condition_variable_any wake_;
     std::vector<std::uint32_t> demand_;

@@ -1,24 +1,13 @@
 #pragma once
 
-#include "geometry/GeometryRefinement.h"
 #include "renderer/RoadStyle.h"
 
-#include <array>
-#include <atomic>
-#include <chrono>
-#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
-#include <deque>
-#include <filesystem>
-#include <mutex>
 #include <optional>
-#include <string>
-#include <thread>
 
 namespace chmv::benchmark {
 class LodPageZoomSweep;
-struct PipelineValidationResult;
 }
 
 namespace chmv::core {
@@ -26,57 +15,56 @@ class Window;
 }
 
 namespace chmv::data {
-class CHGraph;
 class DatasetCatalog;
 struct DatasetLoadSnapshot;
-}
+} // namespace chmv::data
 
 namespace chmv::gpu::filtering {
 class RangeFilterStrategyManager;
 }
 
 namespace chmv::gpu::lod {
+struct LodPageBenchmarkResult;
 struct LodPageRuntimeStats;
-}
+struct LodPageValidation;
+} // namespace chmv::gpu::lod
 
 namespace chmv::gpu::unfolding {
 class UnfoldingStrategyManager;
 }
 
-namespace chmv::pipeline {
-enum class ProcessingMode;
-struct CPUProcessingStats;
-struct GPUProcessingStats;
-struct GPURangeBenchmarkResult;
-}
-
 namespace chmv::renderer {
 class LODController;
 class MapCamera2D;
-}
-
-namespace chmv::streaming::index {
-struct CHIndexData;
-}
-
-namespace chmv::streaming::runtime {
-struct GraphPageStreamingStats;
-}
+} // namespace chmv::renderer
 
 namespace chmv::ui {
 
 struct DebugUIActions {
     std::optional<std::size_t> datasetRequest;
-    bool datasetStreaming = true;
-    bool datasetLodPages = false;
-    bool lodPagesKeepInRam = true;
-    bool startLodPageZoomSweep = false;
-    bool cancelLodPageZoomSweep = false;
-    bool validateCurrentResult = false;
-    bool runGpuRangeBenchmark = false;
-    bool applyStreamingBudgets = false;
-    std::uint32_t streamingRamBudgetMiB = 0;
-    std::uint32_t streamingGpuBudgetMiB = 0;
+    bool rebuildPageFile = false;
+    bool validate = false;
+    bool runBenchmark = false;
+    bool startZoomSweep = false;
+    bool cancelZoomSweep = false;
+    std::optional<std::uint32_t> gpuBudgetMiB;
+};
+
+// What the panel shows and edits. Camera, LOD controller and stats are null without a dataset.
+struct DebugUIState {
+    data::DatasetCatalog& catalog;
+    const data::DatasetLoadSnapshot& load;
+    renderer::MapCamera2D* camera = nullptr;
+    renderer::LODController* lod = nullptr;
+    gpu::filtering::RangeFilterStrategyManager& filters;
+    gpu::unfolding::UnfoldingStrategyManager& unfolds;
+    float& pixelTolerance;
+    bool& preloadAll;
+    renderer::RoadStyleConfig& roadStyles;
+    const gpu::lod::LodPageRuntimeStats* stats = nullptr;
+    const gpu::lod::LodPageValidation* validation = nullptr;
+    const gpu::lod::LodPageBenchmarkResult* benchmark = nullptr;
+    const benchmark::LodPageZoomSweep* sweep = nullptr;
 };
 
 class DebugUI {
@@ -88,135 +76,22 @@ public:
     DebugUI& operator=(const DebugUI&) = delete;
 
     void BeginFrame() const;
-    [[nodiscard]] DebugUIActions Draw(
-        const data::CHGraph* graph,
-        gpu::filtering::RangeFilterStrategyManager& rangeFilterStrategyManager,
-        gpu::unfolding::UnfoldingStrategyManager& strategyManager,
-        renderer::MapCamera2D* camera,
-        renderer::LODController* lodController,
-        data::DatasetCatalog& datasetCatalog,
-        const data::DatasetLoadSnapshot& datasetLoad,
-        pipeline::ProcessingMode& processingMode,
-        geometry::RefinementMode& cpuGeometryRefinement,
-        float& maxScreenErrorPixels,
-        const pipeline::CPUProcessingStats* cpuStats,
-        const pipeline::GPUProcessingStats* gpuStats,
-        const pipeline::GPURangeBenchmarkResult* gpuRangeBenchmarkResult,
-        const benchmark::PipelineValidationResult* validationResult,
-        bool canValidate,
-        const streaming::index::CHIndexData* streamingIndex,
-        const streaming::runtime::GraphPageStreamingStats* streamingStats,
-        renderer::RoadStyleConfig& roadStyles,
-        const gpu::lod::LodPageRuntimeStats* lodPageStats,
-        const benchmark::LodPageZoomSweep* lodPageSweep);
+    [[nodiscard]] DebugUIActions Draw(const DebugUIState& state);
     void EndFrame() const;
     [[nodiscard]] bool WantsMouse() const;
-    [[nodiscard]] bool SplitScreenValidation() const { return splitScreenValidation_; }
 
 private:
-    struct RoadTypeDiagnosticResult {
-        std::filesystem::path graphPath;
-        std::array<std::uint64_t, data::RoadStyleTypeCount> sourceHistogram{};
-        std::array<std::uint64_t, data::RoadStyleTypeCount> indexHistogram{};
-        std::uint64_t scannedEdges = 0;
-        std::uint64_t missingIndexMetadata = 0;
-        std::uint64_t styleMismatches = 0;
-        std::uint64_t recordIdMismatches = 0;
-        bool rootSubset = false;
-        bool comparedIndex = false;
-        std::string error;
-    };
-
-    void StartRoadTypeDiagnostic(std::filesystem::path graphPath,
-                                 std::filesystem::path rangesPath);
-    void DrawLodPagePanel(const gpu::lod::LodPageRuntimeStats& stats,
-                          const benchmark::LodPageZoomSweep* sweep, float& pixelTolerance,
-                          DebugUIActions& actions) const;
-
-
-    struct OocTelemetryCounters {
-        std::uint64_t pageCacheHits = 0;
-        std::uint64_t pageCacheMisses = 0;
-        std::uint64_t uniquePageLoads = 0;
-        std::uint64_t pageReloadsAfterEviction = 0;
-        std::uint64_t pageInFlightReuses = 0;
-        std::uint64_t pageQueueReprioritizations = 0;
-        std::uint64_t stalePageQueueEntriesSkipped = 0;
-        std::uint64_t stalePageLoadsDiscarded = 0;
-        std::uint64_t rootIoReadOperations = 0;
-        std::uint64_t rootIoBatchedReadOperations = 0;
-        std::uint64_t rootIoPagesRead = 0;
-        std::uint64_t rootIoBytesRead = 0;
-        double rootIoReadMilliseconds = 0.0;
-        std::uint64_t totalEvictions = 0;
-        std::uint64_t totalRefinementBlockLoads = 0;
-        std::uint64_t totalRefinementBlockEvictions = 0;
-        std::uint64_t nodeBlockCacheHits = 0;
-        std::uint64_t nodeBlockCacheMisses = 0;
-        std::uint64_t nodeBlockCacheEvictions = 0;
-        std::uint64_t rootPlannerRebuilds = 0;
-        std::uint64_t rootPlannerCacheReuses = 0;
-        std::uint64_t gpuIncrementalRootBytesUploaded = 0;
-        std::uint64_t gpuIncrementalBackingBytesUploaded = 0;
-        std::uint64_t gpuRootPageEvictions = 0;
-        std::uint64_t gpuBackingBlockEvictions = 0;
-        std::uint64_t gpuBackingBlockFirstUploads = 0;
-        std::uint64_t gpuBackingBlockReuploadsAfterEviction = 0;
-        std::uint64_t gpuBackingGraceFallbackEvictions = 0;
-        std::uint64_t gpuRootCacheAllocationFailures = 0;
-        std::uint64_t gpuBackingCacheAllocationFailures = 0;
-    };
-
-    bool StartOocTelemetry(const streaming::runtime::GraphPageStreamingStats& stats,
-                           const renderer::MapCamera2D* camera);
-    void StopOocTelemetry();
-    void UpdateOocTelemetry(const streaming::runtime::GraphPageStreamingStats& stats,
-                            const renderer::MapCamera2D* camera);
-    void QueueOocTelemetryRecord(std::string payload,
-                                 std::chrono::steady_clock::time_point now);
-    void OocTelemetryWriterMain(std::stop_token stopToken, std::filesystem::path path);
-    void DeleteOocTelemetryLogs();
-    [[nodiscard]] static OocTelemetryCounters CaptureOocTelemetryCounters(
-        const streaming::runtime::GraphPageStreamingStats& stats);
+    void DrawDataset(const DebugUIState& state, DebugUIActions& actions);
+    static void DrawView(const DebugUIState& state);
+    static void DrawPipeline(const DebugUIState& state, DebugUIActions& actions);
+    static void DrawPageStats(const gpu::lod::LodPageRuntimeStats& stats);
+    void DrawMemory(const DebugUIState& state, DebugUIActions& actions);
+    void DrawRoadStyles(const DebugUIState& state);
+    static void DrawZoomSweep(const DebugUIState& state, DebugUIActions& actions);
 
     std::size_t selectedDataset_ = 0;
-    // 0 = full resident, 1 = LOD pages (.chlod)
-    int datasetRuntime_ = 1;
-    bool lodPagesKeepInRam_ = true;
-    bool splitScreenValidation_ = true;
-    int streamingRamBudgetMiB_ = 0;
-    int streamingGpuBudgetMiB_ = 0;
+    int gpuBudgetMiB_ = 0;
     int selectedRoadStyleType_ = 0;
-
-    std::jthread roadTypeDiagnosticWorker_;
-    std::atomic<bool> roadTypeDiagnosticRunning_{false};
-    std::atomic<std::uint64_t> roadTypeDiagnosticProcessed_{0};
-    std::atomic<std::uint64_t> roadTypeDiagnosticTotal_{0};
-    std::mutex roadTypeDiagnosticMutex_;
-    std::optional<RoadTypeDiagnosticResult> roadTypeDiagnosticResult_;
-
-    bool oocTelemetryEnabled_ = false;
-    std::filesystem::path oocTelemetryDirectory_;
-    std::filesystem::path oocTelemetryCurrentPath_;
-    std::string oocTelemetryError_;
-    std::string oocTelemetryDeleteMessage_;
-    std::jthread oocTelemetryWriter_;
-    std::mutex oocTelemetryWriterMutex_;
-    std::condition_variable oocTelemetryWriterCondition_;
-    std::deque<std::string> oocTelemetryPendingLines_;
-    std::size_t oocTelemetryPendingBytes_ = 0;
-    std::chrono::steady_clock::time_point oocTelemetryStartTime_{};
-    std::chrono::steady_clock::time_point oocTelemetryLastSampleTime_{};
-    std::chrono::steady_clock::time_point oocTelemetryLastReloadEventTime_{};
-    std::optional<std::chrono::steady_clock::time_point> oocTelemetryBurstIdleSince_;
-    std::chrono::steady_clock::time_point oocTelemetryBurstStartTime_{};
-    OocTelemetryCounters oocTelemetryLastSampleCounters_{};
-    OocTelemetryCounters oocTelemetryBurstStartCounters_{};
-    std::uint64_t oocTelemetryLastObservedReloads_ = 0;
-    std::uint64_t oocTelemetryPendingReloadEvents_ = 0;
-    bool oocTelemetryBurstActive_ = false;
-    bool oocTelemetryBacklogHigh_ = false;
-
 };
 
 } // namespace chmv::ui

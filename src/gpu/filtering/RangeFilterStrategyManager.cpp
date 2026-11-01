@@ -1,7 +1,5 @@
 #include "gpu/filtering/RangeFilterStrategyManager.h"
 
-#include "data/ch/CHGraph.h"
-
 #include <stdexcept>
 #include <utility>
 
@@ -12,23 +10,6 @@ void RangeFilterStrategyManager::Register(std::unique_ptr<IRangeFilterStrategy> 
         throw std::invalid_argument("cannot register a null range filter strategy");
     }
     strategies_.push_back(std::move(strategy));
-}
-
-void RangeFilterStrategyManager::SetGraph(const data::CHGraph& graph) {
-    for (auto& strategy : strategies_) {
-        strategy->SetGraph(graph);
-        strategy->Reset();
-    }
-}
-
-void RangeFilterStrategyManager::SetStreamingRanges(
-    std::span<const data::EdgeRange> ranges) {
-    for (auto& strategy : strategies_) {
-        if (strategy->SupportsStreamingWorkingSet()) {
-            strategy->SetStreamingRanges(ranges);
-            strategy->Reset();
-        }
-    }
 }
 
 void RangeFilterStrategyManager::Select(std::size_t index) {

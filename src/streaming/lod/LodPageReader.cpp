@@ -4,6 +4,7 @@
 #include <chrono>
 #include <exception>
 #include <fstream>
+#include <span>
 #include <stdexcept>
 #include <utility>
 
@@ -25,7 +26,8 @@ constexpr std::uint64_t kMaxFinishedBytes = 64ull << 20u;
 
 } // namespace
 
-LodPageReader::LodPageReader(std::shared_ptr<const LodPageFile> file) : file_(std::move(file)) {
+LodPageReader::LodPageReader(std::shared_ptr<const LodPageFile> file, bool withChildren)
+    : file_(std::move(file)), withChildren_(withChildren) {
     const auto count = ReaderThreadCount();
     stats_.threads = count;
     threads_.reserve(count);
@@ -52,7 +54,7 @@ void LodPageReader::SetDemand(std::vector<std::uint32_t> pages) {
             if (wanted.contains(page.page)) {
                 return false;
             }
-            stats_.finishedBytes -= page.words.size() * 4u;
+            stats_.finishedBytes -= (page.words.size() + page.children.size()) * 4u;
             delivered_.erase(page.page);
             return true;
         });
@@ -66,7 +68,7 @@ void LodPageReader::Take(std::vector<LodPageData>& out, std::uint64_t maxBytes) 
         std::lock_guard lock(mutex_);
         while (!finished_.empty() && taken < maxBytes) {
             auto& page = finished_.front();
-            const auto bytes = page.words.size() * 4u;
+            const auto bytes = (page.words.size() + page.children.size()) * 4u;
             taken += bytes;
             stats_.finishedBytes -= bytes;
             delivered_.erase(page.page);
@@ -129,48 +131,63 @@ void LodPageReader::Run(const std::stop_token& stop) {
 }
 
 void LodPageReader::ReadBatch(std::ifstream& input, std::vector<std::uint32_t>& batch) {
-    const auto pages = file_->Pages();
     std::sort(batch.begin(), batch.end(), [&](std::uint32_t a, std::uint32_t b) {
-        return pages[a].fileOffset < pages[b].fileOffset;
+        return file_->PageStorage(a).offset < file_->PageStorage(b).offset;
     });
 
-    std::vector<LodPageData> done;
-    std::vector<std::uint32_t> buffer;
+    std::vector<LodPageData> done(batch.size());
+    std::vector<std::byte> buffer;
     std::uint64_t bytesRead = 0;
     std::uint64_t calls = 0;
     const auto begin = std::chrono::steady_clock::now();
-    std::size_t first = 0;
-    while (first < batch.size()) {
-        const auto offset = pages[batch[first]].fileOffset;
-        auto end = offset + pages[batch[first]].wordCount * 4ull;
-        auto last = first + 1u;
-        while (last < batch.size()) {
-            const auto& next = pages[batch[last]];
-            const auto nextEnd = next.fileOffset + next.wordCount * 4ull;
-            if (next.fileOffset > end + kMaxGapBytes || nextEnd - offset > kMaxReadBytes) {
-                break;
+    // Both the pages and their children blocks lie in page order, so one sorted batch reads
+    // either with few calls. Compressed pages are decoded here, off the render thread; one that
+    // does not decode is handed over empty and rejected on upload.
+    const auto readAll = [&](auto storage, auto decode) {
+        std::size_t first = 0;
+        while (first < batch.size()) {
+            const auto offset = storage(batch[first]).offset;
+            auto end = offset + storage(batch[first]).bytes;
+            auto last = first + 1u;
+            while (last < batch.size()) {
+                const auto next = storage(batch[last]);
+                const auto nextEnd = next.offset + next.bytes;
+                if (next.offset > end + kMaxGapBytes || nextEnd - offset > kMaxReadBytes) {
+                    break;
+                }
+                end = nextEnd;
+                ++last;
             }
-            end = nextEnd;
-            ++last;
+            buffer.resize(static_cast<std::size_t>(end - offset));
+            input.seekg(static_cast<std::streamoff>(offset));
+            input.read(reinterpret_cast<char*>(buffer.data()),
+                       static_cast<std::streamsize>(end - offset));
+            if (!input) {
+                throw std::runtime_error("page read failed in " + file_->Path().string());
+            }
+            ++calls;
+            bytesRead += end - offset;
+            for (auto i = first; i < last; ++i) {
+                const auto range = storage(batch[i]);
+                decode(done[i], std::span<const std::byte>(buffer).subspan(
+                                    static_cast<std::size_t>(range.offset - offset),
+                                    static_cast<std::size_t>(range.bytes)));
+            }
+            first = last;
         }
-        buffer.resize(static_cast<std::size_t>((end - offset) / 4u));
-        input.seekg(static_cast<std::streamoff>(offset));
-        input.read(reinterpret_cast<char*>(buffer.data()),
-                   static_cast<std::streamsize>(end - offset));
-        if (!input) {
-            throw std::runtime_error("page read failed in " + file_->Path().string());
-        }
-        ++calls;
-        bytesRead += end - offset;
-        for (auto i = first; i < last; ++i) {
-            const auto& entry = pages[batch[i]];
-            const auto start = static_cast<std::ptrdiff_t>((entry.fileOffset - offset) / 4u);
-            LodPageData page;
-            page.page = batch[i];
-            page.words.assign(buffer.begin() + start, buffer.begin() + start + entry.wordCount);
-            done.push_back(std::move(page));
-        }
-        first = last;
+    };
+    for (std::size_t i = 0; i < batch.size(); ++i) {
+        done[i].page = batch[i];
+    }
+    readAll([&](std::uint32_t page) { return file_->PageStorage(page); },
+            [&](LodPageData& page, std::span<const std::byte> stored) {
+                static_cast<void>(file_->DecodePage(page.page, stored, page.words));
+            });
+    if (withChildren_) {
+        readAll([&](std::uint32_t page) { return file_->ChildrenStorage(page); },
+                [&](LodPageData& page, std::span<const std::byte> stored) {
+                    static_cast<void>(file_->DecodeChildren(page.page, stored, page.children));
+                });
     }
     const auto milliseconds =
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
@@ -178,7 +195,7 @@ void LodPageReader::ReadBatch(std::ifstream& input, std::vector<std::uint32_t>& 
     std::lock_guard lock(mutex_);
     for (auto& page : done) {
         inFlight_.erase(page.page);
-        stats_.finishedBytes += page.words.size() * 4u;
+        stats_.finishedBytes += (page.words.size() + page.children.size()) * 4u;
         delivered_.insert(page.page);
         finished_.push_back(std::move(page));
     }

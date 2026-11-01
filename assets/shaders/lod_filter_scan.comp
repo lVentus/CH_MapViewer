@@ -1,0 +1,30 @@
+#version 430 core
+
+// Full scan: one workgroup per listed page, one invocation per record. Keeps every record whose
+// root or child level interval contains the level; what of it is drawn is up to the expansion.
+
+layout(local_size_x = 256) in;
+
+#include "lod_page_common.glsl"
+#include "lod_page_candidates.glsl"
+
+layout(std430, binding = 2) readonly buffer SlotList {
+    uint slotCount;
+    uint slotGroups[3];
+    uint slots[];
+};
+
+uniform uint uLevel;
+
+void main() {
+    uint index = linearGroup();
+    uint local = gl_LocalInvocationID.x;
+    bool keep = false;
+    uint item = 0u;
+    if (index < slotCount) {
+        uint slot = slots[index];
+        item = (slot << 8u) | local;
+        keep = local < recordCount(slot) && levelMatch(pageRecord(item), uLevel);
+    }
+    keepCandidates(keep, item);
+}

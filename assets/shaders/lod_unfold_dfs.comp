@@ -1,0 +1,60 @@
+#version 430 core
+
+// Adaptive DFS: one invocation per root walks its subtree depth first with a private stack,
+// skipping subtrees outside the view and drawing every node that is accurate enough. Simple,
+// but invocations of one workgroup run as long as the deepest walk among them.
+// STACK_SIZE (defined by the host) is at least the hierarchy height plus one.
+
+layout(local_size_x = 64) in;
+
+#include "lod_page_common.glsl"
+#include "lod_page_segments.glsl"
+#include "lod_page_traversal.glsl"
+
+layout(std430, binding = 2) readonly buffer Candidates {
+    uint candidateCount;
+    uint candidateGroups[3];
+    uint candidates[];
+};
+
+uniform uint uLevel;
+
+void main() {
+    uint index = linearInvocation();
+    if (index >= candidateCount) {
+        return;
+    }
+    uint root = candidates[index];
+    if (!inLevelRange(pageRecord(root).y, uLevel)) {
+        return;
+    }
+
+    uint stack[STACK_SIZE];
+    uint depth = 1u;
+    stack[0] = root;
+    while (depth > 0u) {
+        depth -= 1u;
+        uint node = stack[depth];
+        uvec4 record = pageRecord(node);
+        if (!nodeVisible(node, record)) {
+            continue;
+        }
+        if (!expands(node, record)) {
+            drawSegment(node);
+            continue;
+        }
+        // Second child first, so the walk goes left to right.
+        for (uint which = 2u; which > 0u; --which) {
+            uint child = childItem(node, which - 1u);
+            if (child == kNoItem) {
+                continue;
+            }
+            if (depth == uint(STACK_SIZE)) {
+                atomicAdd(status[kStatusStackOverflow], 1u);
+                continue;
+            }
+            stack[depth] = child;
+            depth += 1u;
+        }
+    }
+}

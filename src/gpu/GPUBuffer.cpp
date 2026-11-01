@@ -8,6 +8,7 @@
 #include <atomic>
 #include <cstring>
 #include <stdexcept>
+#include <string>
 #include <string_view>
 #include <utility>
 
@@ -124,6 +125,20 @@ void GPUBuffer::Allocate(std::size_t sizeBytes, const void* data, std::uint32_t 
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, id_);
     glBufferData(GL_SHADER_STORAGE_BUFFER, static_cast<GLsizeiptr>(sizeBytes), data, glUsage);
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+    // A buffer the driver could not allocate must not go unnoticed: every later use of it would
+    // be undefined.
+    bool outOfMemory = false;
+    for (int i = 0; i < 8; ++i) {
+        const auto error = glGetError();
+        if (error == GL_NO_ERROR) {
+            break;
+        }
+        outOfMemory = outOfMemory || error == GL_OUT_OF_MEMORY;
+    }
+    if (outOfMemory) {
+        throw std::runtime_error("out of GPU memory allocating " +
+                                 std::to_string(sizeBytes / (1024u * 1024u)) + " MiB");
+    }
     sizeBytes_ = sizeBytes;
 }
 

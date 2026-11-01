@@ -56,7 +56,7 @@ void LodPageZoomSweep::Start(const std::filesystem::path& csvPath, renderer::Map
     csv_ = std::ofstream(csvPath);
     csv_ << "time_s,phase,zoom,level,draw_level,threshold,required_pages,missing_pages,"
             "draw_pages,segments,uploaded_bytes,plan_ms,upload_ms,update_ms,gpu_filter_ms,"
-            "gpu_draw_ms,frame_ms,complete\n";
+            "gpu_unfold_ms,gpu_draw_ms,frame_ms,complete\n";
     stats_ = {};
     summary_.clear();
     totalSeconds_ = 0.0;
@@ -113,8 +113,9 @@ void LodPageZoomSweep::Record(const gpu::lod::LodPageRuntimeStats& stats,
          << stats.threshold << ',' << stats.requiredPages << ',' << stats.missingRequiredPages
          << ',' << stats.drawPages << ',' << stats.drawnSegments << ',' << stats.uploadedBytes
          << ',' << stats.planMs << ',' << stats.uploadMs << ',' << stats.updateMs << ','
-         << stats.gpuFilterMs.value_or(-1.0) << ',' << stats.gpuDrawMs.value_or(-1.0) << ','
-         << frameMs << ',' << (stats.complete ? 1 : 0) << '\n';
+         << stats.gpuFilterMs.value_or(-1.0) << ',' << stats.gpuUnfoldMs.value_or(-1.0) << ','
+         << stats.gpuDrawMs.value_or(-1.0) << ',' << frameMs << ',' << (stats.complete ? 1 : 0)
+         << '\n';
 
     auto& phaseStats = stats_[static_cast<std::size_t>(phase_)];
     phaseStats.frameMs.push_back(frameMs);

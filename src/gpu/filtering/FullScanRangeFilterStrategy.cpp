@@ -1,46 +1,31 @@
 #include "gpu/filtering/FullScanRangeFilterStrategy.h"
 
-#include "data/ch/CHGraph.h"
+#include "gpu/lod/LodPageLists.h"
+#include "gpu/lod/LodPagePool.h"
 
 #include <glad/gl.h>
 
 namespace chmv::gpu::filtering {
-namespace {
-
-constexpr std::uint32_t kWorkGroupSize = 256;
-
-} // namespace
 
 FullScanRangeFilterStrategy::FullScanRangeFilterStrategy(
     const std::filesystem::path& shaderDirectory)
-    : filterProgram_(shaderDirectory / "range_filter.comp") {}
+    : scanProgram_(shaderDirectory / "lod_filter_scan.comp") {}
 
-void FullScanRangeFilterStrategy::SetGraph(const data::CHGraph& graph) {
-    edgeCount_ = static_cast<std::uint32_t>(graph.EdgeCount());
+void FullScanRangeFilterStrategy::Execute(const RangeFilterInput& input) {
+    Scan(scanProgram_, input, input.slotList);
 }
 
-void FullScanRangeFilterStrategy::SetStreamingRanges(
-    std::span<const data::EdgeRange> ranges) {
-    edgeCount_ = static_cast<std::uint32_t>(ranges.size());
-}
-
-RangeFilterExecutionStats FullScanRangeFilterStrategy::Execute(const RangeFilterInput& input) {
-    filterProgram_.Bind();
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, input.graphEdgeBuffer);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, input.outputEdgeBuffer);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, input.outputDrawCommandBuffer);
-    glUniform1ui(glGetUniformLocation(filterProgram_.Id(), "uEdgeCount"), input.graphEdgeCount);
-    glUniform1i(glGetUniformLocation(filterProgram_.Id(), "uLevel"), input.lodLevel);
-    filterProgram_.Dispatch((input.graphEdgeCount + kWorkGroupSize - 1) / kWorkGroupSize);
-    return {input.graphEdgeCount};
-}
-
-RangeFilterDiagnostics FullScanRangeFilterStrategy::ReadBackDiagnostics(std::int32_t) const {
-    return {
-        edgeCount_,
-        (edgeCount_ + kWorkGroupSize - 1) / kWorkGroupSize,
-        kWorkGroupSize,
-    };
+void FullScanRangeFilterStrategy::Scan(const ComputeProgram& program,
+                                       const RangeFilterInput& input, std::uint32_t slotList) {
+    program.Bind();
+    const auto id = program.Id();
+    input.pool->BindForKernel(id);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, slotList);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, input.candidateList);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, input.statusBuffer);
+    glUniform1ui(glGetUniformLocation(id, "uLevel"), input.query.level);
+    glUniform1ui(glGetUniformLocation(id, "uCandidateCapacity"), input.candidateCapacity);
+    lod::ListDispatcher::Dispatch(slotList);
 }
 
 } // namespace chmv::gpu::filtering

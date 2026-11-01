@@ -1,6 +1,9 @@
 #include "data/DatasetCatalog.h"
 
+#include "streaming/lod/LodPageFile.h"
+
 #include <algorithm>
+#include <set>
 #include <utility>
 
 namespace chmv::data {
@@ -17,6 +20,8 @@ void DatasetCatalog::Refresh() {
         return;
     }
 
+    std::vector<std::filesystem::path> pageFiles;
+    std::set<std::filesystem::path> builtPageFiles;
     std::filesystem::recursive_directory_iterator iterator(directory_);
     const std::filesystem::recursive_directory_iterator end;
     for (; iterator != end; ++iterator) {
@@ -30,6 +35,10 @@ void DatasetCatalog::Refresh() {
         }
 
         const auto& graphPath = item.path();
+        if (graphPath.extension() == ".chlod") {
+            pageFiles.push_back(graphPath);
+            continue;
+        }
         if (graphPath.extension() == ".ranges" || graphPath.extension() == ".bz2") {
             continue;
         }
@@ -44,7 +53,18 @@ void DatasetCatalog::Refresh() {
         entry.name = std::filesystem::relative(graphPath, directory_).generic_string();
         entry.graphPath = graphPath;
         entry.rangesPath = std::move(rangesPath);
+        entry.pageFilePath = streaming::lod::LodPageFile::DefaultPath(graphPath);
+        builtPageFiles.insert(entry.pageFilePath);
         entries_.push_back(std::move(entry));
+    }
+    // A page file is complete on its own: listed by itself once its sources are gone.
+    for (auto& pageFile : pageFiles) {
+        if (!builtPageFiles.contains(pageFile)) {
+            DatasetEntry entry;
+            entry.name = std::filesystem::relative(pageFile, directory_).generic_string();
+            entry.pageFilePath = std::move(pageFile);
+            entries_.push_back(std::move(entry));
+        }
     }
 
     std::sort(entries_.begin(), entries_.end(), [](const DatasetEntry& left, const DatasetEntry& right) {

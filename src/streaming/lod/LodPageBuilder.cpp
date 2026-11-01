@@ -1,19 +1,21 @@
 #include "streaming/lod/LodPageBuilder.h"
 
+#include "data/SystemMemory.h"
 #include "data/ch/CHTypes.h"
 #include "renderer/LODController.h"
 #include "renderer/MapCamera2D.h"
+#include "streaming/lod/LodPageCompression.h"
 #include "streaming/lod/LodPageFile.h"
 #include "streaming/lod/LodPageFormat.h"
 #include "streaming/lod/LodPageHierarchy.h"
 #include "streaming/lod/LodPageIo.h"
 #include "streaming/lod/LodPagePlanner.h"
 #include "streaming/lod/LodPageSource.h"
-#include "streaming/runtime/GraphPageStreamer.h"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -46,8 +48,10 @@ constexpr double kGiB = 1024.0 * 1024.0 * 1024.0;
 // about kTargetPagePasses of them; far more than that means the budget is too small to finish.
 constexpr std::uint32_t kTargetPagePasses = 8;
 constexpr std::uint32_t kMaxPagePasses = 64;
-// Disk still needed once the records are known: record ids, pages and directory.
-constexpr std::uint64_t kDiskBytesPerRecord = 40;
+// Disk still needed once the records are known: record ids, pages, directories, the children
+// section and the representative scratch file (52 B), then the compressed copy of the whole
+// file (about 28 B).
+constexpr std::uint64_t kDiskBytesPerRecord = 80;
 // Hash map entry plus vector allocation for an edge with further contexts.
 constexpr std::uint64_t kExtraContextBytes = 128;
 // Readers and scan buffers of one worker thread.
@@ -218,6 +222,8 @@ struct Record {
     std::uint32_t childLevels = kEmptyLevelRange;
     std::uint32_t errors = 0;
     std::uint8_t style = 0;
+    // The one record of its edge a traversal visits (and whose children it follows).
+    bool representative = false;
 
     [[nodiscard]] std::uint8_t LayerOctave() const { return static_cast<std::uint8_t>(key >> 32u); }
     [[nodiscard]] int Layer() const { return static_cast<int>(key >> 37u); }
@@ -332,8 +338,8 @@ private:
 class RecordMaker {
 public:
     RecordMaker(const LodPageNodes& nodes, const ContextTable& contexts,
-                const ReferenceCurve& curve)
-        : nodes_(nodes), contexts_(contexts), curve_(curve) {
+                const ReferenceCurve& curve, const EdgeMask& shortcuts)
+        : nodes_(nodes), contexts_(contexts), curve_(curve), shortcuts_(shortcuts) {
         minX_ = *std::min_element(nodes.x.begin(), nodes.x.end());
         minY_ = *std::min_element(nodes.y.begin(), nodes.y.end());
         const auto maxX = *std::max_element(nodes.x.begin(), nodes.x.end());
@@ -353,8 +359,9 @@ public:
     }
 
     // Main record of the edge (false if it has none). With `extras`, also appends a record for
-    // every further context. Keys are placed only when `place` is set; otherwise the caller
-    // supplies them.
+    // every further context, and for a shortcut that has no record at all but can still be
+    // walked through, one that is never drawn. Keys are placed only when `place` is set;
+    // otherwise the caller supplies them.
     bool Make(const EdgeRow& row, bool place, Record& main, std::vector<Record>* extras) const {
         const auto errorCode = EncodeGeometryError(row.error);
         const auto root = RootInterval(row);
@@ -380,11 +387,14 @@ public:
         const bool hasMain = !root.Empty() || !child.Empty();
         if (hasMain) {
             Fill(row, root, child, errorCode, child.Empty() ? kErrorCodeInfinite : childCode, main);
+            main.representative = true;
             if (place) {
                 main.key = Key(row, root, child, childCode);
             }
         }
         if (extras != nullptr) {
+            // Without a main record the first further record represents the edge.
+            bool representative = !hasMain;
             const auto addExtra = [&](const LevelContext& context) {
                 if (errorCode >= context.parentCode) {
                     return;
@@ -393,6 +403,8 @@ public:
                 Record record;
                 Fill(row, {}, levels, errorCode, context.parentCode, record);
                 record.key = Key(row, {}, levels, context.parentCode);
+                record.representative = representative;
+                representative = false;
                 extras->push_back(record);
             };
             if (hasMoved) {
@@ -403,11 +415,34 @@ public:
                     addExtra(context);
                 }
             }
+            // Reached only below parents of the same error code, so always expanded there.
+            if (representative && shortcuts_.Test(row.edge) && Expandable(row.edge)) {
+                Record record;
+                Fill(row, {}, {}, errorCode, errorCode, record);
+                record.key = (std::uint64_t{kCatchAllLayer} << 37u) | Morton(row.source, row.target);
+                record.representative = true;
+                extras->push_back(record);
+            }
         }
         return hasMain;
     }
 
 private:
+    // Some parent of the edge can be expanded (has a non-zero error code).
+    [[nodiscard]] bool Expandable(std::uint32_t edge) const {
+        if (contexts_.HasPrimary(edge) && contexts_.parentCode[edge] != 0u) {
+            return true;
+        }
+        if (const auto it = contexts_.extra.find(edge); it != contexts_.extra.end()) {
+            for (const auto& context : it->second) {
+                if (context.parentCode != 0u) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
     void Fill(const EdgeRow& row, LevelInterval root, LevelInterval child, std::uint16_t errorCode,
               std::uint16_t parentCode, Record& record) const {
         record.edge = row.edge;
@@ -441,6 +476,7 @@ private:
     const LodPageNodes& nodes_;
     const ContextTable& contexts_;
     const ReferenceCurve& curve_;
+    const EdgeMask& shortcuts_;
     double minX_ = 0.0;
     double minY_ = 0.0;
     double scaleX_ = 1.0;
@@ -481,14 +517,24 @@ void MergeGroupBands(PageGroup& group, const PageEntry& page) {
     }
 }
 
+// Where an edge's representative record ended up: page << 8 | record.
+struct RepresentativeLocation {
+    std::uint32_t edge = 0;
+    std::uint32_t location = 0;
+};
+
+using ChildMask = std::array<std::uint32_t, kChildMaskWords>;
+
 class PageWriter {
 public:
-    PageWriter(const LodPageNodes& nodes, LodPageOutput& output, const FileHeader& header,
-               SectionHashes& hashes)
-        : nodes_(nodes), output_(output), pagesOffset_(header.At(Section::Pages).offset),
-          pageHash_(HashOf(hashes, Section::Pages)),
-          recordEdges_(output, header.At(Section::RecordEdge),
-                       HashOf(hashes, Section::RecordEdge)) {
+    // Representative locations go to `representatives` in page order.
+    PageWriter(const LodPageNodes& nodes, const ContextTable& contexts, const EdgeMask& shortcuts,
+               LodPageOutput& output, const FileHeader& header, SectionHashes& hashes,
+               const std::filesystem::path& representatives)
+        : nodes_(nodes), contexts_(contexts), shortcuts_(shortcuts), output_(output),
+          pagesOffset_(header.At(Section::Pages).offset), pageHash_(HashOf(hashes, Section::Pages)),
+          recordEdges_(output, header.At(Section::RecordEdge), HashOf(hashes, Section::RecordEdge)),
+          representatives_(representatives) {
         open_.reserve(kPageRecordCapacity);
     }
 
@@ -534,9 +580,14 @@ public:
         }
         Pack();
         recordEdges_.Flush();
+        representatives_.Close();
     }
 
     [[nodiscard]] std::vector<PageEntry>& Pages() { return pages_; }
+    // Visit entries without their children block location yet, and the children masks.
+    [[nodiscard]] std::vector<PageEntry>& VisitPages() { return visits_; }
+    [[nodiscard]] std::vector<ChildMask>& ChildMasks() { return masks_; }
+    [[nodiscard]] std::uint64_t RepresentativeCount() const { return representatives_.Count(); }
     [[nodiscard]] std::uint64_t PageBytes() const { return pageBytes_; }
     [[nodiscard]] std::uint64_t RecordCount() const { return recordCount_; }
 
@@ -587,6 +638,10 @@ private:
         std::vector<std::uint32_t> words;
         std::vector<PageEntry> entries;
         std::vector<std::uint32_t> edges;
+        std::vector<PageEntry> visits;
+        std::vector<ChildMask> masks;
+        std::vector<RepresentativeLocation> representatives;
+        std::vector<std::pair<std::uint32_t, std::uint32_t>> reach;
     };
 
     void Pack() {
@@ -599,6 +654,9 @@ private:
                 run.words.clear();
                 run.entries.clear();
                 run.edges.clear();
+                run.visits.clear();
+                run.masks.clear();
+                run.representatives.clear();
                 LocalVertices local;
                 auto firstRecord = recordCount_;
                 for (auto i = first; i < pieces[task].first; ++i) {
@@ -618,8 +676,11 @@ private:
                 }
                 pageBytes_ += run.words.size() * 4u;
                 recordCount_ += run.edges.size();
+                visits_.insert(visits_.end(), run.visits.begin(), run.visits.end());
+                masks_.insert(masks_.end(), run.masks.begin(), run.masks.end());
             }
-            // Pages and record ids of the round go out in order, each on its own thread.
+            // Pages, record ids and representative locations of the round go out in order, each
+            // on its own thread.
             RunTogether({
                 [&] {
                     auto offset = roundOffset;
@@ -633,6 +694,11 @@ private:
                 [&] {
                     for (const auto& run : runs_) {
                         recordEdges_.Append(run.edges);
+                    }
+                },
+                [&] {
+                    for (const auto& run : runs_) {
+                        representatives_.Append(run.representatives);
                     }
                 },
             });
@@ -724,6 +790,76 @@ private:
                        record.errors >> 16u);
         }
         run.entries.push_back(entry);
+        AddVisit(records, pageIndex, entry, run);
+    }
+
+    // What a traversal needs from the page: where its representative records are visited
+    // (under every context of their edges), how far their geometry can reach beyond their chords,
+    // and which of them have children.
+    void AddVisit(std::span<const Record> records, std::uint32_t pageIndex, const PageEntry& entry,
+                  PageRun& run) const {
+        PageEntry visit;
+        visit.firstRecord = entry.firstRecord;
+        visit.recordCount = entry.recordCount;
+        visit.layer = entry.layer;
+        visit.octave = entry.octave;
+        ChildMask mask{};
+        auto& reach = run.reach;
+        reach.clear();
+        double grow = 0.0;
+        for (std::uint32_t i = 0; i < records.size(); ++i) {
+            const auto& record = records[i];
+            if (!record.representative) {
+                continue;
+            }
+            const auto edge = record.edge;
+            run.representatives.push_back({edge, (pageIndex << 8u) | i});
+            if (shortcuts_.Test(edge)) {
+                mask[i >> 5u] |= 1u << (i & 31u);
+            }
+            grow = std::max(grow, static_cast<double>(ErrorBound(record.errors & 0xffffu)) /
+                                      kFixedCoordinateScale);
+            if (record.rootLevels != kEmptyLevelRange) {
+                reach.emplace_back(record.rootLevels, kErrorCodeInfinite);
+            }
+            if (contexts_.HasPrimary(edge)) {
+                reach.emplace_back(PackLevels({contexts_.low[edge], contexts_.high[edge]}),
+                                   contexts_.parentCode[edge]);
+            }
+            if (const auto it = contexts_.extra.find(edge); it != contexts_.extra.end()) {
+                for (const auto& context : it->second) {
+                    reach.emplace_back(PackLevels({context.low, context.high}),
+                                       context.parentCode);
+                }
+            }
+        }
+
+        std::uint32_t minLevel = 0xffffu;
+        std::uint32_t maxLevel = 0u;
+        std::uint32_t maxParentCode = 0u;
+        for (const auto& [levels, parentCode] : reach) {
+            minLevel = std::min(minLevel, levels & 0xffffu);
+            maxLevel = std::max(maxLevel, levels >> 16u);
+            maxParentCode = std::max(maxParentCode, parentCode);
+        }
+        visit.minLevel = static_cast<std::uint16_t>(minLevel);
+        visit.maxLevel = static_cast<std::uint16_t>(maxLevel);
+        visit.minErrorCode = 0;
+        visit.maxParentCode = static_cast<std::uint16_t>(maxParentCode);
+        visit.bands = EmptyBands();
+        for (const auto& [levels, parentCode] : reach) {
+            AddToBands(visit.bands, minLevel, maxLevel, levels, 0u, parentCode);
+        }
+        const auto outward = [](double value, float direction) {
+            return std::nextafter(static_cast<float>(value),
+                                  direction * std::numeric_limits<float>::infinity());
+        };
+        visit.minX = outward(static_cast<double>(entry.minX) - grow, -1.0f);
+        visit.minY = outward(static_cast<double>(entry.minY) - grow, -1.0f);
+        visit.maxX = outward(static_cast<double>(entry.maxX) + grow, 1.0f);
+        visit.maxY = outward(static_cast<double>(entry.maxY) + grow, 1.0f);
+        run.visits.push_back(visit);
+        run.masks.push_back(mask);
     }
 
     [[nodiscard]] static float OutwardFloat(std::int32_t fixed, float direction) {
@@ -732,10 +868,15 @@ private:
     }
 
     const LodPageNodes& nodes_;
+    const ContextTable& contexts_;
+    const EdgeMask& shortcuts_;
     LodPageOutput& output_;
     std::uint64_t pagesOffset_;
     StreamHash& pageHash_;
     ColumnWriter<std::uint32_t> recordEdges_;
+    ScratchWriter<RepresentativeLocation> representatives_;
+    std::vector<PageEntry> visits_;
+    std::vector<ChildMask> masks_;
     std::vector<Record> open_;
     std::vector<Record> closed_;
     std::vector<std::span<const Record>> spans_;
@@ -786,7 +927,8 @@ struct RecordPlan {
     std::vector<std::uint64_t> cells;
     std::uint64_t recordCount = 0;
     std::uint64_t coverGapEdges = 0;
-    std::uint64_t geometry = 0; // sum of GeometryHash over all records
+    std::uint64_t visitOnlyRecords = 0; // among the extras: never drawn, only walked through
+    std::uint64_t geometry = 0;         // sum of GeometryHash over all records
 };
 
 [[nodiscard]] RecordPlan PlanRecords(const std::filesystem::path& file, FileHeader& header,
@@ -805,6 +947,7 @@ struct RecordPlan {
         std::vector<Record> extras;
         std::uint64_t recordCount = 0;
         std::uint64_t coverGapEdges = 0;
+        std::uint64_t visitOnlyRecords = 0;
         std::uint64_t geometry = 0;
     };
 
@@ -840,7 +983,12 @@ struct RecordPlan {
                     piece.geometry += GeometryHash(nodes, main);
                 }
                 for (auto i = extrasBefore; i < piece.extras.size(); ++i) {
-                    piece.geometry += GeometryHash(nodes, piece.extras[i]);
+                    const auto& extra = piece.extras[i];
+                    piece.geometry += GeometryHash(nodes, extra);
+                    if (extra.rootLevels == kEmptyLevelRange &&
+                        extra.childLevels == kEmptyLevelRange) {
+                        ++piece.visitOnlyRecords;
+                    }
                 }
 
                 cover.clear();
@@ -878,6 +1026,7 @@ struct RecordPlan {
             plan.extras.insert(plan.extras.end(), piece.extras.begin(), piece.extras.end());
             plan.recordCount += piece.recordCount;
             plan.coverGapEdges += piece.coverGapEdges;
+            plan.visitOnlyRecords += piece.visitOnlyRecords;
             plan.geometry += piece.geometry;
         }
         report.Report(0u, 1u, waveEnd, m);
@@ -985,8 +1134,9 @@ void WriteRecordPages(const std::filesystem::path& file, const FileHeader& heade
 
         // Full order, so equal keys of one edge's records land the same way on every machine.
         const auto byKey = [](const Record& a, const Record& b) {
-            return std::tie(a.key, a.edge, a.rootLevels, a.childLevels, a.errors) <
-                   std::tie(b.key, b.edge, b.rootLevels, b.childLevels, b.errors);
+            return std::tie(a.key, a.edge, a.rootLevels, a.childLevels, a.errors,
+                            a.representative) < std::tie(b.key, b.edge, b.rootLevels,
+                                                         b.childLevels, b.errors, b.representative);
         };
         std::vector<IndexRange> sorts;
         const auto share = expected / (std::uint64_t{WorkerCount()} * 8u) + 1u;
@@ -1240,8 +1390,220 @@ struct PageSums {
     return sums;
 }
 
+// ---------------------------------------------------------------------------------------------
+// Hierarchy extension: for every representative record of a shortcut, where the representative
+// records of its two children are, so a traversal can walk the hierarchy page by page.
+
+// Word offsets of every page's children block (and the total at the end).
+[[nodiscard]] std::vector<std::uint64_t> ChildBlockOffsets(std::span<const ChildMask> masks) {
+    std::vector<std::uint64_t> offsets(masks.size() + 1u, 0u);
+    for (std::size_t p = 0; p < masks.size(); ++p) {
+        std::uint32_t children = 0;
+        for (const auto word : masks[p]) {
+            children += static_cast<std::uint32_t>(std::popcount(word));
+        }
+        offsets[p + 1u] = offsets[p] + kChildMaskWords + 2u * children;
+    }
+    return offsets;
+}
+
+// Writes the children section, in page ranges that fit the memory left: the representative
+// locations (which arrived in page order) are spread out per edge, then the child columns are
+// read in edge order and every shortcut's two child locations go to its slot.
+void WriteChildren(const std::filesystem::path& file, const FileHeader& header,
+                   std::span<const ChildMask> masks, std::span<const std::uint64_t> offsets,
+                   const std::filesystem::path& representatives, std::uint64_t representativeCount,
+                   std::uint64_t memoryLeft, LodPageOutput& output, std::uint64_t sectionOffset,
+                   StreamHash& hash, const LodPageBuilder::ProgressCallback& progress) {
+    const auto m = header.edgeCount;
+    StageProgress report(progress, BuildStage::WriteHierarchy);
+    report.Report(0u, 1u, 0u, 1u);
+    std::vector<std::uint32_t> location(static_cast<std::size_t>(m), kNoChildRef);
+    {
+        ValueReader<RepresentativeLocation> reader(representatives, 0, representativeCount);
+        for (std::uint64_t i = 0; i < representativeCount; ++i) {
+            const auto item = reader.Next();
+            location[item.edge] = item.location;
+        }
+    }
+
+    const auto capacityWords =
+        std::max<std::uint64_t>(memoryLeft > location.size() * 4u
+                                    ? (memoryLeft - location.size() * 4u) / 4u
+                                    : 0u,
+                                kChildSlotWords);
+    const auto scans = SplitRange(0u, m, kMinScanEdges);
+    ColumnReaders<std::uint32_t> childAReaders(file, header.At(Section::EdgeChildA));
+    ColumnReaders<std::uint32_t> childBReaders(file, header.At(Section::EdgeChildB));
+    std::vector<std::uint32_t> words;
+    const auto pageCount = static_cast<std::uint32_t>(masks.size());
+    for (std::uint32_t first = 0; first < pageCount;) {
+        auto last = first + 1u;
+        while (last < pageCount && offsets[last + 1u] - offsets[first] <= capacityWords) {
+            ++last;
+        }
+        const auto base = offsets[first];
+        words.assign(static_cast<std::size_t>(offsets[last] - base), kNoChildRef);
+        for (auto p = first; p < last; ++p) {
+            std::copy(masks[p].begin(), masks[p].end(),
+                      words.begin() + static_cast<std::ptrdiff_t>(offsets[p] - base));
+        }
+        RunParallel(scans.size(), [&](std::size_t task, unsigned worker) {
+            auto& childrenA = childAReaders.At(worker, scans[task]);
+            auto& childrenB = childBReaders.At(worker, scans[task]);
+            for (auto e = scans[task].first; e < scans[task].second; ++e) {
+                const auto childA = childrenA.Next();
+                const auto childB = childrenB.Next();
+                const auto here = location[static_cast<std::size_t>(e)];
+                const auto page = here >> 8u;
+                if (childA == kNoChildRef || here == kNoChildRef || page < first ||
+                    page >= last) {
+                    continue;
+                }
+                const auto local = here & 0xffu;
+                const auto& mask = masks[page];
+                std::uint32_t rank = 0;
+                for (std::uint32_t w = 0; w < (local >> 5u); ++w) {
+                    rank += static_cast<std::uint32_t>(std::popcount(mask[w]));
+                }
+                rank += static_cast<std::uint32_t>(
+                    std::popcount(mask[local >> 5u] & ((1u << (local & 31u)) - 1u)));
+                const auto slot = offsets[page] - base + kChildMaskWords + 2u * rank;
+                words[static_cast<std::size_t>(slot)] = location[childA];
+                words[static_cast<std::size_t>(slot) + 1u] = location[childB];
+            }
+        });
+        output.WriteAt(sectionOffset + base * 4u, words.data(), words.size() * 4u);
+        hash.Update(words.data(), words.size() * 4u);
+        report.Report(0u, 1u, last, pageCount);
+        first = last;
+    }
+}
+
+// Children blocks point at the representative records of the child edges: checked on a spread
+// of pages by reading the edges back from the file.
+void CheckChildren(const LodPageFile& file) {
+    const auto& header = file.Header();
+    const auto pages = file.Pages();
+    const auto visits = file.VisitPages();
+    std::ifstream input(file.Path(), std::ios::binary);
+    const auto readWord = [&](std::uint64_t offset) {
+        std::uint32_t value = 0;
+        input.seekg(static_cast<std::streamoff>(offset));
+        input.read(reinterpret_cast<char*>(&value), sizeof(value));
+        if (!input) {
+            throw std::runtime_error("LOD page verification: could not read the hierarchy");
+        }
+        return value;
+    };
+    const auto recordEdge = [&](std::uint64_t record) {
+        return readWord(header.At(Section::RecordEdge).offset + record * 4u);
+    };
+    const auto step = std::max<std::size_t>(1u, pages.size() / 256u);
+    std::vector<std::uint32_t> block;
+    for (std::size_t p = 0; p < pages.size(); p += step) {
+        block.resize(visits[p].wordCount);
+        input.seekg(static_cast<std::streamoff>(visits[p].fileOffset));
+        input.read(reinterpret_cast<char*>(block.data()),
+                   static_cast<std::streamsize>(block.size() * 4u));
+        if (!input) {
+            throw std::runtime_error("LOD page verification: could not read the hierarchy");
+        }
+        std::uint32_t next = kChildMaskWords;
+        for (std::uint32_t i = 0; i < pages[p].recordCount; ++i) {
+            if ((block[i >> 5u] >> (i & 31u) & 1u) == 0u) {
+                continue;
+            }
+            const auto edge = recordEdge(pages[p].firstRecord + i);
+            const std::array<std::uint32_t, 2> children{
+                readWord(header.At(Section::EdgeChildA).offset + std::uint64_t{edge} * 4u),
+                readWord(header.At(Section::EdgeChildB).offset + std::uint64_t{edge} * 4u)};
+            for (const auto child : children) {
+                const auto ref = block[next++];
+                if (ref == kNoChildRef) {
+                    continue;
+                }
+                const auto page = ref >> 8u;
+                if (page >= pages.size() || (ref & 0xffu) >= pages[page].recordCount ||
+                    recordEdge(pages[page].firstRecord + (ref & 0xffu)) != child) {
+                    throw std::runtime_error("LOD page verification failed: a child reference of "
+                                             "page " +
+                                             std::to_string(p) + " points at the wrong record");
+                }
+            }
+        }
+    }
+}
+
+// The reference cuts walked through the hierarchy from the alive roots, all in memory.
+[[nodiscard]] std::vector<CutSum> TraversalCuts(const LodPageFile& file,
+                                                std::span<const Cut> cuts) {
+    const auto pages = file.Pages();
+    const auto visits = file.VisitPages();
+    const auto words = file.ReadPageWords({});
+    const auto children = file.ReadChildrenWords({});
+    const auto recordEdge = file.ReadSection<std::uint32_t>(Section::RecordEdge);
+    const auto record = [&](std::uint32_t ref) {
+        return words.data() + file.PageWordOffset(ref >> 8u) + kPageHeaderWords +
+               (ref & 0xffu) * kRecordWords;
+    };
+    std::vector<CutSum> sums(cuts.size());
+    std::vector<std::uint32_t> stack;
+    for (std::size_t k = 0; k < cuts.size(); ++k) {
+        const auto level = cuts[k].level;
+        const auto threshold = cuts[k].threshold;
+        LodPageQuery everywhere;
+        everywhere.minX = everywhere.minY = -std::numeric_limits<float>::max();
+        everywhere.maxX = everywhere.maxY = std::numeric_limits<float>::max();
+        everywhere.level = level;
+        everywhere.threshold = threshold;
+        for (std::uint32_t p = 0; p < pages.size(); ++p) {
+            for (std::uint32_t i = 0; i < pages[p].recordCount; ++i) {
+                const auto root = (p << 8u) | i;
+                const auto levels = record(root)[1];
+                if (levels == kEmptyLevelRange || level < (levels & 0xffffu) ||
+                    level > (levels >> 16u)) {
+                    continue;
+                }
+                stack.push_back(root);
+                while (!stack.empty()) {
+                    const auto ref = stack.back();
+                    stack.pop_back();
+                    const auto page = ref >> 8u;
+                    const auto local = ref & 0xffu;
+                    // The planner must find every page a traversal reaches.
+                    if (!MayDraw(visits[page], everywhere)) {
+                        throw std::runtime_error("LOD page verification failed: the visit "
+                                                 "directory misses page " +
+                                                 std::to_string(page));
+                    }
+                    const auto* block = children.data() + file.ChildrenWordOffset(page);
+                    const bool hasChildren = (block[local >> 5u] >> (local & 31u) & 1u) != 0u;
+                    if (hasChildren && (record(ref)[3] & 0xffffu) > threshold) {
+                        std::uint32_t rank = 0;
+                        for (std::uint32_t b = 0; b < local; ++b) {
+                            rank += block[b >> 5u] >> (b & 31u) & 1u;
+                        }
+                        for (std::uint32_t c = 0; c < 2u; ++c) {
+                            const auto child = block[kChildMaskWords + 2u * rank + c];
+                            if (child == kNoChildRef) {
+                                throw std::runtime_error("LOD page verification failed: an "
+                                                         "expanded shortcut has no child");
+                            }
+                            stack.push_back(child);
+                        }
+                    } else {
+                        sums[k].Add(recordEdge[pages[page].firstRecord + local], 1u);
+                    }
+                }
+            }
+        }
+    }
+    return sums;
+}
+
 std::uint32_t Verify(const std::filesystem::path& path, const ReferenceCurve& curve,
-                     LevelChunks& chunks, std::uint64_t geometry,
+                     LevelChunks& chunks, std::uint64_t geometry, std::uint64_t memoryBudget,
                      const LodPageBuilder::ProgressCallback& progress) {
     StageProgress report(progress, BuildStage::Verify);
     const auto file = LodPageFile::Open(path);
@@ -1255,22 +1617,26 @@ std::uint32_t Verify(const std::filesystem::path& path, const ReferenceCurve& cu
                s == static_cast<std::size_t>(Section::RecordEdge) ||
                s == static_cast<std::size_t>(Section::Pages);
     };
-    std::vector<std::size_t> sections;
+    std::vector<std::pair<const SectionEntry*, std::uint64_t*>> readBacks;
+    std::vector<std::uint64_t> readBack(kSectionCount + kExtensionCount, 0u);
     std::uint64_t total = 0;
     for (std::size_t s = 0; s < kSectionCount; ++s) {
         if (!readLater(s)) {
-            sections.push_back(s);
+            readBacks.emplace_back(&header.sections[s], &readBack[s]);
             total += header.sections[s].bytes;
         }
     }
+    for (std::size_t e = 0; e < kExtensionCount; ++e) {
+        readBacks.emplace_back(&header.extensions[e], &readBack[kSectionCount + e]);
+        total += header.extensions[e].bytes;
+    }
     SectionHashes hashes{};
-    std::vector<std::uint64_t> readBack(kSectionCount, 0u);
     std::atomic<std::uint64_t> readBytes{0};
     RunParallel(
-        sections.size(),
+        readBacks.size(),
         [&](std::size_t task, unsigned) {
-            const auto& section = header.sections[sections[task]];
-            readBack[sections[task]] =
+            const auto& section = *readBacks[task].first;
+            *readBacks[task].second =
                 HashFileRange(path, section.offset, section.bytes,
                               [&](std::uint64_t bytes) { readBytes += bytes; });
         },
@@ -1294,6 +1660,12 @@ std::uint32_t Verify(const std::filesystem::path& path, const ReferenceCurve& cu
                                      " does not read back as written");
         }
     }
+    for (std::size_t e = 0; e < kExtensionCount; ++e) {
+        if (readBack[kSectionCount + e] != header.extensionHashes[e]) {
+            throw std::runtime_error("LOD page verification failed: extension " +
+                                     std::to_string(e) + " does not read back as written");
+        }
+    }
     if (actual.geometry != geometry) {
         throw std::runtime_error("LOD page verification failed: page vertices or styles differ "
                                  "from the records they were packed from");
@@ -1304,6 +1676,23 @@ std::uint32_t Verify(const std::filesystem::path& path, const ReferenceCurve& cu
                                      std::to_string(cuts[k].level) + ": DFS cut has " +
                                      std::to_string(expected[k].count) + " edges, pages give " +
                                      std::to_string(actual.cuts[k].count));
+        }
+    }
+
+    // The hierarchy: always a sample of its references; the reference cuts walked through it
+    // as well when pages and children fit comfortably in memory.
+    CheckChildren(*file);
+    const auto bytes = header.At(Section::Pages).bytes + header.At(Extension::PageChildren).bytes +
+                       header.At(Section::RecordEdge).bytes;
+    if (bytes <= memoryBudget / 4u) {
+        const auto walked = TraversalCuts(*file, cuts);
+        for (std::size_t k = 0; k < cuts.size(); ++k) {
+            if (!(expected[k] == walked[k])) {
+                throw std::runtime_error(
+                    "LOD page verification failed at level " + std::to_string(cuts[k].level) +
+                    ": DFS cut has " + std::to_string(expected[k].count) +
+                    " edges, the hierarchy walk gives " + std::to_string(walked[k].count));
+            }
         }
     }
     return static_cast<std::uint32_t>(cuts.size());
@@ -1366,29 +1755,20 @@ std::uint64_t LodPageBuilder::EstimateMemoryBytes(std::uint64_t nodeCount,
 }
 
 std::uint64_t LodPageBuilder::EstimateDiskBytes(std::uint64_t nodeCount, std::uint64_t edgeCount) {
-    // CH layer and derived columns (24 B per node, 36 B per edge), records and pages (about
-    // 30 B per edge), the shortcut level scratch file (20 B per shortcut, about half the edges)
-    // and some slack.
-    return nodeCount * 24u + edgeCount * 80u;
+    // The uncompressed file (24 B per node, about 66 B per edge) next to its compressed copy
+    // (about 40 % of it), with some slack; the scratch files of the earlier stages (shortcut
+    // levels, hierarchy) need less than the copy.
+    return nodeCount * 32u + edgeCount * 100u;
 }
 
-BuildResult LodPageBuilder::Build(const std::filesystem::path& graphPath,
-                                  const std::filesystem::path& rangesPath,
-                                  const std::filesystem::path& outputPath,
-                                  const ProgressCallback& progress,
-                                  std::uint64_t memoryBudgetBytes) {
-    const auto begin = std::chrono::steady_clock::now();
-    auto temporaryPath = outputPath;
-    temporaryPath += ".tmp";
-    RemoveStaleScratch(temporaryPath);
-    TemporaryFile temporary(temporaryPath);
+namespace {
 
-    const auto memory = runtime::QuerySystemMemoryInfo();
-    const auto budget = memoryBudgetBytes != 0u ? memoryBudgetBytes
-                        : memory.availablePhysicalBytes != 0u
-                            ? memory.availablePhysicalBytes / 4u * 3u
-                            : 4ull << 30u;
-
+// The uncompressed file, checked against DFS reference cuts.
+[[nodiscard]] BuildResult BuildUncompressed(const std::filesystem::path& graphPath,
+                                            const std::filesystem::path& rangesPath,
+                                            const std::filesystem::path& outputPath,
+                                            const TemporaryFile& temporary, std::uint64_t budget,
+                                            const LodPageBuilder::ProgressCallback& progress) {
     FileHeader header;
     header.magic = kFileMagic;
     header.version = kFormatVersion;
@@ -1403,10 +1783,11 @@ BuildResult LodPageBuilder::Build(const std::filesystem::path& graphPath,
     header.sourceRangesWriteTime = rangesIdentity.writeTime;
 
     const auto checkResources = [&](std::uint64_t nodes, std::uint64_t edges) {
-        if (const auto needed = EstimateMemoryBytes(nodes, edges); needed > budget) {
+        if (const auto needed = LodPageBuilder::EstimateMemoryBytes(nodes, edges);
+            needed > budget) {
             ThrowNotEnoughMemory(needed, budget);
         }
-        const auto disk = EstimateDiskBytes(nodes, edges);
+        const auto disk = LodPageBuilder::EstimateDiskBytes(nodes, edges);
         if (const auto available = FreeDiskSpace(outputPath); available < disk) {
             ThrowNotEnoughDisk(disk, available);
         }
@@ -1427,6 +1808,9 @@ BuildResult LodPageBuilder::Build(const std::filesystem::path& graphPath,
     LevelChunks chunks(levelsPath, nodes.maxNodeLevel + 1u);
     const auto shortcuts = BuildLevelChunks(temporary.Path(), header, nodes, budget,
                                             temporary.Path(), chunks, progress);
+    auto representativesPath = temporary.Path();
+    representativesPath += ".reps";
+    TemporaryFile representatives(representativesPath);
     {
         auto errors = ComputeErrors(chunks, shortcuts, m, progress);
         header.maxHierarchyHeight = errors.maxHeight;
@@ -1441,9 +1825,12 @@ BuildResult LodPageBuilder::Build(const std::filesystem::path& graphPath,
     const ReferenceCurve curve(header.MetersPerNormalizedUnit(), nodes.maxRangeLevel);
     BuildResult result;
     std::uint64_t geometry = 0;
+    std::vector<PageEntry> visits;
+    std::vector<ChildMask> masks;
+    std::uint64_t representativeCount = 0;
     {
         const auto contexts = ComputeContexts(chunks, m, progress);
-        const RecordMaker maker(nodes, contexts, curve);
+        const RecordMaker maker(nodes, contexts, curve, shortcuts);
         auto plan =
             PlanRecords(temporary.Path(), header, nodes, maker, contexts, output, hashes, progress);
         if (plan.recordCount > 0xffffffffull) {
@@ -1456,13 +1843,15 @@ BuildResult LodPageBuilder::Build(const std::filesystem::path& graphPath,
         }
         header.recordCount = plan.recordCount;
         header.coverGapEdges = plan.coverGapEdges;
-        header.extraContextRecords = plan.extras.size();
+        header.extraContextRecords = plan.extras.size() - plan.visitOnlyRecords;
+        result.visitOnlyRecords = plan.visitOnlyRecords;
         header.At(Section::RecordEdge) = {offset, header.recordCount * 4u};
         header.At(Section::Pages) = {AlignSection(offset + header.recordCount * 4u), 0u};
 
         const auto fixed = nodes.Bytes() + m * 7u + plan.extras.size() * sizeof(Record) +
                            contexts.extra.size() * kExtraContextBytes +
-                           header.recordCount / kPageRecordCapacity * sizeof(PageEntry) * 2u +
+                           header.recordCount / kPageRecordCapacity *
+                               (sizeof(PageEntry) * 3u + sizeof(ChildMask)) +
                            WorkerCount() * kWorkerBytes + (256ull << 20u);
         const auto sortBudget =
             std::max<std::uint64_t>(budget > fixed ? budget - fixed : 0u, 64ull << 20u);
@@ -1472,7 +1861,8 @@ BuildResult LodPageBuilder::Build(const std::filesystem::path& graphPath,
                                  budget);
         }
         result.pagePasses = static_cast<std::uint32_t>(partitions.size());
-        PageWriter writer(nodes, output, header, hashes);
+        PageWriter writer(nodes, contexts, shortcuts, output, header, hashes,
+                          representatives.Path());
         WriteRecordPages(temporary.Path(), header, maker, plan, partitions, writer, progress);
         if (writer.RecordCount() != header.recordCount) {
             throw std::logic_error("LOD page record count changed between passes");
@@ -1493,20 +1883,54 @@ BuildResult LodPageBuilder::Build(const std::filesystem::path& graphPath,
         output.WriteAt(offset, groups.data(), header.groupCount * sizeof(PageGroup));
         HashOf(hashes, Section::PageGroups)
             .Update(groups.data(), header.groupCount * sizeof(PageGroup));
+        offset = AlignSection(offset + header.groupCount * sizeof(PageGroup));
+        visits = std::move(writer.VisitPages());
+        masks = std::move(writer.ChildMasks());
+        representativeCount = writer.RepresentativeCount();
+    }
+
+    // The hierarchy extension: children blocks, then the visit directory pointing at them.
+    std::array<StreamHash, kExtensionCount> extensionHashes{};
+    {
+        const auto hashOf = [&](Extension extension) -> StreamHash& {
+            return extensionHashes[static_cast<std::size_t>(extension)];
+        };
+        const auto blocks = ChildBlockOffsets(masks);
+        header.At(Extension::PageChildren) = {offset, blocks.back() * 4u};
+        const auto reserved = nodes.Bytes() + visits.size() * (sizeof(PageEntry) * 2u) +
+                              masks.size() * sizeof(ChildMask) + blocks.size() * 8u +
+                              WorkerCount() * kWorkerBytes + (256ull << 20u);
+        WriteChildren(temporary.Path(), header, masks, blocks, representatives.Path(),
+                      representativeCount, budget > reserved ? budget - reserved : 0u, output,
+                      offset, hashOf(Extension::PageChildren), progress);
+        for (std::size_t p = 0; p < visits.size(); ++p) {
+            visits[p].fileOffset = offset + blocks[p] * 4u;
+            visits[p].wordCount = static_cast<std::uint32_t>(blocks[p + 1u] - blocks[p]);
+        }
+        offset = AlignSection(offset + blocks.back() * 4u);
+        header.At(Extension::VisitDirectory) = {offset, visits.size() * sizeof(PageEntry)};
+        output.WriteAt(offset, visits.data(), visits.size() * sizeof(PageEntry));
+        hashOf(Extension::VisitDirectory).Update(visits.data(), visits.size() * sizeof(PageEntry));
+        const auto visitGroups = BuildGroups(visits);
+        offset = AlignSection(offset + visits.size() * sizeof(PageEntry));
+        header.At(Extension::VisitGroups) = {offset, visitGroups.size() * sizeof(PageGroup)};
+        output.WriteAt(offset, visitGroups.data(), visitGroups.size() * sizeof(PageGroup));
+        hashOf(Extension::VisitGroups)
+            .Update(visitGroups.data(), visitGroups.size() * sizeof(PageGroup));
     }
 
     for (std::size_t s = 0; s < kSectionCount; ++s) {
         header.sectionHashes[s] = hashes[s].Finish();
+    }
+    for (std::size_t e = 0; e < kExtensionCount; ++e) {
+        header.extensionHashes[e] = extensionHashes[e].Finish();
     }
     std::vector<std::byte> headerBytes(kHeaderBytes);
     std::memcpy(headerBytes.data(), &header, sizeof(FileHeader));
     output.WriteAt(0, headerBytes.data(), headerBytes.size());
     output.Close();
 
-    result.verifiedCuts = Verify(temporary.Path(), curve, chunks, geometry, progress);
-    temporary.MoveTo(outputPath);
-
-    result.path = outputPath;
+    result.verifiedCuts = Verify(temporary.Path(), curve, chunks, geometry, budget, progress);
     result.nodeCount = header.nodeCount;
     result.edgeCount = header.edgeCount;
     result.recordCount = header.recordCount;
@@ -1514,9 +1938,98 @@ BuildResult LodPageBuilder::Build(const std::filesystem::path& graphPath,
     result.coverGapEdges = header.coverGapEdges;
     result.extraContextRecords = header.extraContextRecords;
     result.memoryBudgetBytes = budget;
+    return result;
+}
+
+// The compressed file must decode to exactly the bytes the uncompressed one was checked with.
+void CheckCompressed(const std::filesystem::path& path, const FileHeader& checked,
+                     const std::function<void(std::uint64_t, std::uint64_t)>& report) {
+    const auto file = LodPageFile::Open(path);
+    const auto& header = file->Header();
+    std::uint64_t total = 0;
+    for (const auto& stored : header.stored) {
+        total += stored.bytes;
+    }
+    std::uint64_t done = 0;
+    for (std::size_t index = 0; index < kStoredCount; ++index) {
+        const auto hash = file->HashSection(index, [&](std::uint64_t bytes) {
+            done += bytes;
+            report(done, total);
+        });
+        if (hash != checked.Hash(index) ||
+            header.Layout(index).bytes != checked.Layout(index).bytes) {
+            throw std::runtime_error("LOD page compression failed: section " +
+                                     std::to_string(index) + " does not decode as written");
+        }
+    }
+    report(total, total);
+}
+
+// Compresses the checked uncompressed file `raw` into `compressed` and decodes it again.
+void WriteCompressed(const std::filesystem::path& raw, const std::filesystem::path& compressed,
+                     const LodPageBuilder::ProgressCallback& progress) {
+    StageProgress report(progress, BuildStage::Compress);
+    const auto file = LodPageFile::Open(raw);
+    if (file->Compressed()) {
+        throw std::logic_error("LOD page compression: the file is already compressed");
+    }
+    // Compressing takes about three quarters of the stage, decoding it again the rest.
+    CompressPageFile(*file, compressed, [&](std::uint64_t done, std::uint64_t total) {
+        report.Report(0u, 1u, done * 3u, total * 4u);
+    });
+    CheckCompressed(compressed, file->Header(), [&](std::uint64_t done, std::uint64_t total) {
+        report.Report(0u, 1u, total * 3u + done, total * 4u);
+    });
+}
+
+} // namespace
+
+BuildResult LodPageBuilder::Build(const std::filesystem::path& graphPath,
+                                  const std::filesystem::path& rangesPath,
+                                  const std::filesystem::path& outputPath,
+                                  const ProgressCallback& progress,
+                                  std::uint64_t memoryBudgetBytes) {
+    const auto begin = std::chrono::steady_clock::now();
+    auto temporaryPath = outputPath;
+    temporaryPath += ".tmp";
+    RemoveStaleScratch(temporaryPath);
+    TemporaryFile temporary(temporaryPath);
+
+    const auto memory = data::QuerySystemMemoryInfo();
+    const auto budget = memoryBudgetBytes != 0u ? memoryBudgetBytes
+                        : memory.availablePhysicalBytes != 0u
+                            ? memory.availablePhysicalBytes / 4u * 3u
+                            : 4ull << 30u;
+    auto result = BuildUncompressed(graphPath, rangesPath, outputPath, temporary, budget, progress);
+
+    // The scratch files are gone; the checked file is compressed next to it.
+    auto compressedPath = temporaryPath;
+    compressedPath += ".zst";
+    TemporaryFile compressed(compressedPath);
+    WriteCompressed(temporary.Path(), compressed.Path(), progress);
+    result.uncompressedBytes = std::filesystem::file_size(temporary.Path());
+    result.fileBytes = std::filesystem::file_size(compressed.Path());
+    compressed.MoveTo(outputPath);
+
+    result.path = outputPath;
     result.seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count();
     return result;
+}
+
+void LodPageBuilder::Compress(const std::filesystem::path& path, const ProgressCallback& progress) {
+    auto compressedPath = path;
+    compressedPath += ".tmp";
+    RemoveStaleScratch(compressedPath);
+    compressedPath += ".zst";
+    // The copy is about 40 % of the file.
+    const auto needed = std::filesystem::file_size(path) / 2u;
+    if (const auto available = FreeDiskSpace(path); available < needed) {
+        ThrowNotEnoughDisk(needed, available);
+    }
+    TemporaryFile compressed(compressedPath);
+    WriteCompressed(path, compressed.Path(), progress);
+    compressed.MoveTo(path);
 }
 
 } // namespace chmv::streaming::lod

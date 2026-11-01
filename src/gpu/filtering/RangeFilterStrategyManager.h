@@ -7,17 +7,11 @@
 #include <span>
 #include <vector>
 
-namespace chmv::data {
-class CHGraph;
-}
-
 namespace chmv::gpu::filtering {
 
 class RangeFilterStrategyManager {
 public:
     void Register(std::unique_ptr<IRangeFilterStrategy> strategy);
-    void SetGraph(const data::CHGraph& graph);
-    void SetStreamingRanges(std::span<const data::EdgeRange> ranges);
     void Select(std::size_t index);
 
     [[nodiscard]] IRangeFilterStrategy& Current();

@@ -29,6 +29,7 @@
             mesa
             libGL
             libffi
+            zstd
 
             wayland
             wayland-protocols

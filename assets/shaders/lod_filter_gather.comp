@@ -1,0 +1,49 @@
+#version 430 core
+
+// Birth-ordered filter, step 3: one invocation per record of the prefixes found in step 1, so
+// records that are no longer drawable at the level are never touched. Finds its page by binary
+// search over the offsets, then applies the full level test.
+
+layout(local_size_x = 256) in;
+
+#include "lod_page_common.glsl"
+#include "lod_page_candidates.glsl"
+#include "lod_page_order.glsl"
+
+layout(std430, binding = 2) readonly buffer SlotList {
+    uint slotCount;
+    uint slotGroups[3];
+    uint slots[];
+};
+layout(std430, binding = 6) readonly buffer Prefix {
+    uint prefixTotal;
+    uint prefixGroups[3];
+    uint prefix[];
+};
+
+uniform uint uLevel;
+
+void main() {
+    uint position = linearInvocation();
+    bool keep = false;
+    uint item = 0u;
+    if (position < prefixTotal) {
+        // Last listed page whose offset is not past the position (pages with nothing to
+        // gather share the offset of the next one).
+        uint low = 0u;
+        uint high = slotCount;
+        while (low < high) {
+            uint middle = (low + high) / 2u;
+            if (prefix[middle] <= position) {
+                low = middle + 1u;
+            } else {
+                high = middle;
+            }
+        }
+        uint index = low - 1u;
+        uint slot = slots[index];
+        item = (slot << 8u) | orderedRecord(slot, position - prefix[index]);
+        keep = levelMatch(pageRecord(item), uLevel);
+    }
+    keepCandidates(keep, item);
+}

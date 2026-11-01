@@ -6,10 +6,15 @@
 
 namespace chmv::data {
 
+// A .sch/.ranges pair (its page file is built next to it when needed), or a page file whose
+// sources are gone (graphPath and rangesPath empty).
 struct DatasetEntry {
     std::string name;
     std::filesystem::path graphPath;
     std::filesystem::path rangesPath;
+    std::filesystem::path pageFilePath;
+
+    [[nodiscard]] bool HasSources() const { return !graphPath.empty(); }
 };
 
 class DatasetCatalog {

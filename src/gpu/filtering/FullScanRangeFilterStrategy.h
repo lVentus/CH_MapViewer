@@ -3,29 +3,26 @@
 #include "gpu/ComputeProgram.h"
 #include "gpu/filtering/IRangeFilterStrategy.h"
 
-#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 
 namespace chmv::gpu::filtering {
 
+// Tests every record of every planned page: one workgroup per page, one invocation per record.
+// The baseline; the work does not depend on the level at all.
 class FullScanRangeFilterStrategy final : public IRangeFilterStrategy {
 public:
     explicit FullScanRangeFilterStrategy(const std::filesystem::path& shaderDirectory);
 
-    [[nodiscard]] std::string_view Name() const override { return "Full Scan"; }
-    [[nodiscard]] bool SupportsStreamingWorkingSet() const override { return true; }
-    [[nodiscard]] PersistentStreamingRangeFilterKind PersistentStreamingKind() const override {
-        return PersistentStreamingRangeFilterKind::FullScan;
-    }
-    void SetGraph(const data::CHGraph& graph) override;
-    void SetStreamingRanges(std::span<const data::EdgeRange> ranges) override;
-    [[nodiscard]] RangeFilterExecutionStats Execute(const RangeFilterInput& input) override;
-    [[nodiscard]] RangeFilterDiagnostics ReadBackDiagnostics(std::int32_t lodLevel) const override;
+    [[nodiscard]] std::string_view Name() const override { return "Full scan"; }
+    void Execute(const RangeFilterInput& input) override;
+
+    // Runs the scan kernel (lod_filter_scan.comp) over the pages of a GPU slot list.
+    static void Scan(const ComputeProgram& program, const RangeFilterInput& input,
+                     std::uint32_t slotList);
 
 private:
-    ComputeProgram filterProgram_;
-    std::uint32_t edgeCount_ = 0;
+    ComputeProgram scanProgram_;
 };
 
 } // namespace chmv::gpu::filtering

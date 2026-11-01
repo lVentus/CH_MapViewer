@@ -2,16 +2,16 @@
 
 #include <glad/gl.h>
 
+#include <algorithm>
 #include <fstream>
-#include <sstream>
 #include <stdexcept>
 #include <utility>
-#include <vector>
 
 namespace chmv::gpu {
 
-ComputeProgram::ComputeProgram(const std::filesystem::path& shaderPath) {
-    Load(shaderPath);
+ComputeProgram::ComputeProgram(const std::filesystem::path& shaderPath,
+                               std::string_view defines) {
+    Load(shaderPath, defines);
 }
 
 ComputeProgram::~ComputeProgram() {
@@ -29,10 +29,14 @@ ComputeProgram& ComputeProgram::operator=(ComputeProgram&& other) noexcept {
     return *this;
 }
 
-void ComputeProgram::Load(const std::filesystem::path& shaderPath) {
+void ComputeProgram::Load(const std::filesystem::path& shaderPath, std::string_view defines) {
     Reset();
 
-    const auto source = ReadFile(shaderPath);
+    auto source = ReadSource(shaderPath);
+    if (!defines.empty()) {
+        const auto versionEnd = source.find('\n');
+        source.insert(versionEnd == std::string::npos ? source.size() : versionEnd + 1u, defines);
+    }
     const char* sourcePtr = source.c_str();
 
     const auto shader = glCreateShader(GL_COMPUTE_SHADER);
@@ -44,10 +48,11 @@ void ComputeProgram::Load(const std::filesystem::path& shaderPath) {
     if (compiled != GL_TRUE) {
         GLint length = 0;
         glGetShaderiv(shader, GL_INFO_LOG_LENGTH, &length);
-        std::vector<char> log(static_cast<std::size_t>(length));
-        glGetShaderInfoLog(shader, length, nullptr, log.data());
+        std::string log(static_cast<std::size_t>(std::max(length, 1)), '\0');
+        glGetShaderInfoLog(shader, static_cast<GLsizei>(log.size()), nullptr, log.data());
         glDeleteShader(shader);
-        throw std::runtime_error("compute shader compilation failed: " + std::string(log.data()));
+        throw std::runtime_error("compute shader compilation failed (" + shaderPath.string() +
+                                 "): " + log.c_str());
     }
 
     program_ = glCreateProgram();
@@ -60,9 +65,9 @@ void ComputeProgram::Load(const std::filesystem::path& shaderPath) {
     if (linked != GL_TRUE) {
         GLint length = 0;
         glGetProgramiv(program_, GL_INFO_LOG_LENGTH, &length);
-        std::vector<char> log(static_cast<std::size_t>(length));
-        glGetProgramInfoLog(program_, length, nullptr, log.data());
-        const auto message = std::string(log.data());
+        std::string log(static_cast<std::size_t>(std::max(length, 1)), '\0');
+        glGetProgramInfoLog(program_, static_cast<GLsizei>(log.size()), nullptr, log.data());
+        const std::string message = log.c_str();
         Reset();
         throw std::runtime_error("compute program link failed: " + message);
     }
@@ -77,15 +82,33 @@ void ComputeProgram::Dispatch(unsigned int groupsX, unsigned int groupsY,
     glDispatchCompute(groupsX, groupsY, groupsZ);
 }
 
-std::string ComputeProgram::ReadFile(const std::filesystem::path& path) {
+std::string ComputeProgram::ReadSource(const std::filesystem::path& path, int depth) {
+    if (depth > 8) {
+        throw std::runtime_error("shader includes nested too deeply: " + path.string());
+    }
     std::ifstream input(path, std::ios::binary);
     if (!input) {
         throw std::runtime_error("could not open shader: " + path.string());
     }
 
-    std::ostringstream stream;
-    stream << input.rdbuf();
-    return stream.str();
+    constexpr std::string_view kInclude = "#include \"";
+    std::string source;
+    std::string line;
+    while (std::getline(input, line)) {
+        if (line.starts_with(kInclude)) {
+            const auto end = line.find('"', kInclude.size());
+            if (end == std::string::npos) {
+                throw std::runtime_error("malformed #include in shader: " + path.string());
+            }
+            source += ReadSource(
+                path.parent_path() / line.substr(kInclude.size(), end - kInclude.size()),
+                depth + 1);
+        } else {
+            source += line;
+            source += '\n';
+        }
+    }
+    return source;
 }
 
 void ComputeProgram::Reset() {

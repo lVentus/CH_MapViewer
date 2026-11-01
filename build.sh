@@ -92,6 +92,7 @@ install_debian_dependencies() {
         cmake
         ninja-build
         git
+        libzstd-dev
     )
     local graphics_packages=(
         pkg-config
@@ -135,6 +136,7 @@ install_fedora_dependencies() {
         cmake
         ninja-build
         git
+        libzstd-devel
     )
     local graphics_packages=(
         pkgconf-pkg-config
@@ -186,6 +188,7 @@ install_arch_dependencies() {
         cmake
         ninja
         git
+        zstd
     )
     local graphics_packages=(
         pkgconf
@@ -228,6 +231,7 @@ install_opensuse_dependencies() {
         cmake
         ninja
         git
+        libzstd-devel
     )
     local graphics_packages=(
         pkg-config

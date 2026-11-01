@@ -1,0 +1,42 @@
+#version 430 core
+
+// Birth-ordered filter, step 1: per listed page, a binary search over its sorted records for
+// how many can still be drawn at the level.
+
+layout(local_size_x = 256) in;
+
+#include "lod_page_common.glsl"
+#include "lod_page_order.glsl"
+
+layout(std430, binding = 2) readonly buffer SlotList {
+    uint slotCount;
+    uint slotGroups[3];
+    uint slots[];
+};
+// [total, groupsX, groupsY, groupsZ, then one count (later offset) per listed page]
+layout(std430, binding = 6) writeonly buffer Prefix {
+    uint prefixTotal;
+    uint prefixGroups[3];
+    uint prefix[];
+};
+
+uniform uint uLevel;
+
+void main() {
+    uint index = linearInvocation();
+    if (index >= slotCount) {
+        return;
+    }
+    uint slot = slots[index];
+    uint low = 0u;
+    uint high = recordCount(slot);
+    while (low < high) {
+        uint middle = (low + high) / 2u;
+        if (highestLevel(pageRecord((slot << 8u) | orderedRecord(slot, middle))) >= uLevel) {
+            low = middle + 1u;
+        } else {
+            high = middle;
+        }
+    }
+    prefix[index] = low;
+}

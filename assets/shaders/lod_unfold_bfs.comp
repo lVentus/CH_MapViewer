@@ -1,0 +1,58 @@
+#version 430 core
+
+// BFS expansion, one hierarchy depth per dispatch: every invocation takes one node of the
+// current frontier and either draws it or appends its two children to the next frontier, so
+// the work of a depth is spread evenly over the GPU. The first dispatch reads the candidate
+// list and starts from the roots in it.
+
+layout(local_size_x = 256) in;
+
+#include "lod_page_common.glsl"
+#include "lod_page_segments.glsl"
+#include "lod_page_traversal.glsl"
+
+layout(std430, binding = 2) readonly buffer Frontier {
+    uint frontierCount;
+    uint frontierGroups[3];
+    uint frontier[];
+};
+layout(std430, binding = 7) buffer NextFrontier {
+    uint nextCount;
+    uint nextGroups[3];
+    uint next[];
+};
+
+uniform uint uLevel;
+uniform uint uFromCandidates;
+uniform uint uFrontierCapacity;
+
+void main() {
+    uint index = linearInvocation();
+    if (index >= frontierCount) {
+        return;
+    }
+    uint node = frontier[index];
+    uvec4 record = pageRecord(node);
+    if (uFromCandidates != 0u && !inLevelRange(record.y, uLevel)) {
+        return;
+    }
+    if (!nodeVisible(node, record)) {
+        return;
+    }
+    if (!expands(node, record)) {
+        drawSegment(node);
+        return;
+    }
+    for (uint which = 0u; which < 2u; ++which) {
+        uint child = childItem(node, which);
+        if (child == kNoItem) {
+            continue;
+        }
+        uint at = atomicAdd(nextCount, 1u);
+        if (at < uFrontierCapacity) {
+            next[at] = child;
+        } else {
+            atomicAdd(status[kStatusFrontierOverflow], 1u);
+        }
+    }
+}

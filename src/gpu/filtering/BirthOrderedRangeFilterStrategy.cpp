@@ -1,178 +1,109 @@
 #include "gpu/filtering/BirthOrderedRangeFilterStrategy.h"
 
-#include "data/ch/CHGraph.h"
+#include "gpu/lod/LodPagePool.h"
 
 #include <glad/gl.h>
 
 #include <algorithm>
-#include <cstddef>
-#include <limits>
-#include <stdexcept>
-#include <vector>
 
 namespace chmv::gpu::filtering {
 namespace {
 
-struct DispatchIndirectCommand {
-    std::uint32_t groupsX;
-    std::uint32_t groupsY;
-    std::uint32_t groupsZ;
-};
-
-static_assert(sizeof(DispatchIndirectCommand) == 12);
-static_assert(sizeof(data::OrderedRangeEntry) == 8);
-
-void CheckBufferSize(std::size_t sizeBytes) {
-    GLint64 maxBlockSize = 0;
-    glGetInteger64v(GL_MAX_SHADER_STORAGE_BLOCK_SIZE, &maxBlockSize);
-    if (sizeBytes > static_cast<std::size_t>(maxBlockSize)) {
-        throw std::runtime_error(
-            "ordered range index exceeds the maximum SSBO size of this GPU; "
-            "streaming is not implemented yet");
-    }
-}
+// One byte per record.
+constexpr std::size_t kOrderWords = streaming::lod::kPageRecordCapacity / 4u;
+constexpr std::uint32_t kGroupSize = 256;
 
 } // namespace
 
 BirthOrderedRangeFilterStrategy::BirthOrderedRangeFilterStrategy(
     const std::filesystem::path& shaderDirectory)
-    : prepareDispatchProgram_(shaderDirectory / "range_filter_prepare_dispatch.comp"),
-      filterProgram_(shaderDirectory / "range_filter_ordered.comp") {
-    const DispatchIndirectCommand dispatch{0, 1, 1};
-    dispatchBuffer_.Allocate(sizeof(dispatch), &dispatch, GL_DYNAMIC_DRAW);
+    : sortProgram_(shaderDirectory / "lod_filter_sort.comp"),
+      countProgram_(shaderDirectory / "lod_filter_count.comp"),
+      offsetsProgram_(shaderDirectory / "lod_filter_offsets.comp"),
+      gatherProgram_(shaderDirectory / "lod_filter_gather.comp"), lists_(shaderDirectory) {}
+
+void BirthOrderedRangeFilterStrategy::Reset() {
+    orderedPages_.clear();
+    poolGeneration_ = 0;
 }
 
-void BirthOrderedRangeFilterStrategy::UploadIndex(const data::OrderedRangeIndex& index) {
-    levelCount_ = static_cast<std::uint32_t>(index.scanEndByLevel.size());
-    if (index.entries.empty() || index.scanEndByLevel.empty()) {
-        levelCount_ = 0;
+void BirthOrderedRangeFilterStrategy::SortNewPages(const RangeFilterInput& input) {
+    const auto& pool = *input.pool;
+    if (poolGeneration_ != pool.Generation()) {
+        order_.Allocate(std::size_t{pool.SlotCount()} * kOrderWords * 4u);
+        orderedPages_.assign(pool.SlotCount(), lod::LodPagePool::kNoSlot);
+        poolGeneration_ = pool.Generation();
+    }
+
+    // [count, grid, slots...]
+    sortSlots_.assign(lod::kListHeaderWords, 0u);
+    for (const auto slot : input.slots) {
+        const auto page = pool.PageOfSlot(slot);
+        if (orderedPages_[slot] != page) {
+            orderedPages_[slot] = page;
+            sortSlots_.push_back(slot);
+        }
+    }
+    const auto count = sortSlots_.size() - lod::kListHeaderWords;
+    if (count == 0u) {
         return;
     }
+    const auto grid = lod::GroupGrid(count);
+    sortSlots_[0] = static_cast<std::uint32_t>(count);
+    std::copy(grid.begin(), grid.end(), sortSlots_.begin() + 1);
+    if (sortSlots_.size() > sortListCapacity_) {
+        sortListCapacity_ = std::max(sortSlots_.size(), sortListCapacity_ * 2u);
+        sortList_.Allocate(sortListCapacity_ * 4u);
+    }
+    sortList_.Update(0, sortSlots_.size() * 4u, sortSlots_.data());
 
-    const auto rangeBytes = index.entries.size() * sizeof(data::OrderedRangeEntry);
-    const auto scanEndBytes = index.scanEndByLevel.size() * sizeof(std::uint32_t);
-    CheckBufferSize(rangeBytes);
-    CheckBufferSize(scanEndBytes);
-    orderedRangeBuffer_.Allocate(rangeBytes, index.entries.data(), GL_STATIC_DRAW);
-    scanEndBuffer_.Allocate(scanEndBytes, index.scanEndByLevel.data(), GL_STATIC_DRAW);
+    sortProgram_.Bind();
+    pool.BindForKernel(sortProgram_.Id());
+    sortList_.BindBase(GL_SHADER_STORAGE_BUFFER, 2);
+    order_.BindBase(GL_SHADER_STORAGE_BUFFER, 5);
+    sortProgram_.Dispatch(grid[0], grid[1], grid[2]);
+    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
 }
 
-void BirthOrderedRangeFilterStrategy::SetGraph(const data::CHGraph& graph) {
-    UploadIndex(graph.OrderedRanges());
-}
-
-void BirthOrderedRangeFilterStrategy::SetStreamingRanges(
-    std::span<const data::EdgeRange> ranges) {
-    data::OrderedRangeIndex index;
-    std::int32_t maxBirthLevel = -1;
-    std::size_t drawableCount = 0;
-    for (const auto& range : ranges) {
-        if (!range.IsDrawable() || range.birthLevel < range.deathLevel) {
-            continue;
-        }
-        maxBirthLevel = std::max(maxBirthLevel, range.birthLevel);
-        ++drawableCount;
+void BirthOrderedRangeFilterStrategy::Execute(const RangeFilterInput& input) {
+    SortNewPages(input);
+    const auto slots = input.slots.size();
+    if (slots + lod::kListHeaderWords > prefixCapacity_) {
+        prefixCapacity_ = std::max(slots + lod::kListHeaderWords, prefixCapacity_ * 2u);
+        prefix_.Allocate(prefixCapacity_ * 4u);
     }
+    const auto& pool = *input.pool;
 
-    if (maxBirthLevel < 0 || drawableCount == 0) {
-        UploadIndex(index);
-        return;
-    }
-    if (drawableCount > std::numeric_limits<std::uint32_t>::max()) {
-        throw std::runtime_error("too many streamed drawable edges for 32-bit ordered range indexing");
-    }
+    // How many records of each page can still be drawn at the level.
+    countProgram_.Bind();
+    pool.BindForKernel(countProgram_.Id());
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, input.slotList);
+    order_.BindBase(GL_SHADER_STORAGE_BUFFER, 5);
+    prefix_.BindBase(GL_SHADER_STORAGE_BUFFER, 6);
+    glUniform1ui(glGetUniformLocation(countProgram_.Id(), "uLevel"), input.query.level);
+    const auto grid = lod::GroupGrid((slots + kGroupSize - 1u) / kGroupSize);
+    countProgram_.Dispatch(grid[0], grid[1], grid[2]);
+    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
 
-    const auto levelCount = static_cast<std::size_t>(maxBirthLevel) + 1u;
-    std::vector<std::uint32_t> birthCounts(levelCount, 0u);
-    for (const auto& range : ranges) {
-        if (!range.IsDrawable() || range.birthLevel < range.deathLevel) {
-            continue;
-        }
-        ++birthCounts[static_cast<std::size_t>(range.birthLevel)];
-    }
+    // Where each page's records go, and how many there are in all.
+    offsetsProgram_.Bind();
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, input.slotList);
+    prefix_.BindBase(GL_SHADER_STORAGE_BUFFER, 6);
+    offsetsProgram_.Dispatch(1);
+    lists_.Prepare(prefix_.Id(), input.candidateCapacity, kGroupSize);
 
-    std::vector<std::uint32_t> bucketStart(levelCount, 0u);
-    std::uint32_t offset = 0u;
-    for (std::size_t level = levelCount; level-- > 0;) {
-        bucketStart[level] = offset;
-        offset += birthCounts[level];
-    }
-
-    index.entries.resize(drawableCount);
-    auto writePosition = bucketStart;
-    for (std::size_t localEdgeId = 0; localEdgeId < ranges.size(); ++localEdgeId) {
-        const auto& range = ranges[localEdgeId];
-        if (!range.IsDrawable() || range.birthLevel < range.deathLevel) {
-            continue;
-        }
-        const auto birth = static_cast<std::size_t>(range.birthLevel);
-        index.entries[writePosition[birth]++] = {
-            static_cast<std::uint32_t>(localEdgeId),
-            range.deathLevel,
-        };
-    }
-
-    index.scanEndByLevel.resize(levelCount);
-    std::uint32_t scanCount = 0u;
-    for (std::size_t level = levelCount; level-- > 0;) {
-        scanCount += birthCounts[level];
-        index.scanEndByLevel[level] = scanCount;
-    }
-    UploadIndex(index);
-}
-
-RangeFilterExecutionStats BirthOrderedRangeFilterStrategy::Execute(const RangeFilterInput& input) {
-    if (levelCount_ == 0) {
-        return {};
-    }
-
-    prepareDispatchProgram_.Bind();
-    scanEndBuffer_.BindBase(GL_SHADER_STORAGE_BUFFER, 0);
-    dispatchBuffer_.BindBase(GL_SHADER_STORAGE_BUFFER, 1);
-    glUniform1i(glGetUniformLocation(prepareDispatchProgram_.Id(), "uLevel"), input.lodLevel);
-    glUniform1ui(glGetUniformLocation(prepareDispatchProgram_.Id(), "uLevelCount"),
-                 levelCount_);
-    prepareDispatchProgram_.Dispatch(1);
-
-    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_COMMAND_BARRIER_BIT);
-
-    filterProgram_.Bind();
-    orderedRangeBuffer_.BindBase(GL_SHADER_STORAGE_BUFFER, 0);
-    scanEndBuffer_.BindBase(GL_SHADER_STORAGE_BUFFER, 1);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, input.outputEdgeBuffer);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, input.outputDrawCommandBuffer);
-    glUniform1i(glGetUniformLocation(filterProgram_.Id(), "uLevel"), input.lodLevel);
-    glUniform1ui(glGetUniformLocation(filterProgram_.Id(), "uLevelCount"),
-                 levelCount_);
-
-    glBindBuffer(GL_DISPATCH_INDIRECT_BUFFER, dispatchBuffer_.Id());
-    glDispatchComputeIndirect(0);
-
-    return {};
-}
-
-RangeFilterDiagnostics BirthOrderedRangeFilterStrategy::ReadBackDiagnostics(std::int32_t lodLevel) const {
-    RangeFilterDiagnostics diagnostics;
-    if (levelCount_ == 0 || lodLevel < 0 || static_cast<std::uint32_t>(lodLevel) >= levelCount_) {
-        return diagnostics;
-    }
-
-    std::uint32_t candidateCount = 0;
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, scanEndBuffer_.Id());
-    glGetBufferSubData(GL_SHADER_STORAGE_BUFFER,
-                       static_cast<GLintptr>(static_cast<std::uint32_t>(lodLevel) * sizeof(std::uint32_t)),
-                       sizeof(candidateCount), &candidateCount);
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
-
-    DispatchIndirectCommand dispatch{};
-    glBindBuffer(GL_DISPATCH_INDIRECT_BUFFER, dispatchBuffer_.Id());
-    glGetBufferSubData(GL_DISPATCH_INDIRECT_BUFFER, 0, sizeof(dispatch), &dispatch);
-    glBindBuffer(GL_DISPATCH_INDIRECT_BUFFER, 0);
-
-    diagnostics.candidateEdgeCount = candidateCount;
-    diagnostics.dispatchGroupCount = dispatch.groupsX;
-    diagnostics.localSizeX = 256;
-    return diagnostics;
+    // Test only those records.
+    gatherProgram_.Bind();
+    const auto id = gatherProgram_.Id();
+    pool.BindForKernel(id);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, input.slotList);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, input.candidateList);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, input.statusBuffer);
+    order_.BindBase(GL_SHADER_STORAGE_BUFFER, 5);
+    prefix_.BindBase(GL_SHADER_STORAGE_BUFFER, 6);
+    glUniform1ui(glGetUniformLocation(id, "uLevel"), input.query.level);
+    glUniform1ui(glGetUniformLocation(id, "uCandidateCapacity"), input.candidateCapacity);
+    lod::ListDispatcher::Dispatch(prefix_.Id());
 }
 
 } // namespace chmv::gpu::filtering

@@ -4,14 +4,26 @@
 #include "gpu/ComputeProgram.h"
 #include "gpu/GPUBuffer.h"
 #include "gpu/GraphicsProgram.h"
+#include "gpu/lod/LodPageLists.h"
 #include "renderer/RoadStyle.h"
+#include "streaming/lod/LodPageFormat.h"
+#include "streaming/lod/LodPagePlanner.h"
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <optional>
 #include <span>
 #include <vector>
+
+namespace chmv::gpu::filtering {
+class IRangeFilterStrategy;
+}
+
+namespace chmv::gpu::unfolding {
+class IUnfoldingStrategy;
+}
 
 namespace chmv::renderer {
 class MapCamera2D;
@@ -21,8 +33,31 @@ namespace chmv::gpu::lod {
 
 class LodPagePool;
 
-// GPU half of the LOD page runtime: a compute pass that turns resident pages into a compact
-// segment list, and a vertex-pulled draw of that list.
+// What one filter and expansion pass works on: the resident slots of the planned pages, and the
+// directory and query (level, threshold, box) they were planned with.
+struct LodPagePass {
+    std::span<const std::uint32_t> slots;
+    std::span<const streaming::lod::PageEntry> directory;
+    streaming::lod::LodPageQuery query;
+    std::uint32_t hierarchyHeight = 0;
+};
+
+// Repeated passes of the selected strategies, timed on the GPU.
+struct LodPageBenchmarkResult {
+    std::uint32_t iterations = 0;
+    std::uint32_t pages = 0;
+    std::uint32_t candidates = 0;
+    std::uint32_t segments = 0;
+    double filterMinMs = 0.0;
+    double filterAverageMs = 0.0;
+    double filterMaxMs = 0.0;
+    double unfoldMinMs = 0.0;
+    double unfoldAverageMs = 0.0;
+    double unfoldMaxMs = 0.0;
+};
+
+// GPU half of the LOD page runtime: the selected filter and expansion turn resident pages into a
+// segment list, which a vertex-pulled draw renders.
 class LodPageRenderer {
 public:
     explicit LodPageRenderer(const std::filesystem::path& shaderDirectory);
@@ -31,44 +66,87 @@ public:
     LodPageRenderer(const LodPageRenderer&) = delete;
     LodPageRenderer& operator=(const LodPageRenderer&) = delete;
 
-    // Only needed when the level, the threshold or the slot list changed.
-    void Filter(const LodPagePool& pool, std::span<const std::uint32_t> slots, std::uint32_t level,
-                std::uint32_t threshold);
+    // Only needed when the pass or a strategy changed.
+    void Process(const LodPagePool& pool, const LodPagePass& pass,
+                 filtering::IRangeFilterStrategy& filter, unfolding::IUnfoldingStrategy& unfold);
     void Draw(const LodPagePool& pool, const renderer::MapCamera2D& camera, int width, int height,
               const std::array<float, 4>& color, const renderer::RoadStyleConfig& styles);
-    // Collects finished GPU queries without waiting; results are a few frames old.
+    // Runs the pass `iterations` times and waits for the timings.
+    [[nodiscard]] LodPageBenchmarkResult Benchmark(const LodPagePool& pool, const LodPagePass& pass,
+                                                   filtering::IRangeFilterStrategy& filter,
+                                                   unfolding::IUnfoldingStrategy& unfold,
+                                                   std::uint32_t iterations);
+    // Collects finished GPU results without waiting; they are a few frames old.
     void Poll();
+    // True once after a finished pass ran out of room; the buffers have grown, so it is worth
+    // running again.
+    [[nodiscard]] bool TakeRetry();
 
     [[nodiscard]] std::uint32_t DrawnSegments() const { return drawnSegments_; }
+    [[nodiscard]] std::uint32_t Candidates() const { return candidates_; }
+    [[nodiscard]] const std::array<std::uint32_t, kStatusWords>& Status() const { return status_; }
     [[nodiscard]] std::optional<double> FilterMilliseconds() const {
         return filterTimer_.LastMilliseconds();
+    }
+    [[nodiscard]] std::optional<double> UnfoldMilliseconds() const {
+        return unfoldTimer_.LastMilliseconds();
     }
     [[nodiscard]] std::optional<double> DrawMilliseconds() const {
         return drawTimer_.LastMilliseconds();
     }
-    // Synchronous copy of the current segment list (validation only).
+
+    // Synchronous copies of the last pass, for validation.
     [[nodiscard]] std::vector<std::uint32_t> ReadSegments() const;
+    [[nodiscard]] std::vector<std::uint32_t> ReadCandidates() const;
+    [[nodiscard]] std::array<std::uint32_t, kStatusWords> ReadStatus() const;
 
 private:
-    struct CountReadback {
+    struct Readback {
         GPUBuffer buffer;
         void* fence = nullptr;
+        std::uint32_t segmentScale = 0;
     };
 
-    void EnsureCapacity(std::size_t slotCount);
+    struct Capacities {
+        std::uint32_t candidates = 0;
+        std::uint32_t segments = 0;
+    };
 
-    ComputeProgram filterProgram_;
+    void EnsureCapacity(std::size_t slotCount, std::size_t poolSlots);
+    // Uploads the slot list and empties the candidates, segments and status.
+    [[nodiscard]] Capacities StartPass(const LodPagePool& pool, const LodPagePass& pass);
+    void Filter(const LodPagePool& pool, const LodPagePass& pass, Capacities capacities,
+                filtering::IRangeFilterStrategy& filter);
+    void Unfold(const LodPagePool& pool, const LodPagePass& pass, Capacities capacities,
+                unfolding::IUnfoldingStrategy& unfold);
+
     GraphicsProgram roadProgram_;
-    GPUBuffer slotBuffer_;
+    ComputeProgram finishProgram_;
+    GPUBuffer slotList_;
+    GPUBuffer candidateList_;
     GPUBuffer segmentBuffer_;
     GPUBuffer commandBuffer_;
+    GPUBuffer statusBuffer_;
+    GPUBuffer errorBounds_;
+    std::vector<std::uint32_t> slotListWords_;
+    // Pages the lists have room for; segments get segmentScale_ times the records of those,
+    // all within the largest storage block the GPU binds.
     std::size_t slotCapacity_ = 0;
+    std::size_t candidateCapacity_ = 0;
+    std::size_t segmentCapacity_ = 0;
+    std::uint32_t segmentScale_ = 1;
+    std::uint32_t allocatedScale_ = 0;
+    std::int64_t maxBlockBytes_ = 0;
     std::uint32_t vertexArray_ = 0;
     benchmark::GPUTimer filterTimer_;
+    benchmark::GPUTimer unfoldTimer_;
     benchmark::GPUTimer drawTimer_;
-    std::array<CountReadback, 3> countReadbacks_;
-    std::size_t nextCountReadback_ = 0;
+    std::array<Readback, 3> readbacks_;
+    std::size_t nextReadback_ = 0;
     std::uint32_t drawnSegments_ = 0;
+    std::uint32_t candidates_ = 0;
+    std::array<std::uint32_t, kStatusWords> status_{};
+    bool retry_ = false;
 };
 
 } // namespace chmv::gpu::lod

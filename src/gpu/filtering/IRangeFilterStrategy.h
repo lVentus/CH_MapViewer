@@ -1,41 +1,35 @@
 #pragma once
 
-#include <cstddef>
-#include <cstdint>
-#include "data/ch/CHTypes.h"
+#include "streaming/lod/LodPageFormat.h"
+#include "streaming/lod/LodPagePlanner.h"
 
-#include <optional>
+#include <cstdint>
 #include <span>
 #include <string_view>
 
-namespace chmv::data {
-class CHGraph;
+namespace chmv::gpu::lod {
+class LodPagePool;
 }
 
 namespace chmv::gpu::filtering {
 
-enum class PersistentStreamingRangeFilterKind : std::uint8_t {
-    Unsupported,
-    FullScan,
-    BirthOrdered,
-};
-
+// One filter pass over resident LOD pages. A filter finds the candidates of a level: every
+// record of the planned pages whose root or child level interval contains the level, as a list
+// of slot << 8 | record (LodPageLists.h). Which of them are drawn is the expansion's business,
+// so every filter must find the same set; they differ only in the work spent on it.
 struct RangeFilterInput {
-    std::uint32_t graphEdgeBuffer = 0;
-    std::uint32_t graphEdgeCount = 0;
-    std::int32_t lodLevel = 0;
-    std::uint32_t outputEdgeBuffer = 0;
-    std::uint32_t outputDrawCommandBuffer = 0;
-};
-
-struct RangeFilterExecutionStats {
-    std::optional<std::size_t> candidateEdgeCount;
-};
-
-struct RangeFilterDiagnostics {
-    std::optional<std::size_t> candidateEdgeCount;
-    std::optional<std::uint32_t> dispatchGroupCount;
-    std::optional<std::uint32_t> localSizeX;
+    const lod::LodPagePool* pool = nullptr;
+    // Pool slots of the pages the CPU planner chose for the query, also as a GPU list whose
+    // grid has one workgroup per slot.
+    std::span<const std::uint32_t> slots;
+    std::uint32_t slotList = 0;
+    // Directory (indexed by page) and query the planner chose those pages with.
+    std::span<const streaming::lod::PageEntry> directory;
+    streaming::lod::LodPageQuery query;
+    // Empty on entry; room for slots.size() * kPageRecordCapacity items.
+    std::uint32_t candidateList = 0;
+    std::uint32_t candidateCapacity = 0;
+    std::uint32_t statusBuffer = 0;
 };
 
 class IRangeFilterStrategy {
@@ -43,17 +37,9 @@ public:
     virtual ~IRangeFilterStrategy() = default;
 
     [[nodiscard]] virtual std::string_view Name() const = 0;
-    [[nodiscard]] virtual bool SupportsStreamingWorkingSet() const { return false; }
-    [[nodiscard]] virtual PersistentStreamingRangeFilterKind PersistentStreamingKind() const {
-        return PersistentStreamingRangeFilterKind::Unsupported;
-    }
-    virtual void SetGraph(const data::CHGraph& graph) = 0;
-    virtual void SetStreamingRanges(std::span<const data::EdgeRange>) {}
+    // Forgets everything derived from earlier passes.
     virtual void Reset() {}
-    [[nodiscard]] virtual RangeFilterExecutionStats Execute(const RangeFilterInput& input) = 0;
-    [[nodiscard]] virtual RangeFilterDiagnostics ReadBackDiagnostics(std::int32_t) const {
-        return {};
-    }
+    virtual void Execute(const RangeFilterInput& input) = 0;
 };
 
 } // namespace chmv::gpu::filtering

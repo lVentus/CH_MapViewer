@@ -1,7 +1,7 @@
 #pragma once
 
 #include "gpu/ComputeProgram.h"
-#include "gpu/GPUBuffer.h"
+#include "gpu/lod/LodPageLists.h"
 #include "gpu/unfolding/IUnfoldingStrategy.h"
 
 #include <cstdint>
@@ -9,28 +9,25 @@
 
 namespace chmv::gpu::unfolding {
 
+// One invocation per root walks its subtree depth first with a private stack, skipping subtrees
+// outside the view and drawing every node within the screen tolerance.
 class AdaptiveDFSUnfoldingStrategy final : public IUnfoldingStrategy {
 public:
     explicit AdaptiveDFSUnfoldingStrategy(const std::filesystem::path& shaderDirectory);
 
-    [[nodiscard]] std::string_view Name() const override { return "Adaptive DFS (screen-space)"; }
+    [[nodiscard]] std::string_view Name() const override { return "Adaptive DFS"; }
     [[nodiscard]] geometry::RefinementMode Mode() const override {
         return geometry::RefinementMode::Adaptive;
     }
-    [[nodiscard]] UnfoldingOutput Execute(const UnfoldingInput& input) override;
+    [[nodiscard]] bool Traverses() const override { return true; }
+    void Execute(const UnfoldingInput& input) override;
 
 private:
-    void EnsureCapacity(std::uint32_t capacity);
-
-    ComputeProgram prepareDispatchProgram_;
-    ComputeProgram unfoldProgram_;
-    ComputeProgram finalizeProgram_;
-    GPUBuffer outputEdgeBuffer_;
-    GPUBuffer outputCounterBuffer_;
-    GPUBuffer statusBuffer_;
-    GPUBuffer dispatchBuffer_;
-    GPUBuffer indirectBuffer_;
-    std::uint32_t capacity_ = 0;
+    std::filesystem::path shaderDirectory_;
+    ComputeProgram program_;
+    lod::ListDispatcher lists_;
+    // The stack is sized for the hierarchy at hand, so the program is built on first use.
+    std::uint32_t stackSize_ = 0;
 };
 
 } // namespace chmv::gpu::unfolding

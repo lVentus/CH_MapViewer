@@ -1,0 +1,29 @@
+#version 430 core
+
+// Indirect dispatch arguments for a list: one workgroup per uGroupSize items, in two dimensions
+// past 65535 workgroups. A count above the list capacity (the writes beyond it were dropped and
+// counted in the status) is clamped. Optionally empties the list the next pass appends to.
+
+layout(local_size_x = 1) in;
+
+layout(std430, binding = 2) buffer List {
+    uint count;
+    uint groups[3];
+};
+layout(std430, binding = 3) buffer NextList { uint nextCount; };
+
+uniform uint uCapacity;
+uniform uint uGroupSize;
+uniform uint uEmptyNext;
+
+void main() {
+    uint items = min(count, uCapacity);
+    uint workgroups = (items + uGroupSize - 1u) / uGroupSize;
+    count = items;
+    groups[0] = min(workgroups, 65535u);
+    groups[1] = (workgroups + 65534u) / 65535u;
+    groups[2] = 1u;
+    if (uEmptyNext != 0u) {
+        nextCount = 0u;
+    }
+}

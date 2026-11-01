@@ -2,35 +2,25 @@
 
 CH_MapViewer is a Linux-first OpenGL renderer for contraction-hierarchy-based road-network visualization. Windows is a secondary target.
 
-The current repository establishes the project boundaries, CH/range loading, a CPU reference unfolder, OpenGL infrastructure, Dear ImGui integration, and the runtime-selectable unfolding-strategy interface. GPU unfolding algorithms will be implemented behind that interface and benchmarked against the CPU reference before the road renderer and streaming layer are expanded.
+A dataset (`.sch` + `.sch.ranges`) is turned once into a self-contained page file (`<name>.chlod`, built in the background and checked against plain DFS). The viewer then has three independent parts:
 
-## Current module boundaries
+- **Loading (virtual map):** the pages a view needs follow from the camera alone; they are streamed into a GPU page pool from RAM (when the page file fits) or from disk. All pages can be preloaded into the GPU when they fit.
+- **Filter:** finds the records of the current level on the GPU — full scan, birth-ordered (records sorted per page, prefix search), or GPU page culling (the GPU picks the pages itself).
+- **Expansion:** decides what is drawn — none (roots only), full BFS, adaptive DFS, adaptive BFS, or dual interval (no traversal: every record decides from its stored intervals).
+
+Filter and expansion are chosen at runtime; every combination draws the same roads, which the viewer can check against a CPU evaluation and benchmark on the GPU.
+
+## Module boundaries
 
 - `core`: application lifecycle and native window ownership
-- `data/ch`: CH graph, edge ranges, and file loading
-- `reference`: correctness-first CPU algorithms
+- `data`: dataset catalog, background loader, memory queries
+- `streaming/lod`: page file format, builder, reader and page planner
 - `gpu`: OpenGL resources and compute infrastructure
-- `gpu/unfolding`: runtime-selectable unfolding strategies
-- `renderer`: drawing code only
+- `gpu/lod`: GPU page pool, pass orchestration and the runtime
+- `gpu/filtering`, `gpu/unfolding`: the runtime-selectable strategies (`IRangeFilterStrategy`, `IUnfoldingStrategy`); a new strategy is one class plus its shaders, registered in `Application`
+- `renderer`: camera, LOD curve and frame setup
+- `benchmark`: GPU timers and the zoom sweep
 - `ui`: Dear ImGui tools and runtime controls
-
-Streaming, spatial indexing, and benchmark modules will be added when their first concrete implementation is introduced rather than as empty placeholders.
-
-## Planned unfolding strategies
-
-The renderer uses a stable `IUnfoldingStrategy` interface. Concrete strategies are intended to be switchable at runtime and benchmarked under identical inputs.
-
-Planned candidates include:
-
-- per-thread iterative DFS
-- level-synchronous/frontier expansion
-- persistent global work queue
-- workgroup-local queue variants
-- subgroup-cooperative traversal
-- workload binning and task splitting
-- flattened hierarchy / frontier-query layouts
-
-Traversal strategy and output management are kept separate. Atomic append and prefix-sum/scatter can therefore be tested with more than one traversal method.
 
 ## Build
 
@@ -61,7 +51,7 @@ The script currently handles the main Linux paths as follows:
 
 System packages are only installed when they are missing. If installation requires elevated privileges, the script uses `sudo` (or runs the package manager directly when already root).
 
-The first full viewer configuration also needs Internet access because CMake fetches GLFW, GLAD and Dear ImGui from their upstream repositories.
+The first full viewer configuration also needs Internet access because CMake fetches GLFW, GLAD and Dear ImGui from their upstream repositories. zstd (for the compressed page files) is taken from the system when it is installed (`build.sh` installs it) and otherwise fetched and built as well.
 
 Other useful commands are:
 
@@ -90,11 +80,16 @@ assets/data/bw/bw.sch
 assets/data/bw/bw.sch.ranges
 ```
 
-Subdirectories are scanned recursively. Command-line graph/range paths are still supported when needed:
+Subdirectories are scanned recursively. Command-line graph/range paths (or a page file alone) are still supported when needed:
 
 ```bash
 ./build-linux/CH_MapViewer /path/to/bw.sch /path/to/bw.sch.ranges
+./build-linux/CH_MapViewer /path/to/bw.chlod
 ```
+
+Loading a dataset builds `<name>.chlod` next to it when that file is missing, older than the sources, damaged or of an older format; a page file of the previous version (3, the same data uncompressed) is only compressed, not rebuilt. The page file holds the complete CH as well, zstd-compressed (bw: about 430 MiB instead of 1.2 GB uncompressed), so it also works on its own: a `.chlod` whose `.sch`/`.ranges` are gone is listed and loaded as it is (it can only be rebuilt with them).
+
+Road colors and widths come from `assets/road_styles.cfg`: a few road classes over the edge types of OsmGraphCreator's `all.cfg`. The viewer reloads the file when it is saved.
 
 For CI or a non-graphics/core-only build, the script also forwards the existing CMake options through environment variables:
 
@@ -107,7 +102,7 @@ If you prefer to configure manually on Ubuntu/Debian, the equivalent full depend
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y build-essential cmake ninja-build git pkg-config \
+sudo apt-get install -y build-essential cmake ninja-build git pkg-config libzstd-dev \
     python3 python3-jinja2 libgl1-mesa-dev \
     libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev \
     libwayland-dev wayland-protocols libxkbcommon-dev
@@ -129,7 +124,7 @@ In VS Code with CMake Tools, select an x64 kit/variant before configuring. If an
 
 ## Data format
 
-The text loader currently accepts the provided CH format:
+The page file builder reads the provided CH format:
 
 ```text
 <NodeCount>
@@ -146,22 +141,16 @@ and the range file:
 <EdgeID> <birthLevel> <deathLevel>
 ```
 
-`-1 -1` ranges are retained in the graph representation but reported as non-drawable.
+`-1 -1` ranges are kept in the CH layer of the page file but never drawn.
+
+The page file (`streaming/lod/LodPageFormat.h`) stores every column in zstd blocks and every page (and its children block) as its own zstd frame, so a single page is still read and decoded on its own. The builder checks the uncompressed file against DFS first and keeps the compressed one only once it decodes to exactly the same bytes.
 
 ## Tests
 
-The data/reference layer can be built and tested without fetching graphics dependencies:
+The data layer (page file builder, reader, planner, loader) can be built and tested without fetching graphics dependencies:
 
 ```bash
 cmake -S . -B build-tests -DCHMV_BUILD_APP=OFF -DCHMV_BUILD_TESTS=ON
 cmake --build build-tests
 ctest --test-dir build-tests --output-on-failure
 ```
-
-## Immediate next milestone
-
-1. Add benchmark input selection and reproducible root-edge sets.
-2. Implement per-thread iterative DFS as the first GPU baseline.
-3. Implement frontier expansion and persistent-queue variants.
-4. Compare correctness against `CPUReferenceUnfolder` and record GPU time, output size, temporary memory, and timing variance.
-5. Only after selecting a suitable GPU traversal, connect range filtering and the first road-rendering path.
