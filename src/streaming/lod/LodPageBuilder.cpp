@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -36,7 +37,6 @@ constexpr int kQualityLayers = 5; // 1, 2, 4, 8 px on the reference curve, then 
 constexpr int kCatchAllLayer = kQualityLayers - 1;
 constexpr int kMaxOctave = 31;
 constexpr double kFarZoom = 1048576.0;
-constexpr std::uint64_t kPageWriteChunkBytes = 16ull << 20u;
 constexpr std::uint8_t kNoRecord = 0xffu;
 // Sort partitions are cut along (layer, octave, top Morton bits) cells.
 constexpr std::uint32_t kCellMortonBits = 12;
@@ -50,6 +50,14 @@ constexpr std::uint32_t kMaxPagePasses = 64;
 constexpr std::uint64_t kDiskBytesPerRecord = 40;
 // Hash map entry plus vector allocation for an edge with further contexts.
 constexpr std::uint64_t kExtraContextBytes = 128;
+// Readers and scan buffers of one worker thread.
+constexpr std::uint64_t kWorkerBytes = 8ull << 20u;
+// Smallest edge range one thread scans on its own, and edges per round of a scan whose results
+// are written in edge order.
+constexpr std::uint64_t kMinScanEdges = 1u << 16u;
+constexpr std::uint64_t kWaveEdges = 1u << 23u;
+// Pages read back and checked per round of the verification.
+constexpr std::uint64_t kVerifyBlockBytes = 64u << 20u;
 
 template <typename T> void Release(std::vector<T>& values) {
     std::vector<T>().swap(values);
@@ -232,15 +240,15 @@ struct Record {
 
 // What a record draws (edge, style, both end positions), summed over all records so the order
 // of the records does not matter.
-[[nodiscard]] std::uint64_t GeometryHash(std::uint32_t edge, std::uint8_t style, std::int32_t x0,
-                                         std::int32_t y0, std::int32_t x1, std::int32_t y1) {
+[[nodiscard]] std::uint64_t GeometryHash(std::uint32_t edge, std::uint8_t style, std::int32_t fromX,
+                                         std::int32_t fromY, std::int32_t toX, std::int32_t toY) {
     const auto pack = [](std::int32_t x, std::int32_t y) {
         return (std::uint64_t{static_cast<std::uint32_t>(x)} << 32u) |
                static_cast<std::uint32_t>(y);
     };
     auto h = Mix64((std::uint64_t{edge} << 8u) | style);
-    h = Mix64(h ^ pack(x0, y0));
-    return Mix64(h ^ pack(x1, y1));
+    h = Mix64(h ^ pack(fromX, fromY));
+    return Mix64(h ^ pack(toX, toY));
 }
 
 [[nodiscard]] std::uint64_t GeometryHash(const LodPageNodes& nodes, const Record& record) {
@@ -259,6 +267,7 @@ struct EdgeRow {
     float error = 0.0f;
 };
 
+// The CH columns the record passes read, with one set of readers per worker thread.
 class EdgeRows {
 public:
     EdgeRows(const std::filesystem::path& file, const FileHeader& header)
@@ -268,25 +277,50 @@ public:
           deaths_(file, header.At(Section::EdgeDeath)),
           errors_(file, header.At(Section::EdgeError)) {}
 
-    [[nodiscard]] EdgeRow Next(std::uint32_t edge) {
-        EdgeRow row;
-        row.edge = edge;
-        row.source = sources_.Next();
-        row.target = targets_.Next();
-        row.type = types_.Next();
-        row.birth = births_.Next();
-        row.death = deaths_.Next();
-        row.error = errors_.Next();
-        return row;
+    // Edges [range.first, range.second), read in order by one worker.
+    class Range {
+    public:
+        [[nodiscard]] EdgeRow Next(std::uint32_t edge) {
+            EdgeRow row;
+            row.edge = edge;
+            row.source = sources_.Next();
+            row.target = targets_.Next();
+            row.type = types_.Next();
+            row.birth = births_.Next();
+            row.death = deaths_.Next();
+            row.error = errors_.Next();
+            return row;
+        }
+
+    private:
+        friend class EdgeRows;
+        Range(ValueReader<std::uint32_t>& sources, ValueReader<std::uint32_t>& targets,
+              ValueReader<std::int16_t>& types, ValueReader<std::int16_t>& births,
+              ValueReader<std::int16_t>& deaths, ValueReader<float>& errors)
+            : sources_(sources), targets_(targets), types_(types), births_(births), deaths_(deaths),
+              errors_(errors) {}
+
+        ValueReader<std::uint32_t>& sources_;
+        ValueReader<std::uint32_t>& targets_;
+        ValueReader<std::int16_t>& types_;
+        ValueReader<std::int16_t>& births_;
+        ValueReader<std::int16_t>& deaths_;
+        ValueReader<float>& errors_;
+    };
+
+    [[nodiscard]] Range At(unsigned worker, IndexRange range) {
+        return Range(sources_.At(worker, range), targets_.At(worker, range),
+                     types_.At(worker, range), births_.At(worker, range), deaths_.At(worker, range),
+                     errors_.At(worker, range));
     }
 
 private:
-    ValueReader<std::uint32_t> sources_;
-    ValueReader<std::uint32_t> targets_;
-    ValueReader<std::int16_t> types_;
-    ValueReader<std::int16_t> births_;
-    ValueReader<std::int16_t> deaths_;
-    ValueReader<float> errors_;
+    ColumnReaders<std::uint32_t> sources_;
+    ColumnReaders<std::uint32_t> targets_;
+    ColumnReaders<std::int16_t> types_;
+    ColumnReaders<std::int16_t> births_;
+    ColumnReaders<std::int16_t> deaths_;
+    ColumnReaders<float> errors_;
 };
 
 [[nodiscard]] LevelInterval RootInterval(const EdgeRow& row) {
@@ -455,20 +489,20 @@ public:
           pageHash_(HashOf(hashes, Section::Pages)),
           recordEdges_(output, header.At(Section::RecordEdge),
                        HashOf(hashes, Section::RecordEdge)) {
-        local_.reserve(kPageVertexCapacity * 2u);
-        vertices_.reserve(kPageVertexCapacity);
         open_.reserve(kPageRecordCapacity);
     }
 
     // Records must arrive in key order across calls. A page left short at the end of one call
     // is filled up by the next, so the layout does not depend on how the records were split.
     void Write(std::span<const Record> records) {
+        spans_.clear();
         std::size_t begin = 0;
         while (!open_.empty() && begin < records.size()) {
             if (open_.size() == kPageRecordCapacity ||
                 (records[begin].key >> 32u) != (open_.front().key >> 32u)) {
-                WritePage(open_);
+                closed_ = open_;
                 open_.clear();
+                spans_.emplace_back(closed_);
                 break;
             }
             open_.push_back(records[begin++]);
@@ -485,17 +519,20 @@ public:
                 open_.assign(rest.begin(), rest.end());
                 break;
             }
-            WritePage(records.subspan(begin, end - begin));
+            spans_.push_back(records.subspan(begin, end - begin));
             begin = end;
         }
+        Pack();
     }
 
     void Finish() {
+        spans_.clear();
         if (!open_.empty()) {
-            WritePage(open_);
+            closed_ = open_;
             open_.clear();
+            spans_.emplace_back(closed_);
         }
-        Flush();
+        Pack();
         recordEdges_.Flush();
     }
 
@@ -504,41 +541,130 @@ public:
     [[nodiscard]] std::uint64_t RecordCount() const { return recordCount_; }
 
 private:
-    void WritePage(std::span<const Record> records) {
+    struct LocalSlot {
+        std::uint32_t node = 0;
+        std::uint32_t index = 0;
+        std::uint32_t stamp = 0;
+    };
+    // At least twice the most vertices a page can have.
+    static constexpr std::uint32_t kLocalSlotBits = 10;
+    static constexpr std::uint32_t kLocalSlots = 1u << kLocalSlotBits;
+    static_assert(kLocalSlots >= 2u * kPageVertexCapacity);
+    // Pages built in parallel before they are written out in order.
+    static constexpr std::size_t kPagesPerRound = 2048;
+
+    // Page-local vertex index in order of first use: open addressing over the node id, slots of
+    // earlier pages are told apart by their stamp.
+    struct LocalVertices {
+        std::vector<LocalSlot> slots = std::vector<LocalSlot>(kLocalSlots);
+        std::uint32_t stamp = 0;
+        std::vector<std::uint32_t> nodes;
+
+        void Reset() {
+            nodes.clear();
+            if (++stamp == 0u) {
+                std::fill(slots.begin(), slots.end(), LocalSlot{});
+                stamp = 1u;
+            }
+        }
+        [[nodiscard]] std::uint32_t Index(std::uint32_t node) {
+            auto slot = (node * 0x9e3779b1u) >> (32u - kLocalSlotBits);
+            while (slots[slot].stamp == stamp) {
+                if (slots[slot].node == node) {
+                    return slots[slot].index;
+                }
+                slot = (slot + 1u) & (kLocalSlots - 1u);
+            }
+            const auto index = static_cast<std::uint32_t>(nodes.size());
+            slots[slot] = {node, index, stamp};
+            nodes.push_back(node);
+            return index;
+        }
+    };
+
+    // Consecutive pages built by one thread; offsets are relative to `words` until written.
+    struct PageRun {
+        std::vector<std::uint32_t> words;
+        std::vector<PageEntry> entries;
+        std::vector<std::uint32_t> edges;
+    };
+
+    void Pack() {
+        for (std::size_t first = 0; first < spans_.size(); first += kPagesPerRound) {
+            const auto last = std::min(spans_.size(), first + kPagesPerRound);
+            const auto pieces = SplitRange(first, last, 64u);
+            runs_.resize(pieces.size());
+            RunParallel(pieces.size(), [&](std::size_t task, unsigned) {
+                auto& run = runs_[task];
+                run.words.clear();
+                run.entries.clear();
+                run.edges.clear();
+                LocalVertices local;
+                auto firstRecord = recordCount_;
+                for (auto i = first; i < pieces[task].first; ++i) {
+                    firstRecord += spans_[i].size();
+                }
+                for (auto i = pieces[task].first; i < pieces[task].second; ++i) {
+                    BuildPage(spans_[i], static_cast<std::uint32_t>(pages_.size() + i - first),
+                              firstRecord, local, run);
+                    firstRecord += spans_[i].size();
+                }
+            });
+            const auto roundOffset = pagesOffset_ + pageBytes_;
+            for (auto& run : runs_) {
+                for (auto& entry : run.entries) {
+                    entry.fileOffset += pagesOffset_ + pageBytes_;
+                    pages_.push_back(entry);
+                }
+                pageBytes_ += run.words.size() * 4u;
+                recordCount_ += run.edges.size();
+            }
+            // Pages and record ids of the round go out in order, each on its own thread.
+            RunTogether({
+                [&] {
+                    auto offset = roundOffset;
+                    for (const auto& run : runs_) {
+                        const auto bytes = run.words.size() * 4u;
+                        output_.WriteAt(offset, run.words.data(), bytes);
+                        pageHash_.Update(run.words.data(), bytes);
+                        offset += bytes;
+                    }
+                },
+                [&] {
+                    for (const auto& run : runs_) {
+                        recordEdges_.Append(run.edges);
+                    }
+                },
+            });
+        }
+    }
+
+    void BuildPage(std::span<const Record> records, std::uint32_t pageIndex,
+                   std::uint64_t firstRecord, LocalVertices& local, PageRun& run) const {
         PageEntry entry;
-        entry.fileOffset = pagesOffset_ + pageBytes_ + pending_.size() * 4u;
-        entry.firstRecord = static_cast<std::uint32_t>(recordCount_);
+        entry.fileOffset = run.words.size() * 4u;
+        entry.firstRecord = static_cast<std::uint32_t>(firstRecord);
         entry.recordCount = static_cast<std::uint16_t>(records.size());
         entry.layer = static_cast<std::uint8_t>(records.front().Layer());
         entry.octave = static_cast<std::uint8_t>(records.front().Octave());
 
-        local_.clear();
-        vertices_.clear();
-        const auto localIndex = [&](std::uint32_t node) {
-            const auto [it, inserted] =
-                local_.try_emplace(node, static_cast<std::uint32_t>(vertices_.size()));
-            if (inserted) {
-                vertices_.push_back(node);
-            }
-            return it->second;
-        };
-
+        local.Reset();
         const auto recordCount = static_cast<std::uint32_t>(records.size());
         std::array<std::uint32_t, kPageRecordCapacity> endpoints{};
         for (std::uint32_t i = 0; i < recordCount; ++i) {
-            const auto from = localIndex(records[i].source);
-            const auto to = localIndex(records[i].target);
+            const auto from = local.Index(records[i].source);
+            const auto to = local.Index(records[i].target);
             endpoints[i] = from | (to << 16u);
         }
-        const auto vertexCount = static_cast<std::uint32_t>(vertices_.size());
+        const auto vertexCount = static_cast<std::uint32_t>(local.nodes.size());
         entry.vertexCount = static_cast<std::uint16_t>(vertexCount);
         entry.wordCount = PageWordCount(recordCount, vertexCount);
 
-        const auto base = pending_.size();
-        pending_.resize(base + entry.wordCount, 0u);
-        auto* words = pending_.data() + base;
+        const auto base = run.words.size();
+        run.words.resize(base + entry.wordCount, 0u);
+        auto* words = run.words.data() + base;
         words[0] = recordCount | (vertexCount << 16u);
-        words[1] = static_cast<std::uint32_t>(pages_.size());
+        words[1] = pageIndex;
         words[2] = static_cast<std::uint32_t>(entry.layer) |
                    (static_cast<std::uint32_t>(entry.octave) << 8u);
 
@@ -556,7 +682,7 @@ private:
             recordWords[i * 4u + 2u] = record.childLevels;
             recordWords[i * 4u + 3u] = record.errors;
             typeBytes[i] = record.style;
-            recordEdges_.Push(record.edge);
+            run.edges.push_back(record.edge);
             for (const auto levels : {record.rootLevels, record.childLevels}) {
                 if (levels != kEmptyLevelRange) {
                     minLevel = std::min(minLevel, levels & 0xffffu);
@@ -574,7 +700,7 @@ private:
         auto maxX = std::numeric_limits<std::int32_t>::min();
         auto maxY = maxX;
         for (std::uint32_t v = 0; v < vertexCount; ++v) {
-            const auto node = vertices_[v];
+            const auto node = local.nodes[v];
             vertexWords[v * 2u + 0u] = static_cast<std::uint32_t>(nodes_.x[node]);
             vertexWords[v * 2u + 1u] = static_cast<std::uint32_t>(nodes_.y[node]);
             minX = std::min(minX, nodes_.x[node]);
@@ -597,23 +723,7 @@ private:
             AddToBands(entry.bands, minLevel, maxLevel, record.childLevels, record.errors & 0xffffu,
                        record.errors >> 16u);
         }
-        pages_.push_back(entry);
-        recordCount_ += recordCount;
-
-        if (pending_.size() * 4u >= kPageWriteChunkBytes) {
-            Flush();
-        }
-    }
-
-    void Flush() {
-        if (pending_.empty()) {
-            return;
-        }
-        const auto bytes = pending_.size() * 4u;
-        output_.WriteAt(pagesOffset_ + pageBytes_, pending_.data(), bytes);
-        pageHash_.Update(pending_.data(), bytes);
-        pageBytes_ += bytes;
-        pending_.clear();
+        run.entries.push_back(entry);
     }
 
     [[nodiscard]] static float OutwardFloat(std::int32_t fixed, float direction) {
@@ -626,10 +736,10 @@ private:
     std::uint64_t pagesOffset_;
     StreamHash& pageHash_;
     ColumnWriter<std::uint32_t> recordEdges_;
-    std::unordered_map<std::uint32_t, std::uint32_t> local_;
-    std::vector<std::uint32_t> vertices_;
-    std::vector<std::uint32_t> pending_;
     std::vector<Record> open_;
+    std::vector<Record> closed_;
+    std::vector<std::span<const Record>> spans_;
+    std::vector<PageRun> runs_;
     std::vector<PageEntry> pages_;
     std::uint64_t pageBytes_ = 0;
     std::uint64_t recordCount_ = 0;
@@ -690,58 +800,87 @@ struct RecordPlan {
     plan.cells.assign(std::size_t{256} << kCellMortonBits, 0u);
     StageProgress report(progress, BuildStage::LayoutPages);
 
+    // What one scan piece learns; pieces are merged in edge order.
+    struct Piece {
+        std::vector<Record> extras;
+        std::uint64_t recordCount = 0;
+        std::uint64_t coverGapEdges = 0;
+        std::uint64_t geometry = 0;
+    };
+
     // Hull of the levels an edge is reached at, for the CH-layer cover columns.
     ColumnWriter<std::int16_t> coverLow(output, header.At(Section::EdgeCoverLow),
                                         HashOf(hashes, Section::EdgeCoverLow));
     ColumnWriter<std::int16_t> coverHigh(output, header.At(Section::EdgeCoverHigh),
                                          HashOf(hashes, Section::EdgeCoverHigh));
-    std::vector<LevelInterval> cover;
-    EdgeRows rows(file, header);
-    for (std::uint64_t e = 0; e < m; ++e) {
-        const auto edge = static_cast<std::uint32_t>(e);
-        const auto row = rows.Next(edge);
-        const auto extrasBefore = plan.extras.size();
-        Record main;
-        if (maker.Make(row, true, main, &plan.extras)) {
-            plan.layerOctave[edge] = main.LayerOctave();
-            ++plan.cells[CellOf(main)];
-            ++plan.recordCount;
-            plan.geometry += GeometryHash(nodes, main);
-        }
-        for (auto i = extrasBefore; i < plan.extras.size(); ++i) {
-            plan.geometry += GeometryHash(nodes, plan.extras[i]);
-        }
+    std::vector<std::int16_t> lows;
+    std::vector<std::int16_t> highs;
+    EdgeRows edgeRows(file, header);
+    report.Report(0u, 1u, 0u, m);
+    for (std::uint64_t wave = 0; wave < m; wave += kWaveEdges) {
+        const auto waveEnd = std::min(m, wave + kWaveEdges);
+        lows.resize(static_cast<std::size_t>(waveEnd - wave));
+        highs.resize(lows.size());
+        const auto scans = SplitRange(wave, waveEnd, kMinScanEdges);
+        std::vector<Piece> pieces(scans.size());
+        RunParallel(scans.size(), [&](std::size_t task, unsigned worker) {
+            auto& piece = pieces[task];
+            std::vector<LevelInterval> cover;
+            auto rows = edgeRows.At(worker, scans[task]);
+            for (auto e = scans[task].first; e < scans[task].second; ++e) {
+                const auto edge = static_cast<std::uint32_t>(e);
+                const auto row = rows.Next(edge);
+                const auto extrasBefore = piece.extras.size();
+                Record main;
+                if (maker.Make(row, true, main, &piece.extras)) {
+                    plan.layerOctave[edge] = main.LayerOctave();
+                    std::atomic_ref(plan.cells[CellOf(main)])
+                        .fetch_add(1u, std::memory_order_relaxed);
+                    ++piece.recordCount;
+                    piece.geometry += GeometryHash(nodes, main);
+                }
+                for (auto i = extrasBefore; i < piece.extras.size(); ++i) {
+                    piece.geometry += GeometryHash(nodes, piece.extras[i]);
+                }
 
-        cover.clear();
-        if (const auto root = RootInterval(row); !root.Empty()) {
-            cover.push_back(root);
-        }
-        if (contexts.HasPrimary(edge)) {
-            cover.push_back({contexts.low[edge], contexts.high[edge]});
-        }
-        if (const auto it = contexts.extra.find(edge); it != contexts.extra.end()) {
-            for (const auto& context : it->second) {
-                cover.push_back({context.low, context.high});
+                cover.clear();
+                if (const auto root = RootInterval(row); !root.Empty()) {
+                    cover.push_back(root);
+                }
+                if (contexts.HasPrimary(edge)) {
+                    cover.push_back({contexts.low[edge], contexts.high[edge]});
+                }
+                if (const auto it = contexts.extra.find(edge); it != contexts.extra.end()) {
+                    for (const auto& context : it->second) {
+                        cover.push_back({context.low, context.high});
+                    }
+                }
+                std::sort(
+                    cover.begin(), cover.end(),
+                    [](const LevelInterval& a, const LevelInterval& b) { return a.low < b.low; });
+                std::size_t parts = cover.empty() ? 0u : 1u;
+                auto low = cover.empty() ? -1 : cover.front().low;
+                auto high = cover.empty() ? -1 : cover.front().high;
+                for (std::size_t i = 1; i < cover.size(); ++i) {
+                    if (cover[i].low > high + 1) {
+                        ++parts;
+                    }
+                    low = std::min(low, cover[i].low);
+                    high = std::max(high, cover[i].high);
+                }
+                piece.coverGapEdges += parts > 1u ? 1u : 0u;
+                lows[static_cast<std::size_t>(e - wave)] = static_cast<std::int16_t>(low);
+                highs[static_cast<std::size_t>(e - wave)] = static_cast<std::int16_t>(high);
             }
+        });
+        RunTogether({[&] { coverLow.Append(lows); }, [&] { coverHigh.Append(highs); }});
+        for (auto& piece : pieces) {
+            plan.extras.insert(plan.extras.end(), piece.extras.begin(), piece.extras.end());
+            plan.recordCount += piece.recordCount;
+            plan.coverGapEdges += piece.coverGapEdges;
+            plan.geometry += piece.geometry;
         }
-        std::sort(cover.begin(), cover.end(),
-                  [](const LevelInterval& a, const LevelInterval& b) { return a.low < b.low; });
-        std::size_t pieces = cover.empty() ? 0u : 1u;
-        auto low = cover.empty() ? -1 : cover.front().low;
-        auto high = cover.empty() ? -1 : cover.front().high;
-        for (std::size_t i = 1; i < cover.size(); ++i) {
-            if (cover[i].low > high + 1) {
-                ++pieces;
-            }
-            low = std::min(low, cover[i].low);
-            high = std::max(high, cover[i].high);
-        }
-        plan.coverGapEdges += pieces > 1u ? 1u : 0u;
-        coverLow.Push(static_cast<std::int16_t>(low));
-        coverHigh.Push(static_cast<std::int16_t>(high));
-        if ((e & kProgressMask) == 0u) {
-            report.Report(0u, 1u, e, m);
-        }
+        report.Report(0u, 1u, waveEnd, m);
     }
     coverLow.Flush();
     coverHigh.Flush();
@@ -782,48 +921,87 @@ void WriteRecordPages(const std::filesystem::path& file, const FileHeader& heade
     const auto m = header.edgeCount;
     StageProgress report(progress, BuildStage::WritePages);
     const auto parts = static_cast<std::uint32_t>(partitions.size());
+    const auto scans = SplitRange(0u, m, kMinScanEdges);
+    EdgeRows edgeRows(file, header);
     std::vector<Record> records;
+    std::vector<std::uint64_t> begins;
+    std::vector<std::uint64_t> cursors;
+    report.Report(0u, parts, 0u, m);
     for (std::uint32_t part = 0; part < parts; ++part) {
-        const auto [first, last] = partitions[part];
-        std::uint64_t expected = 0;
+        // A cell is a prefix of the record key, so the records sit in key order once every
+        // cell has its own slots and each cell is sorted on its own.
+        const auto first = partitions[part].first;
+        const auto last = partitions[part].second;
+        begins.assign(static_cast<std::size_t>(last - first) + 1u, 0u);
         for (auto cell = first; cell < last; ++cell) {
-            expected += plan.cells[cell];
+            begins[cell - first + 1u] = begins[cell - first] + plan.cells[cell];
         }
+        const auto expected = begins.back();
+        cursors.assign(begins.begin(), begins.end() - 1);
         Release(records);
-        records.reserve(static_cast<std::size_t>(expected));
+        records.resize(static_cast<std::size_t>(expected));
 
-        EdgeRows rows(file, header);
-        for (std::uint64_t e = 0; e < m; ++e) {
-            const auto edge = static_cast<std::uint32_t>(e);
-            const auto row = rows.Next(edge);
-            const auto layerOctave = plan.layerOctave[edge];
-            if (layerOctave != kNoRecord) {
-                const auto morton = maker.Morton(row.source, row.target);
-                const auto cell = CellOf(layerOctave, morton);
-                if (cell >= first && cell < last) {
-                    Record record;
-                    maker.Make(row, false, record, nullptr);
-                    record.key = (std::uint64_t{layerOctave} << 32u) | morton;
-                    records.push_back(record);
+        std::atomic<std::uint64_t> scanned{0};
+        RunParallel(
+            scans.size(),
+            [&](std::size_t task, unsigned worker) {
+                const auto range = scans[task];
+                auto rows = edgeRows.At(worker, range);
+                for (auto e = range.first; e < range.second; ++e) {
+                    const auto edge = static_cast<std::uint32_t>(e);
+                    const auto row = rows.Next(edge);
+                    const auto layerOctave = plan.layerOctave[edge];
+                    if (layerOctave != kNoRecord) {
+                        const auto morton = maker.Morton(row.source, row.target);
+                        const auto cell = CellOf(layerOctave, morton);
+                        if (cell >= first && cell < last) {
+                            const auto slot = std::atomic_ref(cursors[cell - first])
+                                                  .fetch_add(1u, std::memory_order_relaxed);
+                            if (slot >= begins[cell - first + 1u]) {
+                                throw std::logic_error(
+                                    "LOD page cell got more records than planned");
+                            }
+                            auto& record = records[static_cast<std::size_t>(slot)];
+                            maker.Make(row, false, record, nullptr);
+                            record.key = (std::uint64_t{layerOctave} << 32u) | morton;
+                        }
+                    }
+                    if ((e & kProgressMask) == kProgressMask) {
+                        scanned += kProgressMask + 1u;
+                    }
                 }
-            }
-            if ((e & kProgressMask) == 0u) {
-                report.Report(part, parts, e, m);
-            }
-        }
+            },
+            [&] { report.Report(part, parts, scanned, m); });
         for (const auto& record : plan.extras) {
-            const auto cell = CellOf(record);
-            if (cell >= first && cell < last) {
-                records.push_back(record);
+            if (const auto cell = CellOf(record); cell >= first && cell < last) {
+                records[static_cast<std::size_t>(cursors[cell - first]++)] = record;
             }
         }
-        if (records.size() != expected) {
-            throw std::logic_error("LOD page partition lost records");
+        for (std::size_t c = 0; c < cursors.size(); ++c) {
+            if (cursors[c] != begins[c + 1u]) {
+                throw std::logic_error("LOD page partition lost records");
+            }
         }
+
         // Full order, so equal keys of one edge's records land the same way on every machine.
-        std::sort(records.begin(), records.end(), [](const Record& a, const Record& b) {
+        const auto byKey = [](const Record& a, const Record& b) {
             return std::tie(a.key, a.edge, a.rootLevels, a.childLevels, a.errors) <
                    std::tie(b.key, b.edge, b.rootLevels, b.childLevels, b.errors);
+        };
+        std::vector<IndexRange> sorts;
+        const auto share = expected / (std::uint64_t{WorkerCount()} * 8u) + 1u;
+        for (std::uint64_t from = 0, c = 0; c < cursors.size(); ++c) {
+            if (begins[c + 1u] - begins[from] >= share || c + 1u == cursors.size()) {
+                sorts.emplace_back(from, c + 1u);
+                from = c + 1u;
+            }
+        }
+        RunParallel(sorts.size(), [&](std::size_t task, unsigned) {
+            for (auto c = sorts[task].first; c < sorts[task].second; ++c) {
+                const auto begin = records.begin() + static_cast<std::ptrdiff_t>(begins[c]);
+                const auto end = records.begin() + static_cast<std::ptrdiff_t>(begins[c + 1u]);
+                std::sort(begin, end, byKey);
+            }
         });
         writer.Write(records);
     }
@@ -855,9 +1033,11 @@ struct CutSum {
     [[nodiscard]] bool operator==(const CutSum&) const = default;
 };
 
+// Reads the birth and death sections back while it uses them; `hashes` gets their hashes.
 [[nodiscard]] std::vector<CutSum> DfsCuts(const std::filesystem::path& path,
                                           const FileHeader& header, LevelChunks& chunks,
-                                          std::span<const Cut> cuts, StageProgress& report) {
+                                          std::span<const Cut> cuts, SectionHashes& hashes,
+                                          StageProgress& report) {
     const auto m = static_cast<std::size_t>(header.edgeCount);
     const auto k = cuts.size();
     // Visit counts of all cuts side by side, one byte per edge and cut.
@@ -865,6 +1045,8 @@ struct CutSum {
     {
         ValueReader<std::int16_t> births(path, header.At(Section::EdgeBirth));
         ValueReader<std::int16_t> deaths(path, header.At(Section::EdgeDeath));
+        births.Hash(HashOf(hashes, Section::EdgeBirth));
+        deaths.Hash(HashOf(hashes, Section::EdgeDeath));
         for (std::size_t e = 0; e < m; ++e) {
             const auto birth = births.Next();
             const auto death = deaths.Next();
@@ -924,10 +1106,10 @@ struct PageSums {
     std::uint64_t geometry = 0;
 };
 
+// Reads every page and the record ids back, block by block, hashing both sections; the pages
+// of a block are checked on worker threads.
 [[nodiscard]] PageSums PageCuts(const LodPageFile& file, std::span<const Cut> cuts,
-                                StageProgress& report) {
-    PageSums sums;
-    sums.cuts.resize(cuts.size());
+                                SectionHashes& hashes, StageProgress& report) {
     std::vector<LodPageQuery> everywhere(cuts.size());
     for (std::size_t k = 0; k < cuts.size(); ++k) {
         everywhere[k].minX = everywhere[k].minY = -std::numeric_limits<float>::max();
@@ -937,61 +1119,123 @@ struct PageSums {
     }
 
     const auto& header = file.Header();
-    ValueReader<std::uint32_t> recordEdges(file.Path(), header.At(Section::RecordEdge));
-    std::ifstream input(file.Path(), std::ios::binary);
-    std::vector<std::uint32_t> words(kPageSlotWords);
-    std::vector<bool> drawn(cuts.size());
     const auto pages = file.Pages();
-    std::uint64_t done = 0;
-    for (const auto& group : file.Groups()) {
-        for (auto p = group.firstPage; p < group.firstPage + group.pageCount; ++p) {
-            const auto& page = pages[p];
-            input.seekg(static_cast<std::streamoff>(page.fileOffset));
-            input.read(reinterpret_cast<char*>(words.data()),
-                       static_cast<std::streamsize>(page.wordCount * 4u));
-            const auto counts =
-                std::uint32_t{page.recordCount} | (std::uint32_t{page.vertexCount} << 16u);
-            if (!input || words[0] != counts) {
-                throw std::runtime_error("LOD page verification: could not read page " +
-                                         std::to_string(p));
-            }
-            const auto* vertices =
-                words.data() + kPageHeaderWords + page.recordCount * kRecordWords;
-            const auto* types =
-                reinterpret_cast<const std::uint8_t*>(vertices + page.vertexCount * kVertexWords);
-            const auto position = [&](std::uint32_t local, std::uint32_t axis) {
-                return static_cast<std::int32_t>(vertices[local * kVertexWords + axis]);
-            };
-            std::fill(drawn.begin(), drawn.end(), false);
-            for (std::uint32_t i = 0; i < page.recordCount; ++i) {
-                const auto edge = recordEdges.Next();
-                const auto* record = words.data() + kPageHeaderWords + i * kRecordWords;
-                const auto from = record[0] & 0xffffu;
-                const auto to = record[0] >> 16u;
-                if (from >= page.vertexCount || to >= page.vertexCount) {
-                    throw std::runtime_error("LOD page verification failed: page " +
-                                             std::to_string(p) + " points past its vertices");
+    const auto groups = file.Groups();
+    ValueReader<std::uint32_t> recordEdges(file.Path(), header.At(Section::RecordEdge));
+    recordEdges.Hash(HashOf(hashes, Section::RecordEdge));
+    auto& pageHash = HashOf(hashes, Section::Pages);
+    std::ifstream input(file.Path(), std::ios::binary);
+    auto nextOffset = header.At(Section::Pages).offset;
+    std::uint64_t nextRecord = 0;
+    std::vector<std::uint32_t> words;
+    std::vector<std::uint32_t> edges;
+
+    PageSums sums;
+    sums.cuts.resize(cuts.size());
+    for (std::size_t firstGroup = 0; firstGroup < groups.size();) {
+        // Whole groups, about kVerifyBlockBytes of pages.
+        auto lastGroup = firstGroup;
+        std::uint64_t bytes = 0;
+        std::uint64_t records = 0;
+        while (lastGroup < groups.size() &&
+               (lastGroup == firstGroup || bytes < kVerifyBlockBytes)) {
+            const auto& group = groups[lastGroup++];
+            for (auto p = group.firstPage; p < group.firstPage + group.pageCount; ++p) {
+                if (pages[p].fileOffset != nextOffset + bytes ||
+                    pages[p].firstRecord != nextRecord + records) {
+                    throw std::runtime_error("LOD page verification: page " + std::to_string(p) +
+                                             " is not where the directory says");
                 }
-                sums.geometry +=
-                    GeometryHash(edge, types[i], position(from, 0u), position(from, 1u),
-                                 position(to, 0u), position(to, 1u));
-                for (std::size_t k = 0; k < cuts.size(); ++k) {
-                    if (RecordDrawn(record[1], record[2], record[3], cuts[k].level,
-                                    cuts[k].threshold)) {
-                        sums.cuts[k].Add(edge, 1u);
-                        drawn[k] = true;
+                bytes += pages[p].wordCount * 4u;
+                records += pages[p].recordCount;
+            }
+        }
+        words.resize(static_cast<std::size_t>(bytes / 4u));
+        input.seekg(static_cast<std::streamoff>(nextOffset));
+        input.read(reinterpret_cast<char*>(words.data()), static_cast<std::streamsize>(bytes));
+        if (!input) {
+            throw std::runtime_error("LOD page verification: could not read the pages");
+        }
+        pageHash.Update(words.data(), bytes);
+        edges.resize(static_cast<std::size_t>(records));
+        for (auto& edge : edges) {
+            edge = recordEdges.Next();
+        }
+
+        const auto blockOffset = nextOffset;
+        const auto blockRecord = nextRecord;
+        const auto tasks = SplitRange(firstGroup, lastGroup, 1u);
+        std::vector<PageSums> parts(tasks.size());
+        RunParallel(tasks.size(), [&](std::size_t task, unsigned) {
+            auto& part = parts[task];
+            part.cuts.resize(cuts.size());
+            std::vector<bool> drawn(cuts.size());
+            for (auto g = tasks[task].first; g < tasks[task].second; ++g) {
+                const auto& group = groups[g];
+                for (auto p = group.firstPage; p < group.firstPage + group.pageCount; ++p) {
+                    const auto& page = pages[p];
+                    const auto* pageWords = words.data() + (page.fileOffset - blockOffset) / 4u;
+                    const auto counts =
+                        std::uint32_t{page.recordCount} | (std::uint32_t{page.vertexCount} << 16u);
+                    if (pageWords[0] != counts) {
+                        throw std::runtime_error("LOD page verification: page " +
+                                                 std::to_string(p) + " does not match its entry");
+                    }
+                    const auto* vertices =
+                        pageWords + kPageHeaderWords + page.recordCount * kRecordWords;
+                    const auto* types = reinterpret_cast<const std::uint8_t*>(
+                        vertices + page.vertexCount * kVertexWords);
+                    const auto position = [&](std::uint32_t local, std::uint32_t axis) {
+                        return static_cast<std::int32_t>(vertices[local * kVertexWords + axis]);
+                    };
+                    std::fill(drawn.begin(), drawn.end(), false);
+                    for (std::uint32_t i = 0; i < page.recordCount; ++i) {
+                        const auto edge = edges[page.firstRecord - blockRecord + i];
+                        const auto* record = pageWords + kPageHeaderWords + i * kRecordWords;
+                        const auto from = record[0] & 0xffffu;
+                        const auto to = record[0] >> 16u;
+                        if (from >= page.vertexCount || to >= page.vertexCount) {
+                            throw std::runtime_error("LOD page verification failed: page " +
+                                                     std::to_string(p) +
+                                                     " points past its vertices");
+                        }
+                        part.geometry +=
+                            GeometryHash(edge, types[i], position(from, 0u), position(from, 1u),
+                                         position(to, 0u), position(to, 1u));
+                        for (std::size_t k = 0; k < cuts.size(); ++k) {
+                            if (RecordDrawn(record[1], record[2], record[3], cuts[k].level,
+                                            cuts[k].threshold)) {
+                                part.cuts[k].Add(edge, 1u);
+                                drawn[k] = true;
+                            }
+                        }
+                    }
+                    for (std::size_t k = 0; k < cuts.size(); ++k) {
+                        if (drawn[k] &&
+                            (!MayDraw(page, everywhere[k]) || !MayDraw(group, everywhere[k]))) {
+                            throw std::runtime_error(
+                                "LOD page verification failed: metadata of page " +
+                                std::to_string(p) + " hides a drawn record");
+                        }
                     }
                 }
             }
+        });
+        for (const auto& part : parts) {
             for (std::size_t k = 0; k < cuts.size(); ++k) {
-                if (drawn[k] && (!MayDraw(page, everywhere[k]) || !MayDraw(group, everywhere[k]))) {
-                    throw std::runtime_error("LOD page verification failed: metadata of page " +
-                                             std::to_string(p) + " hides a drawn record");
-                }
+                sums.cuts[k].hash += part.cuts[k].hash;
+                sums.cuts[k].count += part.cuts[k].count;
             }
+            sums.geometry += part.geometry;
         }
-        done += group.pageCount;
-        report.Report(2u, 3u, done, pages.size());
+        nextOffset += bytes;
+        nextRecord += records;
+        firstGroup = lastGroup;
+        report.Report(2u, 3u, firstGroup, groups.size());
+    }
+    if (nextOffset != header.At(Section::Pages).offset + header.At(Section::Pages).bytes ||
+        nextRecord != header.recordCount) {
+        throw std::runtime_error("LOD page verification: the directory does not cover the pages");
     }
     return sums;
 }
@@ -1002,22 +1246,35 @@ std::uint32_t Verify(const std::filesystem::path& path, const ReferenceCurve& cu
     StageProgress report(progress, BuildStage::Verify);
     const auto file = LodPageFile::Open(path);
     const auto& header = file->Header();
-    std::uint64_t total = 0;
-    for (const auto& section : header.sections) {
-        total += section.bytes;
-    }
-    std::uint64_t read = 0;
-    const auto onRead = [&](std::uint64_t bytes) {
-        read += bytes;
-        report.Report(0u, 3u, read, total);
+
+    // Sections the cut checks read anyway are hashed there; the rest is read back here, every
+    // section on its own thread.
+    const auto readLater = [](std::size_t s) {
+        return s == static_cast<std::size_t>(Section::EdgeBirth) ||
+               s == static_cast<std::size_t>(Section::EdgeDeath) ||
+               s == static_cast<std::size_t>(Section::RecordEdge) ||
+               s == static_cast<std::size_t>(Section::Pages);
     };
+    std::vector<std::size_t> sections;
+    std::uint64_t total = 0;
     for (std::size_t s = 0; s < kSectionCount; ++s) {
-        const auto& section = header.sections[s];
-        if (HashFileRange(path, section.offset, section.bytes, onRead) != header.sectionHashes[s]) {
-            throw std::runtime_error("LOD page verification failed: section " + std::to_string(s) +
-                                     " does not read back as written");
+        if (!readLater(s)) {
+            sections.push_back(s);
+            total += header.sections[s].bytes;
         }
     }
+    SectionHashes hashes{};
+    std::vector<std::uint64_t> readBack(kSectionCount, 0u);
+    std::atomic<std::uint64_t> readBytes{0};
+    RunParallel(
+        sections.size(),
+        [&](std::size_t task, unsigned) {
+            const auto& section = header.sections[sections[task]];
+            readBack[sections[task]] =
+                HashFileRange(path, section.offset, section.bytes,
+                              [&](std::uint64_t bytes) { readBytes += bytes; });
+        },
+        [&] { report.Report(0u, 3u, readBytes, total); });
 
     // Overview, regional and street-level views at 1 px, plus a coarse tolerance.
     std::vector<Cut> cuts;
@@ -1028,8 +1285,15 @@ std::uint32_t Verify(const std::filesystem::path& path, const ReferenceCurve& cu
         cuts.push_back({static_cast<std::uint32_t>(std::max(0, curve.LevelAt(zoom))),
                         EncodeErrorTolerance(pixels * curve.PixelSize(zoom))});
     }
-    const auto expected = DfsCuts(path, header, chunks, cuts, report);
-    const auto actual = PageCuts(*file, cuts, report);
+    const auto expected = DfsCuts(path, header, chunks, cuts, hashes, report);
+    const auto actual = PageCuts(*file, cuts, hashes, report);
+    for (std::size_t s = 0; s < kSectionCount; ++s) {
+        const auto hash = readLater(s) ? hashes[s].Finish() : readBack[s];
+        if (hash != header.sectionHashes[s]) {
+            throw std::runtime_error("LOD page verification failed: section " + std::to_string(s) +
+                                     " does not read back as written");
+        }
+    }
     if (actual.geometry != geometry) {
         throw std::runtime_error("LOD page verification failed: page vertices or styles differ "
                                  "from the records they were packed from");
@@ -1098,7 +1362,7 @@ std::uint64_t LodPageBuilder::EstimateMemoryBytes(std::uint64_t nodeCount,
     // and each edge's record cell (7 B per edge) and a sort buffer that packs the pages in
     // about kTargetPagePasses passes (about one record per edge).
     return nodeCount * 10u + edgeCount * (7u + sizeof(Record) / kTargetPagePasses) +
-           (512ull << 20u);
+           WorkerCount() * kWorkerBytes + (512ull << 20u);
 }
 
 std::uint64_t LodPageBuilder::EstimateDiskBytes(std::uint64_t nodeCount, std::uint64_t edgeCount) {
@@ -1199,7 +1463,7 @@ BuildResult LodPageBuilder::Build(const std::filesystem::path& graphPath,
         const auto fixed = nodes.Bytes() + m * 7u + plan.extras.size() * sizeof(Record) +
                            contexts.extra.size() * kExtraContextBytes +
                            header.recordCount / kPageRecordCapacity * sizeof(PageEntry) * 2u +
-                           (256ull << 20u);
+                           WorkerCount() * kWorkerBytes + (256ull << 20u);
         const auto sortBudget =
             std::max<std::uint64_t>(budget > fixed ? budget - fixed : 0u, 64ull << 20u);
         const auto partitions = PlanPartitions(plan, sortBudget);

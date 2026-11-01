@@ -8,7 +8,11 @@
 #include <charconv>
 #include <cmath>
 #include <cstring>
+#include <fstream>
+#include <future>
 #include <limits>
+#include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -19,99 +23,256 @@ namespace chmv::streaming::lod {
 namespace {
 
 constexpr std::uint32_t kNoEdge = 0xffffffffu;
-constexpr std::uint64_t kProgressStep = 1u << 20;
 
-// Whitespace-separated tokens with '#' line comments, read in large chunks. Same token rules
-// as CHLoader, so both readers see identical values.
-class SourceTokens {
+[[nodiscard]] bool IsSpace(char ch) {
+    return ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r';
+}
+
+// Calls visit(token, offset) for the tokens of text[begin, end) until it returns false. A '#'
+// at the start of a token comments out the rest of the line.
+template <typename Visit>
+void ScanTokens(const char* text, std::size_t begin, std::size_t end, Visit&& visit) {
+    auto i = begin;
+    while (i < end) {
+        if (IsSpace(text[i])) {
+            ++i;
+            continue;
+        }
+        if (text[i] == '#') {
+            while (i < end && text[i] != '\n') {
+                ++i;
+            }
+            continue;
+        }
+        const auto start = i;
+        while (i < end && !IsSpace(text[i])) {
+            ++i;
+        }
+        if (!visit(std::string_view(text + start, i - start), start)) {
+            return;
+        }
+    }
+}
+
+// Whitespace-separated tokens with '#' line comments, same token rules as CHLoader, so both
+// readers see identical values. The text is read in large blocks cut at line ends; worker
+// threads first count the tokens of their piece of a block and then parse them knowing their
+// position, so records may be laid out across lines in any way.
+class RecordParser {
 public:
-    explicit SourceTokens(const std::filesystem::path& path)
-        : name_(path.filename()), input_(path, std::ios::binary), buffer_(4u << 20u) {
+    explicit RecordParser(const std::filesystem::path& path)
+        : path_(path), input_(path, std::ios::binary), buffer_(2u * kBlockBytes) {
         if (!input_) {
             throw std::runtime_error("could not open " + path.string());
         }
     }
 
-    [[nodiscard]] std::string_view Next() {
-        for (;;) {
-            while (position_ < end_ && IsSpace(buffer_[position_])) {
-                ++position_;
+    RecordParser(const RecordParser&) = delete;
+    RecordParser& operator=(const RecordParser&) = delete;
+
+    // Converted to narrow text only when a message needs it.
+    [[nodiscard]] std::string Name() const { return path_.filename().string(); }
+
+    // Parses the next `count` records of `fields` tokens each, block by block: begin(first,
+    // records) on the calling thread, field(record, index, token) on worker threads for every
+    // token of those records, then end(first, records) on the calling thread.
+    template <typename Begin, typename Field, typename End>
+    void Parse(std::uint64_t count, std::uint32_t fields, Begin&& begin, Field&& field, End&& end) {
+        const auto needed = count * fields;
+        std::uint64_t done = 0;
+        while (done < needed) {
+            Fill();
+            const auto regionEnd = LinesEnd();
+            CountTokens(regionEnd);
+            std::uint64_t total = 0;
+            for (auto& piece : pieces_) {
+                piece.first = total;
+                total += piece.tokens;
             }
-            if (position_ == end_) {
-                if (!Refill(end_)) {
+            const auto take = total >= needed - done ? needed - done : total / fields * fields;
+            if (take == 0u) {
+                if (eof_) {
                     throw std::runtime_error(Name() + ": unexpected end of file");
+                }
+                FinishReadAhead();
+                if (!eof_ && start_ == 0u && size_ == buffer_.size()) {
+                    // A single token or comment longer than half the buffer.
+                    buffer_.resize(buffer_.size() * 2u);
                 }
                 continue;
             }
-            if (buffer_[position_] == '#') {
-                SkipLine();
-                continue;
-            }
-            break;
-        }
 
-        auto begin = position_;
-        for (;;) {
-            while (position_ < end_ && !IsSpace(buffer_[position_])) {
-                ++position_;
+            auto cut = regionEnd;
+            if (take < total) {
+                const auto last = std::find_if(pieces_.begin(), pieces_.end(), [&](const Piece& p) {
+                    return take < p.first + p.tokens;
+                });
+                cut = TokenStart(*last, take - last->first);
+                last->end = cut;
+                last->tokens = take - last->first;
+                pieces_.erase(last + 1, pieces_.end());
             }
-            if (position_ < end_ || end_ - begin == buffer_.size()) {
-                break;
-            }
-            const auto kept = end_ - begin;
-            const bool more = Refill(begin);
-            begin = 0;
-            position_ = kept;
-            if (!more) {
-                break;
-            }
+
+            const auto firstRecord = done / fields;
+            begin(firstRecord, take / fields);
+            const auto* text = buffer_.data();
+            RunParallel(pieces_.size(), [&](std::size_t task, unsigned) {
+                const auto& piece = pieces_[task];
+                auto record = (done + piece.first) / fields;
+                auto index = static_cast<std::uint32_t>((done + piece.first) % fields);
+                auto left = piece.tokens;
+                ScanTokens(text, piece.begin, piece.end, [&](std::string_view token, std::size_t) {
+                    field(record, index, token);
+                    if (++index == fields) {
+                        index = 0;
+                        ++record;
+                    }
+                    return --left != 0u;
+                });
+            });
+            end(firstRecord, take / fields);
+            done += take;
+            start_ = cut;
         }
-        return {buffer_.data() + begin, position_ - begin};
     }
-
-    // Converted to narrow text only when a message needs it.
-    [[nodiscard]] std::string Name() const { return name_.string(); }
 
 private:
-    static bool IsSpace(char ch) { return ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r'; }
+    static constexpr std::size_t kBlockBytes = 32u << 20u;
 
-    // Keeps [keepFrom, end_) at the front of the buffer and appends fresh input after it.
-    bool Refill(std::size_t keepFrom) {
-        const auto kept = end_ - keepFrom;
-        if (kept != 0u && keepFrom != 0u) {
-            std::memmove(buffer_.data(), buffer_.data() + keepFrom, kept);
+    struct Piece {
+        std::size_t begin = 0;
+        std::size_t end = 0;
+        std::uint64_t tokens = 0;
+        std::uint64_t first = 0;
+    };
+
+    // Moves the unparsed rest to the front, tops the first half of the buffer up from the file
+    // and starts reading the next block behind it while this one is parsed.
+    void Fill() {
+        FinishReadAhead();
+        if (start_ != 0u) {
+            std::memmove(buffer_.data(), buffer_.data() + start_, size_ - start_);
+            size_ -= start_;
+            start_ = 0;
         }
-        input_.read(buffer_.data() + kept, static_cast<std::streamsize>(buffer_.size() - kept));
-        const auto got = static_cast<std::size_t>(input_.gcount());
-        end_ = kept + got;
-        position_ = 0;
-        return got != 0u;
+        const auto block = buffer_.size() / 2u;
+        while (!eof_ && size_ < block) {
+            Received(Read(size_, block - size_), block - size_);
+        }
+        if (!eof_) {
+            readAheadBytes_ = buffer_.size() - size_;
+            readAhead_ =
+                std::async(std::launch::async,
+                           [this, at = size_, bytes = readAheadBytes_] { return Read(at, bytes); });
+        }
     }
 
-    void SkipLine() {
-        for (;;) {
-            while (position_ < end_ && buffer_[position_] != '\n') {
-                ++position_;
-            }
-            if (position_ < end_ || !Refill(end_)) {
-                return;
-            }
+    void FinishReadAhead() {
+        if (readAhead_.valid()) {
+            Received(readAhead_.get(), readAheadBytes_);
         }
     }
 
-    std::filesystem::path name_;
+    // Only touches the stream and buffer_[at, at + bytes); may run on another thread.
+    [[nodiscard]] std::size_t Read(std::size_t at, std::size_t bytes) {
+        input_.read(buffer_.data() + at, static_cast<std::streamsize>(bytes));
+        if (input_.bad()) {
+            throw std::runtime_error("read failed: " + Name());
+        }
+        return static_cast<std::size_t>(input_.gcount());
+    }
+
+    void Received(std::size_t got, std::size_t asked) {
+        size_ += got;
+        eof_ = got < asked;
+    }
+
+    // End of the last complete line in the buffer (all of it at the end of the file). Without
+    // any line end, the start of the last token or comment, which may go on in the next block.
+    [[nodiscard]] std::size_t LinesEnd() const {
+        if (eof_) {
+            return size_;
+        }
+        auto end = size_;
+        while (end > start_ && buffer_[end - 1u] != '\n') {
+            --end;
+        }
+        if (end != start_) {
+            return end;
+        }
+        auto open = start_;
+        auto i = start_;
+        while (i < size_) {
+            if (IsSpace(buffer_[i])) {
+                open = ++i;
+                continue;
+            }
+            const auto comment = buffer_[i] == '#';
+            while (i < size_ && (comment ? buffer_[i] != '\n' : !IsSpace(buffer_[i]))) {
+                ++i;
+            }
+        }
+        return open;
+    }
+
+    // Splits [start_, end) into pieces at line ends and counts their tokens in parallel.
+    void CountTokens(std::size_t end) {
+        pieces_.clear();
+        const auto length = end - start_;
+        const auto count =
+            std::max<std::size_t>(1u, std::min<std::size_t>(WorkerCount() * 2u, length / 4096u));
+        auto from = start_;
+        for (std::size_t i = 1; i <= count && from < end; ++i) {
+            auto to = i == count ? end : start_ + length * i / count;
+            while (to < end && buffer_[to - 1u] != '\n') {
+                ++to;
+            }
+            if (to > from) {
+                pieces_.push_back({from, to, 0u, 0u});
+                from = to;
+            }
+        }
+        const auto* text = buffer_.data();
+        RunParallel(pieces_.size(), [&](std::size_t task, unsigned) {
+            auto& piece = pieces_[task];
+            ScanTokens(text, piece.begin, piece.end, [&](std::string_view, std::size_t) {
+                ++piece.tokens;
+                return true;
+            });
+        });
+    }
+
+    [[nodiscard]] std::size_t TokenStart(const Piece& piece, std::uint64_t index) const {
+        auto at = piece.end;
+        ScanTokens(buffer_.data(), piece.begin, piece.end,
+                   [&](std::string_view, std::size_t offset) {
+                       if (index-- == 0u) {
+                           at = offset;
+                           return false;
+                       }
+                       return true;
+                   });
+        return at;
+    }
+
+    std::filesystem::path path_;
     std::ifstream input_;
     std::vector<char> buffer_;
-    std::size_t position_ = 0;
-    std::size_t end_ = 0;
+    std::size_t start_ = 0; // [start_, size_) is read but not parsed yet
+    std::size_t size_ = 0;
+    bool eof_ = false;
+    std::vector<Piece> pieces_;
+    std::size_t readAheadBytes_ = 0;
+    // Last, so a read still running finishes before the buffer goes away.
+    std::future<std::size_t> readAhead_;
 };
 
-[[noreturn]] void BadToken(const SourceTokens& tokens, std::string_view token, const char* what) {
+[[noreturn]] void BadToken(const RecordParser& tokens, std::string_view token, const char* what) {
     throw std::runtime_error(tokens.Name() + ": invalid " + what + " '" + std::string(token) + "'");
 }
 
 template <typename T>
-[[nodiscard]] T ParseNumber(const SourceTokens& tokens, std::string_view token, const char* what) {
+[[nodiscard]] T ParseNumber(const RecordParser& tokens, std::string_view token, const char* what) {
     T value{};
     const auto* end = token.data() + token.size();
     const auto [ptr, ec] = std::from_chars(token.data(), end, value);
@@ -122,7 +283,7 @@ template <typename T>
 }
 
 template <typename T>
-[[nodiscard]] T ParseRanged(const SourceTokens& tokens, std::string_view token, const char* what) {
+[[nodiscard]] T ParseRanged(const RecordParser& tokens, std::string_view token, const char* what) {
     const auto value = ParseNumber<std::int64_t>(tokens, token, what);
     if (value < static_cast<std::int64_t>(std::numeric_limits<T>::min()) ||
         value > static_cast<std::int64_t>(std::numeric_limits<T>::max())) {
@@ -132,7 +293,7 @@ template <typename T>
 }
 
 // Decimal degrees with at most seven significant decimals, as exact 1e-7 integers.
-[[nodiscard]] std::int32_t ParseDegrees(const SourceTokens& tokens, std::string_view token) {
+[[nodiscard]] std::int32_t ParseDegrees(const RecordParser& tokens, std::string_view token) {
     std::size_t i = 0;
     bool negative = false;
     if (i < token.size() && (token[i] == '-' || token[i] == '+')) {
@@ -178,7 +339,7 @@ template <typename T>
     return static_cast<std::int32_t>(negative ? -value : value);
 }
 
-[[nodiscard]] std::uint32_t ParseWeight(const SourceTokens& tokens, std::string_view token) {
+[[nodiscard]] std::uint32_t ParseWeight(const RecordParser& tokens, std::string_view token) {
     const auto value = ParseNumber<double>(tokens, token, "edge weight");
     if (!(value >= 0.0) || value > 4294967295.0 || std::floor(value) != value) {
         throw std::runtime_error(tokens.Name() + ": edge weight '" + std::string(token) +
@@ -192,13 +353,6 @@ void WriteSection(LodPageOutput& output, const SectionEntry& section, StreamHash
                   const std::vector<T>& values) {
     output.WriteAt(section.offset, values.data(), values.size() * sizeof(T));
     hash.Update(values.data(), values.size() * sizeof(T));
-}
-
-void Report(const LodPageBuilder::ProgressCallback& progress, BuildStage stage,
-            std::uint64_t current, std::uint64_t total) {
-    if (progress && (current % kProgressStep == 0u || current == total)) {
-        progress({stage, current, total});
-    }
 }
 
 void PlaceCHSections(FileHeader& header, std::uint64_t& offset) {
@@ -242,9 +396,21 @@ LodPageNodes ReadLodPageSource(const std::filesystem::path& graphPath,
                                std::uint64_t& nextSectionOffset,
                                const SourceCountsCallback& checkCounts,
                                const LodPageBuilder::ProgressCallback& progress) {
-    SourceTokens graph(graphPath);
-    const auto nodeCount = ParseNumber<std::uint64_t>(graph, graph.Next(), "node count");
-    const auto edgeCount = ParseNumber<std::uint64_t>(graph, graph.Next(), "edge count");
+    // Freed before the ranges file is read.
+    std::optional<RecordParser> graphFile(std::in_place, graphPath);
+    auto& graph = *graphFile;
+    std::uint64_t nodeCount = 0;
+    std::uint64_t edgeCount = 0;
+    graph.Parse(
+        1u, 2u, [](std::uint64_t, std::uint64_t) {},
+        [&](std::uint64_t, std::uint32_t field, std::string_view token) {
+            if (field == 0u) {
+                nodeCount = ParseNumber<std::uint64_t>(graph, token, "node count");
+            } else {
+                edgeCount = ParseNumber<std::uint64_t>(graph, token, "edge count");
+            }
+        },
+        [](std::uint64_t, std::uint64_t) {});
     if (nodeCount == 0u || nodeCount >= kNoEdge || edgeCount >= kNoEdge) {
         throw std::runtime_error(graph.Name() + ": node/edge counts must fit 32-bit ids");
     }
@@ -264,6 +430,11 @@ LodPageNodes ReadLodPageSource(const std::filesystem::path& graphPath,
     nodes.edgeCount = edgeCount;
     const auto n = static_cast<std::size_t>(nodeCount);
     const auto m = static_cast<std::size_t>(edgeCount);
+    const auto report = [&](BuildStage stage, std::uint64_t current, std::uint64_t total) {
+        if (progress) {
+            progress({stage, current, total});
+        }
+    };
 
     // Latitude goes to y and longitude to x; both become projected fixed point below.
     nodes.x.resize(n);
@@ -280,29 +451,69 @@ LodPageNodes ReadLodPageSource(const std::filesystem::path& graphPath,
                                        HashOf(hashes, Section::NodeElevation));
         ColumnWriter<std::uint32_t> levels(output, header.At(Section::NodeLevel),
                                            HashOf(hashes, Section::NodeLevel));
-        for (std::size_t i = 0; i < n; ++i) {
-            const auto id = ParseNumber<std::uint64_t>(graph, graph.Next(), "node id");
-            if (id != i) {
-                throw std::runtime_error(graph.Name() +
-                                         ": node ids must be listed as 0..n-1 in order");
-            }
-            osmIds.Push(ParseNumber<std::uint64_t>(graph, graph.Next(), "OSM id"));
-            const auto latitude = ParseDegrees(graph, graph.Next());
-            const auto longitude = ParseDegrees(graph, graph.Next());
-            latitudes.Push(latitude);
-            longitudes.Push(longitude);
-            nodes.y[i] = latitude;
-            nodes.x[i] = longitude;
-            elevations.Push(ParseNumber<float>(graph, graph.Next(), "elevation"));
-            const auto level = ParseNumber<std::uint32_t>(graph, graph.Next(), "node level");
-            if (level > 0xffffu) {
-                throw std::runtime_error(graph.Name() + ": node level above 65535");
-            }
-            levels.Push(level);
-            nodes.level[i] = static_cast<std::uint16_t>(level);
-            nodes.maxNodeLevel = std::max(nodes.maxNodeLevel, level);
-            Report(progress, BuildStage::ReadNodes, i + 1u, nodeCount);
-        }
+        std::vector<std::uint64_t> osm;
+        std::vector<float> elevation;
+        std::vector<std::uint32_t> level;
+        std::uint64_t base = 0;
+        graph.Parse(
+            nodeCount, 6u,
+            [&](std::uint64_t first, std::uint64_t records) {
+                base = first;
+                osm.resize(static_cast<std::size_t>(records));
+                elevation.resize(static_cast<std::size_t>(records));
+                level.resize(static_cast<std::size_t>(records));
+            },
+            [&](std::uint64_t record, std::uint32_t field, std::string_view token) {
+                const auto i = static_cast<std::size_t>(record);
+                const auto local = static_cast<std::size_t>(record - base);
+                switch (field) {
+                case 0u:
+                    if (ParseNumber<std::uint64_t>(graph, token, "node id") != record) {
+                        throw std::runtime_error(graph.Name() +
+                                                 ": node ids must be listed as 0..n-1 in order");
+                    }
+                    break;
+                case 1u:
+                    osm[local] = ParseNumber<std::uint64_t>(graph, token, "OSM id");
+                    break;
+                case 2u:
+                    nodes.y[i] = ParseDegrees(graph, token);
+                    break;
+                case 3u:
+                    nodes.x[i] = ParseDegrees(graph, token);
+                    break;
+                case 4u:
+                    elevation[local] = ParseNumber<float>(graph, token, "elevation");
+                    break;
+                default:
+                    level[local] = ParseNumber<std::uint32_t>(graph, token, "node level");
+                    if (level[local] > 0xffffu) {
+                        throw std::runtime_error(graph.Name() + ": node level above 65535");
+                    }
+                    nodes.level[i] = static_cast<std::uint16_t>(level[local]);
+                    break;
+                }
+            },
+            [&](std::uint64_t first, std::uint64_t records) {
+                const auto from = static_cast<std::size_t>(first);
+                const auto count = static_cast<std::size_t>(records);
+                RunTogether({
+                    [&] { osmIds.Append(osm); },
+                    [&] {
+                        latitudes.Append(
+                            std::span<const std::int32_t>(nodes.y).subspan(from, count));
+                    },
+                    [&] {
+                        longitudes.Append(
+                            std::span<const std::int32_t>(nodes.x).subspan(from, count));
+                    },
+                    [&] { elevations.Append(elevation); },
+                    [&] { levels.Append(level); },
+                });
+                nodes.maxNodeLevel =
+                    std::max(nodes.maxNodeLevel, *std::max_element(level.begin(), level.end()));
+                report(BuildStage::ReadNodes, first + records, nodeCount);
+            });
         osmIds.Flush();
         latitudes.Flush();
         longitudes.Flush();
@@ -325,34 +536,83 @@ LodPageNodes ReadLodPageSource(const std::filesystem::path& graphPath,
                                               HashOf(hashes, Section::EdgeChildA));
         ColumnWriter<std::uint32_t> childrenB(output, header.At(Section::EdgeChildB),
                                               HashOf(hashes, Section::EdgeChildB));
-        const auto readChild = [&]() {
-            const auto value = ParseNumber<std::int64_t>(graph, graph.Next(), "child edge");
+        std::vector<std::uint32_t> source;
+        std::vector<std::uint32_t> target;
+        std::vector<std::uint32_t> weight;
+        std::vector<std::int16_t> type;
+        std::vector<std::int16_t> maxSpeed;
+        std::vector<std::uint32_t> childA;
+        std::vector<std::uint32_t> childB;
+        std::uint64_t base = 0;
+        const auto parseEndpoint = [&](std::string_view token, const char* what) {
+            const auto node = ParseNumber<std::uint32_t>(graph, token, what);
+            if (node >= nodeCount) {
+                throw std::runtime_error(graph.Name() + ": edge endpoint out of range");
+            }
+            return node;
+        };
+        const auto parseChild = [&](std::string_view token) {
+            const auto value = ParseNumber<std::int64_t>(graph, token, "child edge");
             if (value >= static_cast<std::int64_t>(edgeCount)) {
                 throw std::runtime_error(graph.Name() + ": child edge out of range");
             }
             return value < 0 ? kNoEdge : static_cast<std::uint32_t>(value);
         };
-        for (std::size_t e = 0; e < m; ++e) {
-            const auto source = ParseNumber<std::uint32_t>(graph, graph.Next(), "edge source");
-            const auto target = ParseNumber<std::uint32_t>(graph, graph.Next(), "edge target");
-            if (source >= nodeCount || target >= nodeCount) {
-                throw std::runtime_error(graph.Name() + ": edge endpoint out of range");
-            }
-            sources.Push(source);
-            targets.Push(target);
-            weights.Push(ParseWeight(graph, graph.Next()));
-            types.Push(ParseRanged<std::int16_t>(graph, graph.Next(), "edge type"));
-            maxSpeeds.Push(ParseRanged<std::int16_t>(graph, graph.Next(), "max speed"));
-            const auto childA = readChild();
-            const auto childB = readChild();
-            if ((childA == kNoEdge) != (childB == kNoEdge)) {
-                throw std::runtime_error(graph.Name() + ": edge " + std::to_string(e) +
-                                         " has only one child");
-            }
-            childrenA.Push(childA);
-            childrenB.Push(childB);
-            Report(progress, BuildStage::ReadEdges, e + 1u, edgeCount);
-        }
+        graph.Parse(
+            edgeCount, 7u,
+            [&](std::uint64_t first, std::uint64_t records) {
+                base = first;
+                const auto count = static_cast<std::size_t>(records);
+                for (auto* column : {&source, &target, &weight, &childA, &childB}) {
+                    column->resize(count);
+                }
+                type.resize(count);
+                maxSpeed.resize(count);
+            },
+            [&](std::uint64_t record, std::uint32_t field, std::string_view token) {
+                const auto local = static_cast<std::size_t>(record - base);
+                switch (field) {
+                case 0u:
+                    source[local] = parseEndpoint(token, "edge source");
+                    break;
+                case 1u:
+                    target[local] = parseEndpoint(token, "edge target");
+                    break;
+                case 2u:
+                    weight[local] = ParseWeight(graph, token);
+                    break;
+                case 3u:
+                    type[local] = ParseRanged<std::int16_t>(graph, token, "edge type");
+                    break;
+                case 4u:
+                    maxSpeed[local] = ParseRanged<std::int16_t>(graph, token, "max speed");
+                    break;
+                case 5u:
+                    childA[local] = parseChild(token);
+                    break;
+                default:
+                    childB[local] = parseChild(token);
+                    break;
+                }
+            },
+            [&](std::uint64_t first, std::uint64_t records) {
+                for (std::size_t i = 0; i < childA.size(); ++i) {
+                    if ((childA[i] == kNoEdge) != (childB[i] == kNoEdge)) {
+                        throw std::runtime_error(graph.Name() + ": edge " +
+                                                 std::to_string(first + i) + " has only one child");
+                    }
+                }
+                RunTogether({
+                    [&] { sources.Append(source); },
+                    [&] { targets.Append(target); },
+                    [&] { weights.Append(weight); },
+                    [&] { types.Append(type); },
+                    [&] { maxSpeeds.Append(maxSpeed); },
+                    [&] { childrenA.Append(childA); },
+                    [&] { childrenB.Append(childB); },
+                });
+                report(BuildStage::ReadEdges, first + records, edgeCount);
+            });
         sources.Flush();
         targets.Flush();
         weights.Flush();
@@ -361,21 +621,46 @@ LodPageNodes ReadLodPageSource(const std::filesystem::path& graphPath,
         childrenA.Flush();
         childrenB.Flush();
     }
+    graphFile.reset();
 
     {
-        // The ranges file may list edges in any order, so both columns are assembled in memory.
+        // The ranges file may list edges in any order, so both columns are assembled in memory;
+        // entries are applied in file order, a later one for the same edge wins.
         std::vector<std::int16_t> birth(m, -1);
         std::vector<std::int16_t> death(m, -1);
-        SourceTokens ranges(rangesPath);
-        for (std::size_t i = 0; i < m; ++i) {
-            const auto edge = ParseNumber<std::uint32_t>(ranges, ranges.Next(), "range edge id");
-            if (edge >= edgeCount) {
-                throw std::runtime_error(ranges.Name() + ": range edge id out of range");
-            }
-            birth[edge] = ParseRanged<std::int16_t>(ranges, ranges.Next(), "birth");
-            death[edge] = ParseRanged<std::int16_t>(ranges, ranges.Next(), "death");
-            Report(progress, BuildStage::ReadRanges, i + 1u, edgeCount);
-        }
+        RecordParser ranges(rangesPath);
+        std::vector<std::uint32_t> edge;
+        std::vector<std::int16_t> born;
+        std::vector<std::int16_t> died;
+        std::uint64_t base = 0;
+        ranges.Parse(
+            edgeCount, 3u,
+            [&](std::uint64_t first, std::uint64_t records) {
+                base = first;
+                edge.resize(static_cast<std::size_t>(records));
+                born.resize(static_cast<std::size_t>(records));
+                died.resize(static_cast<std::size_t>(records));
+            },
+            [&](std::uint64_t record, std::uint32_t field, std::string_view token) {
+                const auto local = static_cast<std::size_t>(record - base);
+                if (field == 0u) {
+                    edge[local] = ParseNumber<std::uint32_t>(ranges, token, "range edge id");
+                    if (edge[local] >= edgeCount) {
+                        throw std::runtime_error(ranges.Name() + ": range edge id out of range");
+                    }
+                } else if (field == 1u) {
+                    born[local] = ParseRanged<std::int16_t>(ranges, token, "birth");
+                } else {
+                    died[local] = ParseRanged<std::int16_t>(ranges, token, "death");
+                }
+            },
+            [&](std::uint64_t first, std::uint64_t records) {
+                for (std::size_t i = 0; i < edge.size(); ++i) {
+                    birth[edge[i]] = born[i];
+                    death[edge[i]] = died[i];
+                }
+                report(BuildStage::ReadRanges, first + records, edgeCount);
+            });
         WriteSection(output, header.At(Section::EdgeBirth), HashOf(hashes, Section::EdgeBirth),
                      birth);
         WriteSection(output, header.At(Section::EdgeDeath), HashOf(hashes, Section::EdgeDeath),
@@ -385,23 +670,37 @@ LodPageNodes ReadLodPageSource(const std::filesystem::path& graphPath,
         }
     }
 
-    auto minLatitude = std::numeric_limits<std::int32_t>::max();
-    auto maxLatitude = std::numeric_limits<std::int32_t>::min();
-    auto minLongitude = minLatitude;
-    auto maxLongitude = maxLatitude;
-    for (std::size_t i = 0; i < n; ++i) {
-        minLatitude = std::min(minLatitude, nodes.y[i]);
-        maxLatitude = std::max(maxLatitude, nodes.y[i]);
-        minLongitude = std::min(minLongitude, nodes.x[i]);
-        maxLongitude = std::max(maxLongitude, nodes.x[i]);
+    struct Bounds {
+        std::int32_t minLatitude = std::numeric_limits<std::int32_t>::max();
+        std::int32_t maxLatitude = std::numeric_limits<std::int32_t>::min();
+        std::int32_t minLongitude = std::numeric_limits<std::int32_t>::max();
+        std::int32_t maxLongitude = std::numeric_limits<std::int32_t>::min();
+    };
+    const auto pieces = SplitRange(0u, nodeCount, 1u << 16u);
+    std::vector<Bounds> pieceBounds(pieces.size());
+    RunParallel(pieces.size(), [&](std::size_t task, unsigned) {
+        auto& bounds = pieceBounds[task];
+        for (auto i = pieces[task].first; i < pieces[task].second; ++i) {
+            bounds.minLatitude = std::min(bounds.minLatitude, nodes.y[i]);
+            bounds.maxLatitude = std::max(bounds.maxLatitude, nodes.y[i]);
+            bounds.minLongitude = std::min(bounds.minLongitude, nodes.x[i]);
+            bounds.maxLongitude = std::max(bounds.maxLongitude, nodes.x[i]);
+        }
+    });
+    Bounds bounds;
+    for (const auto& piece : pieceBounds) {
+        bounds.minLatitude = std::min(bounds.minLatitude, piece.minLatitude);
+        bounds.maxLatitude = std::max(bounds.maxLatitude, piece.maxLatitude);
+        bounds.minLongitude = std::min(bounds.minLongitude, piece.minLongitude);
+        bounds.maxLongitude = std::max(bounds.maxLongitude, piece.maxLongitude);
     }
 
     // Same projection as the full-resident loader: ComputeCHProjection only looks at bounds.
     std::array<data::CHNode, 2> corners{};
-    corners[0].latitude = minLatitude / kDegreeScale;
-    corners[0].longitude = minLongitude / kDegreeScale;
-    corners[1].latitude = maxLatitude / kDegreeScale;
-    corners[1].longitude = maxLongitude / kDegreeScale;
+    corners[0].latitude = bounds.minLatitude / kDegreeScale;
+    corners[0].longitude = bounds.minLongitude / kDegreeScale;
+    corners[1].latitude = bounds.maxLatitude / kDegreeScale;
+    corners[1].longitude = bounds.maxLongitude / kDegreeScale;
     const auto projection = data::ComputeCHProjection(corners);
     header.centerLatitude = projection.centerLatitude;
     header.centerLongitude = projection.centerLongitude;
@@ -412,17 +711,20 @@ LodPageNodes ReadLodPageSource(const std::filesystem::path& graphPath,
     header.minLongitude = corners[0].longitude;
     header.maxLongitude = corners[1].longitude;
 
-    constexpr double kLimit = 1073741823.0;
-    for (std::size_t i = 0; i < n; ++i) {
-        const auto point = projection.Project(nodes.y[i] / kDegreeScale, nodes.x[i] / kDegreeScale);
-        const auto x = std::round(point.x * kFixedCoordinateScale);
-        const auto y = std::round(point.y * kFixedCoordinateScale);
-        if (std::abs(x) > kLimit || std::abs(y) > kLimit) {
-            throw std::runtime_error("projected coordinate outside the fixed-point range");
+    RunParallel(pieces.size(), [&](std::size_t task, unsigned) {
+        constexpr double kLimit = 1073741823.0;
+        for (auto i = pieces[task].first; i < pieces[task].second; ++i) {
+            const auto point =
+                projection.Project(nodes.y[i] / kDegreeScale, nodes.x[i] / kDegreeScale);
+            const auto x = std::round(point.x * kFixedCoordinateScale);
+            const auto y = std::round(point.y * kFixedCoordinateScale);
+            if (std::abs(x) > kLimit || std::abs(y) > kLimit) {
+                throw std::runtime_error("projected coordinate outside the fixed-point range");
+            }
+            nodes.x[i] = static_cast<std::int32_t>(x);
+            nodes.y[i] = static_cast<std::int32_t>(y);
         }
-        nodes.x[i] = static_cast<std::int32_t>(x);
-        nodes.y[i] = static_cast<std::int32_t>(y);
-    }
+    });
     if (nodes.maxRangeLevel > kMaxStoredLevel) {
         throw std::runtime_error("CH level above 65534 is not supported");
     }

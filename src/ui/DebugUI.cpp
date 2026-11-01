@@ -970,8 +970,8 @@ DebugUIActions DebugUI::Draw(
         }
         if (ImGui::Button("Load dataset")) {
             actions.datasetRequest = selectedDataset_;
-            actions.datasetStreaming = datasetRuntime_ == 1;
-            actions.datasetLodPages = datasetRuntime_ == 2;
+            actions.datasetStreaming = false;
+            actions.datasetLodPages = datasetRuntime_ == 1;
             actions.lodPagesKeepInRam = lodPagesKeepInRam_;
         }
         if (datasetLoad.Active()) {
@@ -984,14 +984,9 @@ DebugUIActions DebugUI::Draw(
         datasetCatalog.Refresh();
     }
 
-    ImGui::Combo("Runtime", &datasetRuntime_,
-                 "Full resident (RAM + GPU)\0Virtual Map v8 (out-of-core)\0LOD pages (new)\0");
+    ImGui::Combo("Runtime", &datasetRuntime_, "Full resident (RAM + GPU)\0LOD pages\0");
     if (datasetRuntime_ == 0) {
         ImGui::TextDisabled("Full binary graph resident in RAM + GPU, no runtime streaming.");
-    } else if (datasetRuntime_ == 1) {
-        ImGui::TextDisabled(
-            "Virtual Map; prefers RAM-backed streaming when .chbin fits RAM, otherwise "
-            "SSD-backed.");
     } else {
         ImGui::Checkbox("Keep page file in RAM if it fits", &lodPagesKeepInRam_);
         ImGui::TextDisabled(

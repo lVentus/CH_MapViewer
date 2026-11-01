@@ -14,7 +14,10 @@ namespace {
 
 constexpr std::uint32_t kNoEdge = 0xffffffffu;
 constexpr std::size_t kChunkRecords = 8192;
-constexpr std::uint64_t kProgressMask = (1u << 20u) - 1u;
+// Smallest edge range one thread scans on its own, and edges per round of a scan whose results
+// are kept in edge order.
+constexpr std::uint64_t kMinScanEdges = 1u << 16u;
+constexpr std::uint64_t kWaveEdges = 1u << 23u;
 
 struct SplitPair {
     std::uint32_t edge = 0;
@@ -81,7 +84,8 @@ struct OpenSplit {
     return std::hypot(px - (ax + t * dx), py - (ay + t * dy)) / kFixedCoordinateScale;
 }
 
-// Merges the per-pass split files (each sorted by edge) back into edge order.
+// The per-pass split files (each sorted by edge) and the resolved open splits, handed out
+// range by range in edge order.
 class SplitStreams {
 public:
     void Add(const std::filesystem::path& path, std::uint64_t count) {
@@ -92,20 +96,24 @@ public:
     }
     void AddResolved(std::vector<SplitPair> pairs) { resolved_ = std::move(pairs); }
 
-    [[nodiscard]] std::uint32_t Take(std::uint32_t edge) {
+    // Writes the bypassed node of every shortcut in [begin, end) to split[edge - begin].
+    void Take(std::uint64_t begin, std::uint64_t end, std::span<std::uint32_t> split) {
+        const auto place = [&](const SplitPair& pair) {
+            if (pair.edge < begin) {
+                throw std::logic_error("LOD page split nodes out of order");
+            }
+            split[pair.edge - begin] = pair.node;
+        };
         for (auto& stream : streams_) {
-            if (stream.remaining != 0u && stream.head.edge == edge) {
-                const auto node = stream.head.node;
+            while (stream.remaining != 0u && stream.head.edge < end) {
+                place(stream.head);
                 --stream.remaining;
                 Advance(stream);
-                return node;
             }
         }
-        if (next_ < resolved_.size() && resolved_[next_].edge == edge) {
-            return resolved_[next_++].node;
+        for (; next_ < resolved_.size() && resolved_[next_].edge < end; ++next_) {
+            place(resolved_[next_]);
         }
-        throw std::logic_error("LOD page build lost the split node of shortcut " +
-                               std::to_string(edge));
     }
 
 private:
@@ -244,8 +252,10 @@ EdgeMask BuildLevelChunks(const std::filesystem::path& file, const FileHeader& h
     StageProgress report(progress, BuildStage::ResolveShortcuts);
 
     // Endpoints of one range of child ids are held in memory per pass: 8 bytes per edge.
+    // Readers and scan buffers of the worker threads.
     const auto reserved = nodes.Bytes() + m / 8u +
-                          LevelChunks::BufferBytes(nodes.maxNodeLevel + 1u) + (256ull << 20u);
+                          LevelChunks::BufferBytes(nodes.maxNodeLevel + 1u) +
+                          WorkerCount() * (8ull << 20u) + (256ull << 20u);
     const auto available = memoryBudget > reserved ? memoryBudget - reserved : 0u;
     const auto sliceEdges = std::max<std::uint64_t>(std::min<std::uint64_t>(available / 8u, m),
                                                     std::min<std::uint64_t>(m, 1u << 20u));
@@ -255,6 +265,10 @@ EdgeMask BuildLevelChunks(const std::filesystem::path& file, const FileHeader& h
     std::vector<TemporaryFile> splitFiles;
     std::vector<std::uint64_t> splitCounts;
     std::vector<OpenSplit> open;
+    ColumnReaders<std::uint32_t> sourceReaders(file, sourceSection);
+    ColumnReaders<std::uint32_t> targetReaders(file, targetSection);
+    ColumnReaders<std::uint32_t> childAReaders(file, header.At(Section::EdgeChildA));
+    report.Report(0u, passes + 2u, 0u, m);
     for (std::uint32_t pass = 0; pass < passes; ++pass) {
         const auto first = std::uint64_t{pass} * sliceEdges;
         const auto count = std::min(sliceEdges, m - first);
@@ -267,26 +281,37 @@ EdgeMask BuildLevelChunks(const std::filesystem::path& file, const FileHeader& h
         splitPath += ".split" + std::to_string(pass);
         splitFiles.emplace_back(std::move(splitPath));
         ScratchWriter<SplitPair> pairs(splitFiles.back().Path());
-        ValueReader<std::uint32_t> sources(file, sourceSection);
-        ValueReader<std::uint32_t> targets(file, targetSection);
-        ValueReader<std::uint32_t> childrenA(file, header.At(Section::EdgeChildA));
-        for (std::uint64_t e = 0; e < m; ++e) {
-            const auto from = sources.Next();
-            const auto to = targets.Next();
-            const auto childA = childrenA.Next();
-            if (childA != kNoEdge && childA >= first && childA < first + count) {
-                const auto a0 = sliceSource[childA - first];
-                const auto a1 = sliceTarget[childA - first];
-                const auto split = OtherEndpoint(a0, a1, from, to);
-                if (split != kNoEdge) {
-                    pairs.Push({static_cast<std::uint32_t>(e), split});
-                } else {
-                    open.push_back({static_cast<std::uint32_t>(e), 0u, from, to, a0, a1});
+        for (std::uint64_t wave = 0; wave < m; wave += kWaveEdges) {
+            const auto waveEnd = std::min(m, wave + kWaveEdges);
+            const auto scans = SplitRange(wave, waveEnd, kMinScanEdges);
+            std::vector<std::vector<SplitPair>> found(scans.size());
+            std::vector<std::vector<OpenSplit>> unresolved(scans.size());
+            RunParallel(scans.size(), [&](std::size_t task, unsigned worker) {
+                const auto range = scans[task];
+                auto& sources = sourceReaders.At(worker, range);
+                auto& targets = targetReaders.At(worker, range);
+                auto& childrenA = childAReaders.At(worker, range);
+                for (auto e = range.first; e < range.second; ++e) {
+                    const auto from = sources.Next();
+                    const auto to = targets.Next();
+                    const auto childA = childrenA.Next();
+                    if (childA != kNoEdge && childA >= first && childA < first + count) {
+                        const auto a0 = sliceSource[childA - first];
+                        const auto a1 = sliceTarget[childA - first];
+                        const auto edge = static_cast<std::uint32_t>(e);
+                        if (const auto split = OtherEndpoint(a0, a1, from, to); split != kNoEdge) {
+                            found[task].push_back({edge, split});
+                        } else {
+                            unresolved[task].push_back({edge, 0u, from, to, a0, a1});
+                        }
+                    }
                 }
+            });
+            for (std::size_t task = 0; task < scans.size(); ++task) {
+                pairs.Append(found[task]);
+                open.insert(open.end(), unresolved[task].begin(), unresolved[task].end());
             }
-            if ((e & kProgressMask) == 0u) {
-                report.Report(pass, passes + 2u, e, m);
-            }
+            report.Report(pass, passes + 2u, waveEnd, m);
         }
         pairs.Close();
         splitCounts.push_back(pairs.Count());
@@ -335,34 +360,59 @@ EdgeMask BuildLevelChunks(const std::filesystem::path& file, const FileHeader& h
     }
     splits.AddResolved(std::move(resolved));
     EdgeMask shortcuts(m);
-    {
-        ValueReader<std::uint32_t> sources(file, sourceSection);
-        ValueReader<std::uint32_t> targets(file, targetSection);
-        ValueReader<std::uint32_t> childrenA(file, header.At(Section::EdgeChildA));
-        ValueReader<std::uint32_t> childrenB(file, header.At(Section::EdgeChildB));
-        ValueReader<std::int16_t> births(file, header.At(Section::EdgeBirth));
-        ValueReader<std::int16_t> deaths(file, header.At(Section::EdgeDeath));
-        for (std::uint64_t e = 0; e < m; ++e) {
-            const auto from = sources.Next();
-            const auto to = targets.Next();
-            const auto childA = childrenA.Next();
-            const auto childB = childrenB.Next();
-            const auto birth = births.Next();
-            const auto death = deaths.Next();
-            if (childA == kNoEdge) {
-                continue;
+    struct Filed {
+        std::uint32_t level = 0;
+        LevelRecord record;
+    };
+    std::vector<std::uint32_t> waveSplit;
+    ColumnReaders<std::uint32_t> childBReaders(file, header.At(Section::EdgeChildB));
+    ColumnReaders<std::int16_t> birthReaders(file, header.At(Section::EdgeBirth));
+    ColumnReaders<std::int16_t> deathReaders(file, header.At(Section::EdgeDeath));
+    for (std::uint64_t wave = 0; wave < m; wave += kWaveEdges) {
+        const auto waveEnd = std::min(m, wave + kWaveEdges);
+        waveSplit.assign(static_cast<std::size_t>(waveEnd - wave), kNoEdge);
+        splits.Take(wave, waveEnd, waveSplit);
+        const auto scans = SplitRange(wave, waveEnd, kMinScanEdges);
+        std::vector<std::vector<Filed>> filed(scans.size());
+        RunParallel(scans.size(), [&](std::size_t task, unsigned worker) {
+            const auto range = scans[task];
+            auto& sources = sourceReaders.At(worker, range);
+            auto& targets = targetReaders.At(worker, range);
+            auto& childrenA = childAReaders.At(worker, range);
+            auto& childrenB = childBReaders.At(worker, range);
+            auto& births = birthReaders.At(worker, range);
+            auto& deaths = deathReaders.At(worker, range);
+            for (auto e = range.first; e < range.second; ++e) {
+                const auto from = sources.Next();
+                const auto to = targets.Next();
+                const auto childA = childrenA.Next();
+                const auto childB = childrenB.Next();
+                const auto birth = births.Next();
+                const auto death = deaths.Next();
+                if (childA == kNoEdge) {
+                    continue;
+                }
+                const auto edge = static_cast<std::uint32_t>(e);
+                const auto split = waveSplit[static_cast<std::size_t>(e - wave)];
+                if (split == kNoEdge) {
+                    throw std::logic_error("LOD page build lost the split node of shortcut " +
+                                           std::to_string(edge));
+                }
+                filed[task].push_back(
+                    {nodes.level[split],
+                     {edge, childA, childB,
+                      static_cast<float>(DistanceToSegment(nodes, split, from, to)), birth,
+                      death}});
             }
-            const auto edge = static_cast<std::uint32_t>(e);
-            const auto split = splits.Take(edge);
-            shortcuts.Set(edge);
-            chunks.Append(nodes.level[split],
-                          {edge, childA, childB,
-                           static_cast<float>(DistanceToSegment(nodes, split, from, to)), birth,
-                           death});
-            if ((e & kProgressMask) == 0u) {
-                report.Report(passes, passes + 2u, e, m);
+        });
+        // In edge order inside every level, as a single scan would file them.
+        for (const auto& items : filed) {
+            for (const auto& item : items) {
+                shortcuts.Set(item.record.edge);
+                chunks.Append(item.level, item.record);
             }
         }
+        report.Report(passes, passes + 2u, waveEnd, m);
     }
     chunks.Finish();
     report.Report(passes + 1u, passes + 2u, 1u, 1u);

@@ -180,7 +180,7 @@ private:
         const streaming::runtime::GraphPageStreamingStats& stats);
 
     std::size_t selectedDataset_ = 0;
-    // 0 = full resident, 1 = Virtual Map (v8 .chbin/.chidx), 2 = LOD pages (.chlod)
+    // 0 = full resident, 1 = LOD pages (.chlod)
     int datasetRuntime_ = 1;
     bool lodPagesKeepInRam_ = true;
     bool splitScreenValidation_ = true;
