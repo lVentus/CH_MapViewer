@@ -24,9 +24,12 @@ struct RoadStyleConfig {
     std::vector<RoadClass> classes;
     std::array<std::uint8_t, data::RoadStyleTypeCount> classOfType{};
 
-    // What the road shaders take: color and width per type.
+    // What the road shaders take: color and width per type, and the depth that puts the
+    // classes listed first on top of the later ones (between 0 and 1, smaller is nearer). With
+    // it the picture does not depend on the order in which the segments are drawn.
     [[nodiscard]] std::array<std::array<float, 4>, data::RoadStyleTypeCount> TypeColors() const;
     [[nodiscard]] std::array<float, data::RoadStyleTypeCount> TypeWidths() const;
+    [[nodiscard]] std::array<float, data::RoadStyleTypeCount> TypeDepths() const;
 };
 
 // Roads wider than this would need a larger query margin around the view.

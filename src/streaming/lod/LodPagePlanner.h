@@ -2,9 +2,15 @@
 
 #include "streaming/lod/LodPageFormat.h"
 
+#include <array>
 #include <cstdint>
 #include <span>
 #include <vector>
+
+namespace chmv::renderer {
+class LODController;
+class MapCamera2D;
+} // namespace chmv::renderer
 
 namespace chmv::streaming::lod {
 
@@ -39,5 +45,25 @@ template <typename Bounds>
 // first, then Morton order).
 void CollectLodPages(std::span<const PageGroup> groups, std::span<const PageEntry> pages,
                      const LodPageQuery& query, std::vector<std::uint32_t>& out);
+
+// What a frame shows, from the camera alone: the planner query (the view grown by half the
+// widest road, and the level of the LOD curve; its threshold is left to the caller, which
+// derives it from toleranceCode and the expansion mode) and the view rectangle (minX, minY,
+// maxX, maxY) in normalized coordinates.
+struct LodPageView {
+    LodPageQuery query;
+    std::uint32_t toleranceCode = 0;
+    // The error code of one pixel.
+    std::uint32_t pixelCode = 0;
+    std::array<double, 4> rectangle{};
+};
+
+[[nodiscard]] LodPageView PlanView(const renderer::MapCamera2D& camera,
+                                   const renderer::LODController& lod, int width, int height,
+                                   float pixelTolerance, std::int32_t maxLevel);
+
+// The query box in fixed coordinates, rounded inward (and two units more), so a node that a
+// traversal keeps always lies in a page the planner chose with the float box.
+[[nodiscard]] std::array<std::int32_t, 4> TraversalCullBox(const LodPageQuery& query);
 
 } // namespace chmv::streaming::lod

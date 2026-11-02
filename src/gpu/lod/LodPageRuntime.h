@@ -4,6 +4,7 @@
 #include "gpu/lod/LodPagePool.h"
 #include "gpu/lod/LodPageRenderer.h"
 #include "renderer/RoadStyle.h"
+#include "renderer/ToleranceController.h"
 #include "streaming/lod/LodPageFile.h"
 #include "streaming/lod/LodPagePlanner.h"
 #include "streaming/lod/LodPageReader.h"
@@ -76,7 +77,12 @@ struct LodPageRuntimeStats {
     std::optional<double> gpuFilterMs;
     std::optional<double> gpuUnfoldMs;
     std::optional<double> gpuDrawMs;
+    std::optional<double> gpuCountMs;
     bool filtered = false;
+    // For the automatic tolerance: the error code of one pixel now, and the segments each
+    // tolerance step would draw in the drawn pages (when asked for and finished).
+    std::uint32_t pixelCode = 0;
+    std::optional<std::array<std::uint32_t, renderer::kToleranceSteps>> stepCounts;
 
     // Totals.
     std::uint64_t totalUploadedPages = 0;
@@ -141,9 +147,11 @@ public:
     LodPageRuntime(const std::filesystem::path& shaderDirectory,
                    chmv::streaming::lod::LodPageDataset dataset, std::uint64_t poolBudgetBytes = 0);
 
+    // countSteps also counts, with every pass of an adaptive expansion, the segments each
+    // tolerance step would draw.
     void Update(const renderer::MapCamera2D& camera, const renderer::LODController& lod, int width,
                 int height, float pixelTolerance, filtering::IRangeFilterStrategy& filter,
-                unfolding::IUnfoldingStrategy& unfold);
+                unfolding::IUnfoldingStrategy& unfold, bool countSteps = false);
     void Draw(const renderer::MapCamera2D& camera, int width, int height,
               const renderer::RoadStyleConfig& styles);
     // Loads every page into the GPU pool when the pool can be made that large.
@@ -153,6 +161,16 @@ public:
 
     [[nodiscard]] const LodPageRuntimeStats& Stats() const { return stats_; }
     [[nodiscard]] const chmv::streaming::lod::LodPageFile& File() const { return *file_; }
+    // Query and view rectangle of what is drawn now.
+    [[nodiscard]] const chmv::streaming::lod::LodPageQuery& DrawQuery() const {
+        return drawQuery_;
+    }
+    // The CH edges drawn now whose chord touches the view, sorted (a synchronous readback).
+    [[nodiscard]] std::vector<std::uint32_t> DrawnEdgesInView() const;
+    // Status words of the last pass (a synchronous readback).
+    [[nodiscard]] std::array<std::uint32_t, kStatusWords> CurrentStatus() const {
+        return renderer_.ReadStatus();
+    }
     // Synchronous checks of what the GPU currently draws.
     [[nodiscard]] LodPageValidation Validate() const;
     [[nodiscard]] LodPageBenchmarkResult Benchmark(filtering::IRangeFilterStrategy& filter,
@@ -216,6 +234,7 @@ private:
     std::optional<chmv::streaming::lod::LodPageQuery> filteredQuery_;
     const filtering::IRangeFilterStrategy* filteredBy_ = nullptr;
     const unfolding::IUnfoldingStrategy* unfoldedBy_ = nullptr;
+    bool counted_ = false;
     double uploadBytesPerMs_ = 0.0;
     std::optional<std::chrono::steady_clock::time_point> incompleteSince_;
     std::array<float, 3> lastCamera_{};

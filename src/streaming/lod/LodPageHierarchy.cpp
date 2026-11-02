@@ -1,5 +1,6 @@
 #include "streaming/lod/LodPageHierarchy.h"
 
+#include "data/ch/CHTypes.h"
 #include "streaming/lod/LodPageIo.h"
 
 #include <algorithm>
@@ -447,9 +448,55 @@ ErrorTable ComputeErrors(LevelChunks& chunks, const EdgeMask& shortcuts, std::ui
             table.maxHeight = std::max(table.maxHeight, level);
         }
         done += records.size();
-        report.Report(0u, 1u, done, chunks.Count());
+        report.Report(0u, 2u, done, chunks.Count());
     });
     return table;
+}
+
+std::vector<std::uint8_t> ComputeStyles(const std::filesystem::path& file,
+                                        const FileHeader& header, const LodPageNodes& nodes,
+                                        LevelChunks& chunks, const EdgeMask& shortcuts,
+                                        const LodPageBuilder::ProgressCallback& progress) {
+    // 5 bytes per edge: the style, and the length of the roads behind it while joining.
+    const auto m = static_cast<std::size_t>(header.edgeCount);
+    std::vector<std::uint8_t> style(m, 0u);
+    std::vector<float> length(m, 0.0f);
+    StageProgress report(progress, BuildStage::ComputeErrors);
+    ColumnReaders<std::uint32_t> sourceReaders(file, header.At(Section::EdgeSource));
+    ColumnReaders<std::uint32_t> targetReaders(file, header.At(Section::EdgeTarget));
+    ColumnReaders<std::int16_t> typeReaders(file, header.At(Section::EdgeType));
+    const auto scans = SplitRange(0u, header.edgeCount, kMinScanEdges);
+    RunParallel(scans.size(), [&](std::size_t task, unsigned worker) {
+        const auto range = scans[task];
+        auto& sources = sourceReaders.At(worker, range);
+        auto& targets = targetReaders.At(worker, range);
+        auto& types = typeReaders.At(worker, range);
+        for (auto e = range.first; e < range.second; ++e) {
+            const auto from = sources.Next();
+            const auto to = targets.Next();
+            const auto type = types.Next();
+            if (shortcuts.Test(static_cast<std::uint32_t>(e))) {
+                continue;
+            }
+            const auto own =
+                OriginalStyle(static_cast<std::uint8_t>(data::RoadStyleIndexFromType(type)),
+                              nodes.x[from], nodes.y[from], nodes.x[to], nodes.y[to]);
+            style[static_cast<std::size_t>(e)] = own.style;
+            length[static_cast<std::size_t>(e)] = own.length;
+        }
+    });
+    std::uint64_t done = 0;
+    chunks.ForEach(true, false, [&](std::span<LevelRecord> records) {
+        for (const auto& record : records) {
+            const auto joined = JoinStyles({style[record.childA], length[record.childA]},
+                                           {style[record.childB], length[record.childB]});
+            style[record.edge] = joined.style;
+            length[record.edge] = joined.length;
+        }
+        done += records.size();
+        report.Report(1u, 2u, done, chunks.Count());
+    });
+    return style;
 }
 
 ContextTable ComputeContexts(LevelChunks& chunks, std::uint64_t edgeCount,

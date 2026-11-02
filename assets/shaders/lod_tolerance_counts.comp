@@ -1,0 +1,68 @@
+#version 430 core
+
+// Segments each screen tolerance step would draw (ToleranceController.h): one workgroup per
+// listed page, one invocation per record. A record is drawn at error threshold T when its own
+// error is within T and it is a root at the level, or lies below a parent there whose error is
+// above T (the dual-interval rule of LodPageFormat.h). With the thresholds uStepBase + 256 k
+// that is a range of steps, added up per workgroup and then once into the totals.
+
+layout(local_size_x = 256) in;
+
+#include "lod_page_common.glsl"
+
+layout(std430, binding = 2) readonly buffer SlotList {
+    uint slotCount;
+    uint slotGroups[3];
+    uint slots[];
+};
+layout(std430, binding = 5) buffer StepCounts { uint stepCounts[]; };
+
+const uint kSteps = 13u;
+const uint kCodesPerStep = 256u;
+
+uniform uint uLevel;
+uniform uint uStepBase;
+
+shared int sChanges[kSteps + 1u];
+
+// The first step whose threshold reaches this error code.
+uint firstStepReaching(uint code) {
+    if (code <= uStepBase) {
+        return 0u;
+    }
+    return min((code - uStepBase + kCodesPerStep - 1u) / kCodesPerStep, kSteps);
+}
+
+void main() {
+    uint local = gl_LocalInvocationID.x;
+    if (local <= kSteps) {
+        sChanges[local] = 0;
+    }
+    barrier();
+    uint index = linearGroup();
+    if (index < slotCount) {
+        uint slot = slots[index];
+        if (local < recordCount(slot)) {
+            uvec4 record = pageRecord((slot << 8u) | local);
+            bool root = inLevelRange(record.y, uLevel);
+            if (root || inLevelRange(record.z, uLevel)) {
+                uint first = firstStepReaching(record.w & 0xffffu);
+                uint end = root ? kSteps : firstStepReaching(record.w >> 16u);
+                if (first < end) {
+                    atomicAdd(sChanges[first], 1);
+                    atomicAdd(sChanges[end], -1);
+                }
+            }
+        }
+    }
+    barrier();
+    if (local == 0u) {
+        int running = 0;
+        for (uint step = 0u; step < kSteps; ++step) {
+            running += sChanges[step];
+            if (running != 0) {
+                atomicAdd(stepCounts[step], uint(running));
+            }
+        }
+    }
+}

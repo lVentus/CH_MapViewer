@@ -137,6 +137,15 @@ private:
     mutable std::vector<std::byte> cachedData_;
 };
 
+// A page blob matches its directory entry: header word, and every record's vertex indices
+// within the page. Kernels and CPU passes trust pages that pass.
+[[nodiscard]] bool PageMatchesEntry(const PageEntry& entry, std::span<const std::uint32_t> words);
+// A children block marks only existing records, and every reference names an existing record of
+// an existing page.
+[[nodiscard]] bool ChildrenMatchEntry(std::span<const PageEntry> pages, const PageEntry& visit,
+                                      std::uint32_t recordCount,
+                                      std::span<const std::uint32_t> children);
+
 // What the background loader hands to the runtime.
 struct LodPageDataset {
     std::shared_ptr<const LodPageFile> file;

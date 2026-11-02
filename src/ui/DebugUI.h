@@ -1,5 +1,8 @@
 #pragma once
 
+#include "cpu/CpuPasses.h"
+#include "renderer/ToleranceController.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -8,6 +11,11 @@
 namespace chmv::benchmark {
 class LodPageZoomSweep;
 }
+
+namespace chmv::cpu {
+struct ClassicStatus;
+struct CpuBenchmarkResult;
+} // namespace chmv::cpu
 
 namespace chmv::core {
 class Window;
@@ -57,6 +65,12 @@ struct DebugUIState {
     gpu::filtering::RangeFilterStrategyManager& filters;
     gpu::unfolding::UnfoldingStrategyManager& unfolds;
     float& pixelTolerance;
+    // Manual or automatic tolerance, what the automatic one decided, and the tolerance of this
+    // frame (doubled while moving, if asked for).
+    renderer::ToleranceSettings& tolerance;
+    const renderer::ToleranceStatus& toleranceStatus;
+    float tolerancePixels = 1.0f;
+    bool toleranceCoarsened = false;
     bool& preloadAll;
     const std::string& roadStyleStatus;
     bool roadStyleError = false;
@@ -64,6 +78,18 @@ struct DebugUIState {
     const gpu::lod::LodPageValidation* validation = nullptr;
     const gpu::lod::LodPageBenchmarkResult* benchmark = nullptr;
     const benchmark::LodPageZoomSweep* sweep = nullptr;
+    // Who computes what is drawn, and the CPU side: method, threads, result (null when the CPU
+    // does not run), classic method state, the GPU/CPU comparison of the current view (null
+    // until there is one) and the CPU benchmark.
+    cpu::ProcessingMode& mode;
+    cpu::CpuMethod& cpuMethod;
+    int& cpuThreads;
+    const cpu::CpuResult* cpu = nullptr;
+    // Why the CPU result is not drawn (empty when it is).
+    const std::string& cpuDrawError;
+    const cpu::ClassicStatus& classic;
+    const cpu::CpuGpuComparison* comparison = nullptr;
+    const cpu::CpuBenchmarkResult* cpuBenchmark = nullptr;
 };
 
 class DebugUI {
@@ -83,6 +109,11 @@ private:
     void DrawDataset(const DebugUIState& state, DebugUIActions& actions);
     static void DrawView(const DebugUIState& state);
     static void DrawPipeline(const DebugUIState& state, DebugUIActions& actions);
+    static void DrawProcessing(const DebugUIState& state);
+    static void DrawTolerance(const DebugUIState& state);
+    static void DrawCpuResults(const DebugUIState& state);
+    // Labels the two halves of the window side by side.
+    static void DrawSplitLabels(const DebugUIState& state);
     static void DrawPageStats(const gpu::lod::LodPageRuntimeStats& stats);
     void DrawMemory(const DebugUIState& state, DebugUIActions& actions);
     static void DrawZoomSweep(const DebugUIState& state, DebugUIActions& actions);

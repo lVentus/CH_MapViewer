@@ -16,9 +16,12 @@ public:
     GPUTimer& operator=(const GPUTimer&) = delete;
 
     void Begin();
-    void End();
+    // Returns the number of this measurement (counting from 1), or 0 when it is not timed.
+    std::uint64_t End();
 
     [[nodiscard]] std::optional<double> LastMilliseconds() const { return lastMilliseconds_; }
+    // Number of the measurement LastMilliseconds() comes from.
+    [[nodiscard]] std::uint64_t LastSequence() const { return lastSequence_; }
 
 private:
     void CollectReadyResults();

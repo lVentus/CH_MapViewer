@@ -10,15 +10,31 @@ A dataset (`.sch` + `.sch.ranges`) is turned once into a self-contained page fil
 
 Filter and expansion are chosen at runtime; every combination draws the same roads, which the viewer can check against a CPU evaluation and benchmark on the GPU.
 
+Processing runs on the GPU, on the CPU, or both side by side:
+
+- **CPU:** a CPU method decides what is drawn and the GPU only rasterizes it. Either the same pages and strategies on the CPU, or the classic method on the whole CH in RAM (roots by their [death, birth] interval, DFS/BFS expansion, a grid of the edges for culling). Both run on 1 to all hardware threads.
+- **Compare:** GPU on the left, CPU on the right, same view; once the view is still and complete, the roads in view are compared edge by edge (not when the GPU result was truncated by a full list). The benchmark button and the zoom sweep CSV record the CPU times as well (columns that do not apply are -1).
+
+The screen tolerance of the adaptive expansions is set by hand (0.5 to 16 px) or automatically, for a target frame rate (60 fps by default): 1 px when the machine is fast enough, coarser in quarter octaves up to 8 px when it is not. Each frame is timed on the GPU from its first command to the end of its drawing.
+
+- **Auto: predictive:** every pass also counts how many segments each of the 13 steps would draw; with the measured cost of the current step that predicts every step's frame time. The tolerance gets coarser at once when the frames are, or are about to get, too slow (the camera starts moving), and finer one step at a time once there is room again. A step that turned out too slow is tried again only after a while.
+- **Auto: PI feedback:** a PI controller on the measured frame time alone, for comparison.
+- **Twice the tolerance while moving:** on top of either, until 150 ms after the camera stops.
+
+The zoom sweep CSV records the tolerance and the measured frame time of every frame.
+
+Damaged pages are left out on the CPU as on the GPU. A CPU page pass refuses a view whose pages would need more than a quarter of the free RAM (at least 512 MiB), and a CPU result too large for the GPU memory left is reported instead of drawn.
+
 ## Module boundaries
 
 - `core`: application lifecycle and native window ownership
+- `cpu`: the CPU methods (pages, classic whole-CH), their worker threads and the GPU/CPU comparison
 - `data`: dataset catalog, background loader, memory queries
 - `streaming/lod`: page file format, builder, reader and page planner
 - `gpu`: OpenGL resources and compute infrastructure
 - `gpu/lod`: GPU page pool, pass orchestration and the runtime
 - `gpu/filtering`, `gpu/unfolding`: the runtime-selectable strategies (`IRangeFilterStrategy`, `IUnfoldingStrategy`); a new strategy is one class plus its shaders, registered in `Application`
-- `renderer`: camera, LOD curve and frame setup
+- `renderer`: camera, LOD curve, road styles, tolerance controller and frame setup
 - `benchmark`: GPU timers and the zoom sweep
 - `ui`: Dear ImGui tools and runtime controls
 
@@ -89,7 +105,7 @@ Subdirectories are scanned recursively. Command-line graph/range paths (or a pag
 
 Loading a dataset builds `<name>.chlod` next to it when that file is missing, older than the sources, damaged or of an older format; a page file of the previous version (3, the same data uncompressed) is only compressed, not rebuilt. The page file holds the complete CH as well, zstd-compressed (bw: about 430 MiB instead of 1.2 GB uncompressed), so it also works on its own: a `.chlod` whose `.sch`/`.ranges` are gone is listed and loaded as it is (it can only be rebuilt with them).
 
-Road colors and widths come from `assets/road_styles.cfg`: a few road classes over the edge types of OsmGraphCreator's `all.cfg`. The viewer reloads the file when it is saved.
+Road colors and widths come from `assets/road_styles.cfg`: a few road classes over the edge types of OsmGraphCreator's `all.cfg`. A shortcut drawn as it is takes the class of the roads it stands for (where its two halves differ, the longer one's), not its own type, which many datasets leave 0; page files built before this (format 4) are rebuilt from their sources. Where roads overlap, the class listed first is on top, so every filter, expansion and the CPU draw the same picture whatever order their segments come in. The viewer reloads the file when it is saved.
 
 For CI or a non-graphics/core-only build, the script also forwards the existing CMake options through environment variables:
 

@@ -1,7 +1,12 @@
+#include "cpu/ClassicPipeline.h"
+#include "cpu/CpuRuntime.h"
+#include "cpu/CpuWorkers.h"
+#include "cpu/PagePipeline.h"
 #include "data/AsyncDatasetLoader.h"
 #include "data/DatasetCatalog.h"
 #include "data/ch/CHTypes.h"
 #include "renderer/RoadStyle.h"
+#include "renderer/ToleranceController.h"
 #include "streaming/lod/LodPageBuilder.h"
 #include "streaming/lod/LodPageCompression.h"
 #include "streaming/lod/LodPageFile.h"
@@ -11,6 +16,7 @@
 #include "streaming/lod/LodPageReader.h"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <chrono>
 #include <cmath>
@@ -19,10 +25,16 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
+#include <memory>
+#include <optional>
+#include <random>
 #include <stdexcept>
+#include <stop_token>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -87,6 +99,122 @@ struct ChainGraph {
         }
     }
     ~ChainGraph() {
+        std::filesystem::remove(graphPath);
+        std::filesystem::remove(rangesPath);
+        std::filesystem::remove(chmv::streaming::lod::LodPageFile::DefaultPath(graphPath));
+    }
+};
+
+// Many units of a bent shortcut S (0-2 via 1) below a shortcut P (0-3 via S and 2-3) whose chord
+// is the same line, so both have the same error: S is never drawn, only walked through, and
+// whole pages hold nothing but such records.
+struct WalkOnlyGraph {
+    std::filesystem::path graphPath;
+    std::filesystem::path rangesPath;
+
+    explicit WalkOnlyGraph(std::uint32_t units) {
+        const auto base = std::filesystem::temp_directory_path() / "chmv_walk_only_test";
+        graphPath = base.string() + ".sch";
+        rangesPath = base.string() + ".sch.ranges";
+        std::ofstream graph(graphPath);
+        graph << units * 4u << '\n' << units * 5u << '\n' << std::fixed << std::setprecision(7);
+        for (std::uint32_t node = 0; node < units * 4u; ++node) {
+            const auto k = node % 4u;
+            const std::uint32_t level = k == 1u ? 0u : k == 2u ? 1u : 2u;
+            graph << node << ' ' << 1000u + node << ' ' << (k == 1u ? 48.0005 : 48.0) << ' '
+                  << 9.0 + node * 0.001 << " 0 " << level << '\n';
+        }
+        std::ofstream ranges(rangesPath);
+        for (std::uint32_t unit = 0; unit < units; ++unit) {
+            const auto node = unit * 4u;
+            const auto edge = unit * 5u;
+            graph << node << ' ' << node + 1u << " 1 1 50 -1 -1\n";
+            graph << node + 1u << ' ' << node + 2u << " 1 1 50 -1 -1\n";
+            graph << node + 2u << ' ' << node + 3u << " 1 1 50 -1 -1\n";
+            graph << node << ' ' << node + 2u << " 2 1 50 " << edge << ' ' << edge + 1u << '\n';
+            graph << node << ' ' << node + 3u << " 3 1 50 " << edge + 3u << ' ' << edge + 2u
+                  << '\n';
+            ranges << edge << " 0 0\n"
+                   << edge + 1u << " 0 0\n"
+                   << edge + 2u << " 0 0\n"
+                   << edge + 3u << " -1 -1\n"
+                   << edge + 4u << " 2 1\n";
+        }
+    }
+    ~WalkOnlyGraph() {
+        std::filesystem::remove(graphPath);
+        std::filesystem::remove(rangesPath);
+        std::filesystem::remove(chmv::streaming::lod::LodPageFile::DefaultPath(graphPath));
+    }
+};
+
+// Random roads: chains of 2^depth originals along random walks, each below a binary tree of
+// shortcuts, some of them drawn one level longer. Many pages, real traversals, views anywhere.
+struct RandomRoadsGraph {
+    std::filesystem::path graphPath;
+    std::filesystem::path rangesPath;
+
+    RandomRoadsGraph(std::uint32_t seed, std::uint32_t chains, std::uint32_t depth) {
+        const auto base = std::filesystem::temp_directory_path() / "chmv_random_roads_test";
+        graphPath = base.string() + ".sch";
+        rangesPath = base.string() + ".sch.ranges";
+        std::mt19937 random(seed);
+        std::uniform_real_distribution<double> unit(0.0, 1.0);
+        const std::uint32_t length = 1u << depth;
+        std::ofstream graph(graphPath);
+        graph << "# random roads\n"
+              << chains * (length + 1u) << '\n'
+              << chains * (2u * length - 1u) << '\n'
+              << std::fixed << std::setprecision(7);
+        for (std::uint32_t chain = 0; chain < chains; ++chain) {
+            double lat = 48.0 + unit(random) * 0.5;
+            double lon = 9.0 + unit(random) * 0.7;
+            for (std::uint32_t i = 0; i <= length; ++i) {
+                const auto node = chain * (length + 1u) + i;
+                const auto level = i == 0u || i == length
+                                       ? depth + 1u
+                                       : static_cast<std::uint32_t>(std::countr_zero(i));
+                graph << node << ' ' << 1000u + node << ' ' << lat << ' ' << lon << " 0 "
+                      << level << '\n';
+                lat += (unit(random) - 0.5) * 0.004;
+                lon += (unit(random) - 0.3) * 0.004;
+            }
+        }
+        std::ofstream ranges(rangesPath);
+        std::uint32_t edge = 0;
+        const auto write = [&](std::uint32_t from, std::uint32_t to, const std::string& children,
+                               int birth, int death) {
+            graph << from << ' ' << to << " 10 " << 1u + edge % 5u << " 50 " << children << '\n';
+            ranges << edge << ' ' << birth << ' ' << death << '\n';
+            return edge++;
+        };
+        for (std::uint32_t chain = 0; chain < chains; ++chain) {
+            const auto first = chain * (length + 1u);
+            // (edge, from, to) of the current level of the tree.
+            std::vector<std::array<std::uint32_t, 3>> current;
+            for (std::uint32_t i = 0; i < length; ++i) {
+                current.push_back({write(first + i, first + i + 1u, "-1 -1", 0, 0), first + i,
+                                   first + i + 1u});
+            }
+            for (std::uint32_t height = 1; height <= depth; ++height) {
+                std::vector<std::array<std::uint32_t, 3>> next;
+                for (std::size_t k = 0; k + 1u < current.size(); k += 2u) {
+                    const auto& a = current[k];
+                    const auto& b = current[k + 1u];
+                    auto birth = static_cast<int>(height == depth ? depth + 2u : height);
+                    if (height < depth && unit(random) < 0.15) {
+                        birth = static_cast<int>(height) + 1;
+                    }
+                    next.push_back({write(a[1], b[2],
+                                          std::to_string(a[0]) + ' ' + std::to_string(b[0]),
+                                          birth, static_cast<int>(height)),
+                                    a[1], b[2]});
+                }
+                current = std::move(next);
+            }
+        }
+    }
+    ~RandomRoadsGraph() {
         std::filesystem::remove(graphPath);
         std::filesystem::remove(rangesPath);
         std::filesystem::remove(chmv::streaming::lod::LodPageFile::DefaultPath(graphPath));
@@ -218,6 +346,428 @@ void RequireTraversalsMatchDfs(const chmv::streaming::lod::LodPageFile& file,
     }
 }
 
+// Roots drawn as they are: alive at the level and accurate enough.
+std::vector<std::uint32_t> RootsCut(const chmv::streaming::lod::LodPageFile& file,
+                                    std::uint32_t level, std::uint32_t threshold) {
+    namespace lod = chmv::streaming::lod;
+    const auto birth = file.ReadSection<std::int16_t>(lod::Section::EdgeBirth);
+    const auto death = file.ReadSection<std::int16_t>(lod::Section::EdgeDeath);
+    const auto error = file.ReadSection<float>(lod::Section::EdgeError);
+    const auto r = static_cast<std::int32_t>(level);
+    std::vector<std::uint32_t> edges;
+    for (std::uint32_t e = 0; e < birth.size(); ++e) {
+        if (death[e] >= 0 && birth[e] >= 0 && r >= death[e] && r <= birth[e] &&
+            lod::EncodeGeometryError(error[e]) <= threshold) {
+            edges.push_back(e);
+        }
+    }
+    return edges;
+}
+
+// Every CPU filter and expansion, on pages read from the file and from RAM images, and the
+// classic method on the whole CH, with one and with several threads: the same edges as DFS
+// (everywhere), and the page and classic methods draw the same segments.
+void RequireCpuPassesMatchDfs(const std::shared_ptr<const chmv::streaming::lod::LodPageFile>& file,
+                              const char* message) {
+    namespace lod = chmv::streaming::lod;
+    namespace cpu = chmv::cpu;
+    cpu::CpuPageStore diskStore(file, nullptr, nullptr);
+    cpu::CpuPageStore ramStore(file,
+                               std::make_shared<const std::vector<std::uint32_t>>(
+                                   file->ReadPageWords({})),
+                               std::make_shared<const std::vector<std::uint32_t>>(
+                                   file->ReadChildrenWords({})));
+    const std::stop_source stop;
+    const auto classic = cpu::ClassicGraph::Load(*file, stop.get_token());
+    const auto sorted = [](std::vector<std::uint32_t> edges) {
+        std::sort(edges.begin(), edges.end());
+        return edges;
+    };
+    const auto segments = [](const cpu::CpuResult& result) {
+        std::vector<std::array<std::int64_t, 6>> keyed;
+        for (std::size_t i = 0; i < result.segments.size(); ++i) {
+            const auto& s = result.segments[i];
+            keyed.push_back({result.edges[i], s.ax, s.ay, s.bx, s.by, s.type});
+        }
+        std::sort(keyed.begin(), keyed.end());
+        return keyed;
+    };
+    for (const unsigned threads : {1u, 3u}) {
+        cpu::CpuWorkers workers(threads);
+        for (std::uint32_t level = 0; level <= 3u; ++level) {
+            for (const std::uint32_t threshold :
+                 {0u, 27000u, 30000u, std::uint32_t{lod::kErrorCodeMax}}) {
+                const auto expected = DfsCut(*file, level, threshold);
+                const auto roots = RootsCut(*file, level, threshold);
+                lod::LodPageQuery query{-1e9f, -1e9f, 1e9f, 1e9f, level, threshold};
+                for (const auto filter : {cpu::CpuFilter::FullScan, cpu::CpuFilter::BirthOrdered,
+                                          cpu::CpuFilter::Culling}) {
+                    for (const auto expansion :
+                         {cpu::CpuExpansion::Roots, cpu::CpuExpansion::Intervals,
+                          cpu::CpuExpansion::Dfs, cpu::CpuExpansion::Bfs}) {
+                        const auto& want =
+                            expansion == cpu::CpuExpansion::Roots ? roots : expected;
+                        const auto fromDisk =
+                            cpu::RunPagePass(diskStore, workers, query, filter, expansion);
+                        const auto fromRam =
+                            cpu::RunPagePass(ramStore, workers, query, filter, expansion);
+                        Require(sorted(fromDisk.edges) == want && sorted(fromRam.edges) == want &&
+                                    fromDisk.missingPages == fromRam.missingPages,
+                                message);
+                        const auto whole = classic->Run(workers, query, filter, expansion);
+                        if (expansion == cpu::CpuExpansion::Intervals) {
+                            Require(!whole.unavailable.empty(), message);
+                        } else {
+                            Require(sorted(whole.edges) == want &&
+                                        segments(whole) == segments(fromDisk),
+                                    message);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Random views anywhere on random roads: every CPU pass draws, inside the view, exactly what a
+// plain depth-first walk of the whole CH draws there; from disk and from RAM, with one and
+// several threads, in mixed order (the store then holds pages fetched for other passes).
+// A damaged page or children block is left out alike from disk and from RAM.
+void TestCpuPartialViews() {
+    namespace lod = chmv::streaming::lod;
+    namespace cpu = chmv::cpu;
+    constexpr std::uint32_t kDepth = 6;
+    const RandomRoadsGraph source(7u, 40u, kDepth);
+    const auto filePath = lod::LodPageFile::DefaultPath(source.graphPath);
+    (void)lod::LodPageBuilder::Build(source.graphPath, source.rangesPath, filePath);
+    const auto file = lod::LodPageFile::Open(filePath);
+    Require(file->Pages().size() > 10u, "the random roads span many pages");
+    const std::stop_source stop;
+    const auto classic = cpu::ClassicGraph::Load(*file, stop.get_token());
+    const auto ramStore = [](const std::shared_ptr<const lod::LodPageFile>& pages) {
+        return std::make_unique<cpu::CpuPageStore>(
+            pages, std::make_shared<const std::vector<std::uint32_t>>(pages->ReadPageWords({})),
+            std::make_shared<const std::vector<std::uint32_t>>(pages->ReadChildrenWords({})));
+    };
+    cpu::CpuPageStore disk(file, nullptr, nullptr);
+    const auto ram = ramStore(file);
+    cpu::CpuWorkers one(1);
+    cpu::CpuWorkers four(4);
+
+    const lod::LodPageQuery everywhere{-1e9f, -1e9f, 1e9f, 1e9f, 0u, 0u};
+    const auto whole = classic->Run(one, everywhere, cpu::CpuFilter::FullScan,
+                                    cpu::CpuExpansion::Dfs);
+    double minX = 1e9;
+    double minY = 1e9;
+    double maxX = -1e9;
+    double maxY = -1e9;
+    for (const auto& segment : whole.segments) {
+        for (const auto& [x, y] :
+             {std::pair{segment.ax, segment.ay}, std::pair{segment.bx, segment.by}}) {
+            minX = std::min(minX, x / lod::kFixedCoordinateScale);
+            maxX = std::max(maxX, x / lod::kFixedCoordinateScale);
+            minY = std::min(minY, y / lod::kFixedCoordinateScale);
+            maxY = std::max(maxY, y / lod::kFixedCoordinateScale);
+        }
+    }
+    std::mt19937 random(11u);
+    std::uniform_real_distribution<double> unit(0.0, 1.0);
+    constexpr std::array<std::uint32_t, 7> kThresholds{0u,     20000u, 24000u, 26000u,
+                                                       28000u, 30000u, lod::kErrorCodeMax};
+    std::vector<int> combinations(12);
+    for (int k = 0; k < 12; ++k) {
+        combinations[static_cast<std::size_t>(k)] = k;
+    }
+    for (std::uint32_t round = 0; round < 60u; ++round) {
+        const auto level = static_cast<std::uint32_t>(random() % (kDepth + 3u));
+        const auto threshold = kThresholds[random() % kThresholds.size()];
+        const double width = (maxX - minX) * std::pow(10.0, -3.0 * unit(random));
+        const double height = width * (0.3 + unit(random));
+        const double x = minX + (maxX - minX) * (unit(random) * 1.2 - 0.1);
+        const double y = minY + (maxY - minY) * (unit(random) * 1.2 - 0.1);
+        const std::array<double, 4> view{x - width / 2.0, y - height / 2.0, x + width / 2.0,
+                                         y + height / 2.0};
+        const double margin = width * 0.01;
+        const lod::LodPageQuery query{static_cast<float>(view[0] - margin),
+                                      static_cast<float>(view[1] - margin),
+                                      static_cast<float>(view[2] + margin),
+                                      static_cast<float>(view[3] + margin), level, threshold};
+        const lod::LodPageQuery all{-1e9f, -1e9f, 1e9f, 1e9f, level, threshold};
+        const auto dfs = classic->Run(one, all, cpu::CpuFilter::FullScan, cpu::CpuExpansion::Dfs);
+        const auto roots =
+            classic->Run(one, all, cpu::CpuFilter::FullScan, cpu::CpuExpansion::Roots);
+        auto dfsEdges = dfs.edges;
+        std::sort(dfsEdges.begin(), dfsEdges.end());
+        Require(dfsEdges == DfsCut(*file, level, threshold),
+                "the unculled classic walk is the DFS cut");
+        const auto wantDfs = cpu::EdgesInView(dfs.segments, dfs.edges, view);
+        const auto wantRoots = cpu::EdgesInView(roots.segments, roots.edges, view);
+        std::shuffle(combinations.begin(), combinations.end(), random);
+        for (const int k : combinations) {
+            const auto filter = static_cast<cpu::CpuFilter>(k / 4);
+            const auto expansion = static_cast<cpu::CpuExpansion>(k % 4);
+            const auto& want = expansion == cpu::CpuExpansion::Roots ? wantRoots : wantDfs;
+            auto& workers = (round & 1u) != 0u ? four : one;
+            for (auto* store : {&disk, ram.get()}) {
+                const auto result = cpu::RunPagePass(*store, workers, query, filter, expansion);
+                Require(result.unavailable.empty() &&
+                            cpu::EdgesInView(result.segments, result.edges, view) == want,
+                        "a page pass draws the view as the whole-CH walk does");
+            }
+            if (expansion != cpu::CpuExpansion::Intervals) {
+                const auto result = classic->Run(workers, query, filter, expansion);
+                Require(cpu::EdgesInView(result.segments, result.edges, view) == want,
+                        "a classic pass draws the view as the whole-CH walk does");
+            }
+        }
+    }
+
+    // Segments per tolerance step: the step a pass draws is counted exactly (other steps may
+    // need pages this pass did not plan).
+    for (std::uint32_t level = 0; level <= kDepth + 2u; ++level) {
+        constexpr std::uint32_t kBase = 24000u;
+        for (int step = 0; step < chmv::renderer::kToleranceSteps; ++step) {
+            const auto threshold =
+                kBase + static_cast<std::uint32_t>(step) * chmv::renderer::kCodesPerToleranceStep;
+            const lod::LodPageQuery all{-1e9f, -1e9f, 1e9f, 1e9f, level, threshold};
+            const auto result = cpu::RunPagePass(disk, four, all, cpu::CpuFilter::FullScan,
+                                                 cpu::CpuExpansion::Intervals, kBase);
+            Require(result.stepCounts.has_value() &&
+                        (*result.stepCounts)[static_cast<std::size_t>(step)] ==
+                            result.segments.size(),
+                    "the segments of every tolerance step are counted");
+        }
+    }
+
+    // A damaged page, then a damaged children block of another page.
+    auto damagedPath = filePath;
+    damagedPath += ".damaged";
+    const auto damage = [&](lod::StoredRange range) {
+        std::filesystem::copy_file(filePath, damagedPath,
+                                   std::filesystem::copy_options::overwrite_existing);
+        std::fstream io(damagedPath, std::ios::in | std::ios::out | std::ios::binary);
+        io.seekg(static_cast<std::streamoff>(range.offset + range.bytes / 2u));
+        char byte = 0;
+        io.read(&byte, 1);
+        byte = static_cast<char>(byte ^ 0x5a);
+        io.seekp(static_cast<std::streamoff>(range.offset + range.bytes / 2u));
+        io.write(&byte, 1);
+    };
+    const auto victim = static_cast<std::uint32_t>(file->Pages().size() / 2u);
+    for (const bool children : {false, true}) {
+        damage(children ? file->ChildrenStorage(victim + 1u) : file->PageStorage(victim));
+        const auto damaged = lod::LodPageFile::Open(damagedPath);
+        cpu::CpuPageStore damagedDisk(damaged, nullptr, nullptr);
+        const auto damagedRam = ramStore(damaged);
+        bool lost = false;
+        for (std::uint32_t level = 0; level <= kDepth + 2u; ++level) {
+            for (const auto threshold : kThresholds) {
+                const lod::LodPageQuery all{-1e9f, -1e9f, 1e9f, 1e9f, level, threshold};
+                for (int k = 0; k < 12; ++k) {
+                    const auto filter = static_cast<cpu::CpuFilter>(k / 4);
+                    const auto expansion = static_cast<cpu::CpuExpansion>(k % 4);
+                    auto fromDisk = cpu::RunPagePass(damagedDisk, four, all, filter, expansion);
+                    auto fromRam = cpu::RunPagePass(*damagedRam, four, all, filter, expansion);
+                    const auto intact = cpu::RunPagePass(disk, four, all, filter, expansion);
+                    std::sort(fromDisk.edges.begin(), fromDisk.edges.end());
+                    std::sort(fromRam.edges.begin(), fromRam.edges.end());
+                    Require(fromDisk.edges == fromRam.edges &&
+                                fromDisk.edges.size() <= intact.edges.size(),
+                            "a damaged page is left out alike from disk and from RAM");
+                    lost = lost || fromDisk.edges.size() < intact.edges.size();
+                }
+            }
+        }
+        Require(lost, "a damaged page or children block loses roads");
+    }
+    std::filesystem::remove(damagedPath);
+}
+
+// A simulated machine for the tolerance controller: every step draws 10% fewer segments than the
+// one before; drawing and expanding cost `perSegmentMs` each, a pass 1 ms more, the rest 2 ms.
+// `hiddenBelow` makes the steps finer than it twice as slow as their counts say. Frames are
+// measured one frame late, the part costs `costLag` frames late, and a finer step is drawn only
+// `loadFrames` frames after it was asked for (its pages load meanwhile).
+struct SimulatedMachine {
+    double perSegmentMs = 0.0;
+    int hiddenBelow = -1;
+    bool counted = true;
+    std::size_t costLag = 0;
+    int loadFrames = 0;
+
+    [[nodiscard]] std::array<std::uint64_t, chmv::renderer::kToleranceSteps> Counts() const {
+        std::array<std::uint64_t, chmv::renderer::kToleranceSteps> counts{};
+        for (std::size_t step = 0; step < counts.size(); ++step) {
+            counts[step] = static_cast<std::uint64_t>(100000.0 * std::pow(0.9, step));
+        }
+        return counts;
+    }
+    [[nodiscard]] double Segments(int step) const {
+        const auto segments = static_cast<double>(Counts()[static_cast<std::size_t>(step)]);
+        return step < hiddenBelow ? segments * 2.0 : segments;
+    }
+    [[nodiscard]] double FrameMs(int step, bool pass) const {
+        const auto segments = Segments(step);
+        return 2.0 + segments * perSegmentMs + (pass ? 1.0 + segments * perSegmentMs : 0.0);
+    }
+};
+
+struct SimulatedRun {
+    int step = 0;
+    std::uint32_t changes = 0;
+    std::uint32_t slowFrames = 0;
+    std::uint32_t refinesTo = 0;
+};
+
+// The viewer around the controller, at 60 Hz.
+class SimulatedViewer {
+public:
+    SimulatedViewer(chmv::renderer::ToleranceController& controller, SimulatedMachine machine,
+                    int step)
+        : controller_(controller), machine_(machine), requested_(step), drawn_(step) {}
+
+    // Runs `frames` frames, moving or not, and reports the last step asked for and what
+    // happened; `watchedStep` counts how often that step was asked for when going finer.
+    SimulatedRun Run(bool moving, int frames, int watchedStep = -1) {
+        namespace renderer = chmv::renderer;
+        SimulatedRun run;
+        for (int frame = 0; frame < frames; ++frame) {
+            renderer::ToleranceInput input;
+            input.seconds = 1.0 / 60.0;
+            input.budgetMs = 1000.0 / 60.0;
+            input.moving = moving;
+            input.drawnStep = drawn_;
+            input.requestDrawn = drawn_ == requested_;
+            const auto lag = std::min(machine_.costLag, drawnHistory_.size() - 1u);
+            const auto measured =
+                drawnHistory_.empty() ? drawn_ : drawnHistory_[drawnHistory_.size() - 1u - lag];
+            const auto segments = machine_.Segments(measured);
+            input.passFixedMs = 1.0;
+            input.passScaledMs = segments * machine_.perSegmentMs;
+            input.drawScaledMs = segments * machine_.perSegmentMs;
+            if (machine_.counted) {
+                input.counts = machine_.Counts();
+            }
+            input.sample = pending_;
+            const auto next = controller_.Update(input);
+            if (next != requested_) {
+                ++run.changes;
+                run.refinesTo += next == watchedStep && next < requested_ ? 1u : 0u;
+                loading_ = next < drawn_ ? machine_.loadFrames : 0;
+                requested_ = next;
+            }
+            bool pass = moving;
+            if (drawn_ != requested_ && loading_-- <= 0) {
+                drawn_ = requested_;
+                pass = true;
+            }
+            const auto frameMs = machine_.FrameMs(drawn_, pass);
+            run.slowFrames += frameMs > input.budgetMs ? 1u : 0u;
+            pending_ = renderer::ToleranceSample{frameMs, pass, drawn_};
+            drawnHistory_.push_back(drawn_);
+        }
+        run.step = requested_;
+        return run;
+    }
+
+private:
+    chmv::renderer::ToleranceController& controller_;
+    SimulatedMachine machine_;
+    int requested_ = 0;
+    int drawn_ = 0;
+    int loading_ = 0;
+    std::vector<int> drawnHistory_;
+    std::optional<chmv::renderer::ToleranceSample> pending_;
+};
+
+void TestToleranceController() {
+    namespace renderer = chmv::renderer;
+    Require(renderer::NearestStep(1.0f) == 0 && renderer::NearestStep(2.0f) == 4 &&
+                renderer::NearestStep(8.0f) == 12 && renderer::NearestStep(100.0f) == 12 &&
+                std::abs(renderer::StepPixels(4) - 2.0f) < 1e-5f,
+            "tolerance steps are quarter octaves from 1 px to 8 px");
+    Require(renderer::StepOfThreshold(1000u + 3u * 256u, 1000u) == 3 &&
+                renderer::StepOfThreshold(1000u - 256u, 1000u) == -1,
+            "a threshold maps back to its step");
+    const auto predictive = [](int step) {
+        renderer::ToleranceController controller;
+        controller.SetMode(renderer::ToleranceMode::Predictive);
+        controller.Reset(step);
+        return controller;
+    };
+
+    {
+        // Fast enough for 1 px: stays there, moving or not.
+        auto controller = predictive(0);
+        SimulatedMachine fast;
+        fast.perSegmentMs = 1e-5;
+        SimulatedViewer viewer(controller, fast, 0);
+        const auto moving = viewer.Run(true, 120);
+        const auto still = viewer.Run(false, 120);
+        Require(moving.changes == 0u && still.changes == 0u && still.step == 0,
+                "a fast machine keeps 1 px");
+    }
+    for (const bool counted : {true, false}) {
+        for (const std::size_t lag : {std::size_t{0}, std::size_t{3}}) {
+            // Too slow for 1 px while moving: coarser at once, finer again once the camera
+            // stops, and then quiet; also when the part costs arrive late.
+            auto controller = predictive(0);
+            SimulatedMachine slow;
+            slow.perSegmentMs = 13.5 / 100000.0;
+            slow.counted = counted;
+            slow.costLag = lag;
+            SimulatedViewer viewer(controller, slow, 0);
+            (void)viewer.Run(false, 60);
+            const auto moving = viewer.Run(true, 240);
+            const auto settled = viewer.Run(true, 60);
+            Require(moving.step >= 8 && moving.step <= (counted ? 9 : 10) &&
+                        settled.slowFrames == 0u,
+                    "moving on a slow machine finds a step within the budget");
+            Require(moving.slowFrames <= (counted ? 6u : 30u),
+                    "the controller gets within the budget quickly");
+            (void)viewer.Run(false, 240);
+            const auto quiet = viewer.Run(false, 120);
+            Require(quiet.step >= 1 && quiet.step <= 3 && quiet.changes == 0u &&
+                        quiet.slowFrames == 0u,
+                    "standing still refines and then stays put");
+        }
+    }
+    for (const int load : {0, 40}) {
+        // Steps below 4 are twice as slow as counted: tried rarely, not again and again, also
+        // when finer steps take a while to load.
+        auto controller = predictive(8);
+        SimulatedMachine tricky;
+        tricky.perSegmentMs = 10.0 / 100000.0;
+        tricky.hiddenBelow = 4;
+        tricky.loadFrames = load;
+        SimulatedViewer viewer(controller, tricky, 8);
+        const auto run = viewer.Run(false, 1200, 3);
+        Require(run.refinesTo <= 5u && run.slowFrames <= 12u && run.step >= 3,
+                "a step that was too slow is tried rarely");
+    }
+    {
+        // Feedback alone also leaves 1 px on a slow machine and stays within the steps.
+        renderer::ToleranceController controller;
+        controller.SetMode(renderer::ToleranceMode::Feedback);
+        controller.Reset(0);
+        SimulatedMachine slow;
+        slow.perSegmentMs = 13.5 / 100000.0;
+        SimulatedViewer viewer(controller, slow, 0);
+        const auto run = viewer.Run(true, 300);
+        Require(run.step >= 5 && run.step < renderer::kToleranceSteps,
+                "the feedback controller coarsens a slow machine");
+    }
+    {
+        renderer::MotionCoarsening motion;
+        const bool before = motion.Update(false, 0.1);
+        const bool moving = motion.Update(true, 0.016);
+        const bool just = motion.Update(false, 0.1);
+        const bool later = motion.Update(false, 0.1);
+        Require(!before && moving && just && !later,
+                "coarser while moving, and for a moment after stopping");
+    }
+}
+
 void TestErrorBounds() {
     namespace lod = chmv::streaming::lod;
     Require(lod::ErrorBound(0) == 0u, "error code 0 means no error at all");
@@ -278,6 +828,75 @@ void TestCompressedPageFile() {
                 file->Pages().size() > 50u,
             "the chain spans several blocks and pages");
     RequireLodCutsMatchDfs(*file, "compressed chain differs from DFS");
+    RequireCpuPassesMatchDfs(file, "CPU passes on the chain differ from DFS");
+    {
+        // The runtime: recomputes only when something changed, loads the whole CH for the
+        // classic method in the background, says why it cannot run a combination.
+        namespace cpu = chmv::cpu;
+        cpu::CpuRuntime runtime(file, nullptr, nullptr);
+        runtime.SetThreads(2);
+        const lod::LodPageQuery query{-1e9f, -1e9f, 1e9f, 1e9f, 0u, 0u};
+        cpu::CpuStrategy strategy{cpu::CpuFilter::BirthOrdered, cpu::CpuExpansion::Bfs,
+                                  chmv::geometry::RefinementMode::Full};
+        const auto expected = DfsCut(*file, 0u, 0u);
+        const auto sortedEdges = [&] {
+            auto edges = runtime.Result().edges;
+            std::sort(edges.begin(), edges.end());
+            return edges;
+        };
+        Require(runtime.Update(query, cpu::CpuMethod::Pages, strategy) && sortedEdges() == expected,
+                "the CPU runtime draws the DFS cut");
+        Require(!runtime.Update(query, cpu::CpuMethod::Pages, strategy),
+                "an unchanged view is not computed again");
+        (void)runtime.Update(query, cpu::CpuMethod::Classic, strategy);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        while (runtime.Classic().state == cpu::ClassicState::Loading &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        Require(runtime.Classic().state == cpu::ClassicState::Ready,
+                "the whole CH loads for the classic method");
+        Require(runtime.Update(query, cpu::CpuMethod::Classic, strategy) &&
+                    runtime.Result().unavailable.empty() && sortedEdges() == expected,
+                "the classic method draws the DFS cut");
+        strategy.expansion = cpu::CpuExpansion::Intervals;
+        Require(runtime.Update(query, cpu::CpuMethod::Classic, strategy) &&
+                    !runtime.Result().unavailable.empty() && runtime.Result().segments.empty(),
+                "the classic method has no dual-interval counterpart");
+        strategy.expansion.reset();
+        Require(runtime.Update(query, cpu::CpuMethod::Pages, strategy) &&
+                    !runtime.Result().unavailable.empty(),
+                "a strategy without CPU version is reported");
+        strategy.expansion = cpu::CpuExpansion::Dfs;
+        const auto benchmark =
+            runtime.Benchmark(query, cpu::CpuMethod::Pages, strategy, 5u, 0.0);
+        Require(benchmark.unavailable.empty() && benchmark.iterations == 3u &&
+                    benchmark.segments == expected.size() &&
+                    benchmark.filterMinMs <= benchmark.filterMaxMs,
+                "the CPU benchmark repeats the pass");
+    }
+    {
+        // Workers run every task once and hand on the lowest failure.
+        chmv::cpu::CpuWorkers workers(4);
+        std::vector<int> runs(1000, 0);
+        workers.Run(runs.size(), [&](std::size_t task, unsigned worker) {
+            Require(worker < 4u, "worker index within the pool");
+            ++runs[task];
+        });
+        Require(std::all_of(runs.begin(), runs.end(), [](int count) { return count == 1; }),
+                "every task runs exactly once");
+        bool failed = false;
+        try {
+            workers.Run(100, [](std::size_t task, unsigned) {
+                if (task == 17u || task == 60u) {
+                    throw std::runtime_error(task == 17u ? "17" : "60");
+                }
+            });
+        } catch (const std::runtime_error& error) {
+            failed = std::string(error.what()) == "17";
+        }
+        Require(failed, "the lowest failed task is reported");
+    }
 
     const auto words = file->ReadPageWords({});
     const auto children = file->ReadChildrenWords({});
@@ -371,6 +990,68 @@ void TestCompressedPageFile() {
     std::filesystem::remove(damagedPath);
 }
 
+// Shortcuts whose own type is 0, as many datasets give them: a record draws with the style of
+// the roads it stands for, the longer one where its halves differ, on the GPU pages and in the
+// classic method alike.
+void TestShortcutStyles() {
+    namespace lod = chmv::streaming::lod;
+    namespace cpu = chmv::cpu;
+    const auto base = std::filesystem::temp_directory_path() / "chmv_shortcut_styles_test";
+    const std::filesystem::path graphPath = base.string() + ".sch";
+    const std::filesystem::path rangesPath = base.string() + ".sch.ranges";
+    {
+        // Edges 0 and 1 (primary) are short, edge 2 (residential) four times as long as both.
+        std::ofstream graph(graphPath);
+        graph << "# shortcut styles\n4\n5\n";
+        graph << "0 100 48.0000000 9.0000000 0 2\n";
+        graph << "1 101 48.0005000 9.0010000 0 0\n";
+        graph << "2 102 48.0000000 9.0020000 0 1\n";
+        graph << "3 103 48.0000000 9.0100000 0 2\n";
+        graph << "0 1 10 3 50 -1 -1\n1 2 10 3 50 -1 -1\n2 3 40 12 50 -1 -1\n";
+        graph << "0 2 20 0 50 0 1\n0 3 60 0 50 3 2\n";
+        std::ofstream(rangesPath) << "0 0 0\n1 0 0\n2 1 0\n3 1 1\n4 2 2\n";
+    }
+    const auto filePath = lod::LodPageFile::DefaultPath(graphPath);
+    (void)lod::LodPageBuilder::Build(graphPath, rangesPath, filePath);
+    {
+        const auto file = lod::LodPageFile::Open(filePath);
+        const std::array<std::uint32_t, 5> expected{3u, 3u, 12u, 3u, 12u};
+        const auto words = file->ReadPageWords({});
+        const auto recordEdges = file->ReadSection<std::uint32_t>(lod::Section::RecordEdge);
+        std::array<bool, 5> seen{};
+        for (std::uint32_t p = 0; p < file->Pages().size(); ++p) {
+            const auto& page = file->Pages()[p];
+            const auto* pageWords = words.data() + file->PageWordOffset(p);
+            const auto vertexCount = pageWords[0] >> 16u;
+            const auto* typeBytes = reinterpret_cast<const std::uint8_t*>(
+                pageWords + lod::kPageHeaderWords + page.recordCount * lod::kRecordWords +
+                vertexCount * lod::kVertexWords);
+            for (std::uint32_t i = 0; i < page.recordCount; ++i) {
+                const auto edge = recordEdges[page.firstRecord + i];
+                Require(typeBytes[i] == expected[edge],
+                        "a shortcut draws with the style of the roads it stands for");
+                seen[edge] = true;
+            }
+        }
+        Require(std::all_of(seen.begin(), seen.end(), [](bool s) { return s; }),
+                "every edge of the test graph has a record");
+        // The classic method gives its segments the same styles.
+        RequireCpuPassesMatchDfs(file, "CPU passes on the shortcut style graph differ");
+        const std::stop_source stop;
+        const auto classic = cpu::ClassicGraph::Load(*file, stop.get_token());
+        cpu::CpuWorkers workers(1);
+        const lod::LodPageQuery top{-1e9f, -1e9f, 1e9f, 1e9f, 2u, lod::kErrorCodeMax};
+        const auto roots =
+            classic->Run(workers, top, cpu::CpuFilter::FullScan, cpu::CpuExpansion::Roots);
+        Require(roots.segments.size() == 1u && roots.edges[0] == 4u &&
+                    roots.segments[0].type == 12u,
+                "the classic method draws the top shortcut as residential");
+    }
+    std::filesystem::remove(graphPath);
+    std::filesystem::remove(rangesPath);
+    std::filesystem::remove(filePath);
+}
+
 void TestLodPageBuilder() {
     namespace lod = chmv::streaming::lod;
     {
@@ -418,6 +1099,7 @@ void TestLodPageBuilder() {
                 "level 2, exact: fully unfolded");
         RequireLodCutsMatchDfs(*file, "page cut differs from DFS");
         RequireTraversalsMatchDfs(*file, "traversal differs from DFS");
+        RequireCpuPassesMatchDfs(file, "CPU passes differ from DFS");
 
         lod::LodPageQuery everywhere{-1e9f, -1e9f, 1e9f, 1e9f, 2, 0};
         std::vector<std::uint32_t> pages;
@@ -435,6 +1117,7 @@ void TestLodPageBuilder() {
         const auto file = lod::LodPageFile::Open(filePath);
         RequireLodCutsMatchDfs(*file, "root + parent at the same level differs from DFS");
         RequireTraversalsMatchDfs(*file, "traversal with a revisited shortcut differs from DFS");
+        RequireCpuPassesMatchDfs(file, "CPU passes differ from DFS");
     }
     {
         // Shortcut 7 (0-3 via 2) is a second parent of shortcut 4, alive at the same level as 6.
@@ -446,15 +1129,31 @@ void TestLodPageBuilder() {
         const auto file = lod::LodPageFile::Open(filePath);
         RequireLodCutsMatchDfs(*file, "two parents at the same level differ from DFS");
         RequireTraversalsMatchDfs(*file, "traversal with two parents differs from DFS");
+        RequireCpuPassesMatchDfs(file, "CPU passes differ from DFS");
+    }
+    {
+        const WalkOnlyGraph source(600);
+        const auto filePath = lod::LodPageFile::DefaultPath(source.graphPath);
+        const auto result = lod::LodPageBuilder::Build(source.graphPath, source.rangesPath,
+                                                       filePath);
+        Require(result.visitOnlyRecords == 600u, "every bent shortcut is only walked through");
+        const auto file = lod::LodPageFile::Open(filePath);
+        Require(std::any_of(file->Pages().begin(), file->Pages().end(),
+                            [](const lod::PageEntry& page) {
+                                return page.minLevel > page.maxLevel;
+                            }),
+                "some pages hold only records that are never drawn");
+        RequireLodCutsMatchDfs(*file, "pages of walk-only records change the cut");
+        RequireTraversalsMatchDfs(*file, "traversal through walk-only pages differs from DFS");
+        RequireCpuPassesMatchDfs(file, "CPU passes differ from DFS");
     }
 }
 
-// The same file as the builder writes it before compressing, marked as a version 3 file.
+// The same file as the builder writes it before compressing.
 void WriteUncompressed(const chmv::streaming::lod::LodPageFile& file,
                        const std::filesystem::path& path) {
     namespace lod = chmv::streaming::lod;
     auto header = file.Header();
-    header.version = lod::kUncompressedFormatVersion;
     header.compression = lod::Compression::None;
     header.stored = {};
     header.pageFrames = {};
@@ -544,8 +1243,8 @@ void TestAsyncDatasetLoader() {
                 "a damaged page file is rebuilt");
     }
 
-    // A version 3 file (the same file uncompressed) is compressed, not rebuilt: the sources keep
-    // their size and time but could not be read any more.
+    // An uncompressed file (as the builder writes it before compressing) is compressed, not
+    // rebuilt: the sources keep their size and time but could not be read any more.
     {
         namespace lod = chmv::streaming::lod;
         WriteUncompressed(*lod::LodPageFile::Open(pageFile), pageFile);
@@ -559,7 +1258,7 @@ void TestAsyncDatasetLoader() {
     Require(chmv::streaming::lod::LodPageFile::Open(pageFile)->Compressed() &&
                 chmv::streaming::lod::LodPageFile::Open(pageFile)->Header().version ==
                     chmv::streaming::lod::kFormatVersion,
-            "a version 3 file is compressed on load");
+            "an uncompressed page file is compressed on load");
     {
         const chmv::data::DatasetCatalog catalog(root);
         Require(catalog.Entries().size() == 1u && catalog.Entries()[0].HasSources() &&
@@ -610,6 +1309,10 @@ void TestRoadStyles() {
     Require(nameOf(0) == "other" && nameOf(chmv::data::RoadStyleFallbackType) == "other",
             "unlisted types use the * class");
     Require(shipped.TypeWidths()[1] == 4.5f, "width of a class reaches its types");
+    const auto depths = shipped.TypeDepths();
+    Require(depths[1] < depths[9] && depths[9] < depths[3] && depths[3] < depths[12] &&
+                depths[12] < depths[0] && depths[1] > 0.0f && depths[0] < 1.0f,
+            "classes listed first lie on top, inside the depth range");
 
     const auto path = std::filesystem::temp_directory_path() / "chmv_road_styles_test.cfg";
     const auto parse = [&](const std::string& text) {
@@ -640,9 +1343,12 @@ int main() {
     try {
         TestErrorBounds();
         TestRoadStyles();
+        TestToleranceController();
         TestCompression();
         TestLodPageBuilder();
+        TestShortcutStyles();
         TestCompressedPageFile();
+        TestCpuPartialViews();
         TestAsyncDatasetLoader();
         std::cout << "All tests passed.\n";
         return 0;

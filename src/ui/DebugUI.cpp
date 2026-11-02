@@ -2,6 +2,8 @@
 
 #include "benchmark/LodPageZoomSweep.h"
 #include "core/Window.h"
+#include "cpu/CpuRuntime.h"
+#include "cpu/CpuWorkers.h"
 #include "data/AsyncDatasetLoader.h"
 #include "data/DatasetCatalog.h"
 #include "gpu/filtering/RangeFilterStrategyManager.h"
@@ -149,7 +151,12 @@ void DebugUI::BeginFrame() const {
 
 DebugUIActions DebugUI::Draw(const DebugUIState& state) {
     DebugUIActions actions;
+    if (state.stats != nullptr && state.mode == cpu::ProcessingMode::Compare) {
+        DrawSplitLabels(state);
+    }
     ImGui::Begin("CH_MapViewer");
+    // Every text line wraps at the window edge.
+    ImGui::PushTextWrapPos(0.0f);
     DrawDataset(state, actions);
     ImGui::Separator();
     if (state.stats != nullptr) {
@@ -161,6 +168,7 @@ DebugUIActions DebugUI::Draw(const DebugUIState& state) {
     } else {
         ImGui::TextUnformatted("No dataset loaded.");
     }
+    ImGui::PopTextWrapPos();
     ImGui::End();
     return actions;
 }
@@ -252,41 +260,177 @@ void DebugUI::DrawView(const DebugUIState& state) {
     ImGui::TextDisabled("Mouse wheel: zoom | Left mouse: pan");
 }
 
-void DebugUI::DrawPipeline(const DebugUIState& state, DebugUIActions& actions) {
-    if (!ImGui::CollapsingHeader("GPU pipeline", ImGuiTreeNodeFlags_DefaultOpen)) {
+void DebugUI::DrawSplitLabels(const DebugUIState& state) {
+    auto* draw = ImGui::GetBackgroundDrawList();
+    const auto size = ImGui::GetIO().DisplaySize;
+    const auto middle = size.x * 0.5f;
+    draw->AddLine(ImVec2(middle, 0.0f), ImVec2(middle, size.y), IM_COL32(200, 200, 200, 160),
+                  2.0f);
+    const auto text = ImGui::GetColorU32(ImGuiCol_Text);
+    const auto bottom = size.y - ImGui::GetTextLineHeight() - 8.0f;
+    draw->AddText(ImVec2(8.0f, bottom), text, "GPU");
+    draw->AddText(ImVec2(middle + 8.0f, bottom), text,
+                  state.cpuMethod == cpu::CpuMethod::Pages ? "CPU (pages)"
+                                                            : "CPU (classic, whole CH)");
+}
+
+void DebugUI::DrawProcessing(const DebugUIState& state) {
+    auto mode = static_cast<int>(state.mode);
+    ImGui::TextUnformatted("Processing:");
+    ImGui::SameLine();
+    ImGui::RadioButton("GPU", &mode, static_cast<int>(cpu::ProcessingMode::Gpu));
+    ImGui::SameLine();
+    ImGui::RadioButton("CPU", &mode, static_cast<int>(cpu::ProcessingMode::Cpu));
+    ImGui::SameLine();
+    ImGui::RadioButton("Compare", &mode, static_cast<int>(cpu::ProcessingMode::Compare));
+    state.mode = static_cast<cpu::ProcessingMode>(mode);
+    if (state.mode == cpu::ProcessingMode::Gpu) {
         return;
     }
-    const auto& stats = *state.stats;
-    ImGui::TextDisabled("Loading: virtual map. Pages follow from the camera alone and stream "
-                        "into a GPU page pool.");
-    ImGui::Checkbox("Preload all pages to the GPU if they fit", &state.preloadAll);
-    if (state.preloadAll && !stats.preloadFits) {
-        ImGui::TextColored(kWarning, "Not every page fits the GPU pool; streaming as needed.");
+    if (state.mode == cpu::ProcessingMode::Compare) {
+        ImGui::TextDisabled("GPU on the left, CPU on the right, same view; the roads in view are "
+                            "compared edge by edge once the view is still and complete.");
+    } else {
+        ImGui::TextDisabled("The CPU decides what is drawn; the GPU only rasterizes.");
     }
+    const char* methods[] = {"Pages (the GPU's pages and strategies, on the CPU)",
+                             "Classic (whole CH in RAM, no pages)"};
+    auto method = static_cast<int>(state.cpuMethod);
+    if (ImGui::Combo("CPU method", &method, methods, 2)) {
+        state.cpuMethod = static_cast<cpu::CpuMethod>(method);
+    }
+    ImGui::SliderInt("CPU threads", &state.cpuThreads, 1,
+                     static_cast<int>(cpu::CpuWorkers::HardwareThreads()));
+    if (state.cpuMethod == cpu::CpuMethod::Classic) {
+        const auto& classic = state.classic;
+        switch (classic.state) {
+        case cpu::ClassicState::NotLoaded:
+            break;
+        case cpu::ClassicState::Loading:
+            ImGui::TextColored(kWarning, "Classic: %s ...", classic.message.c_str());
+            break;
+        case cpu::ClassicState::Ready:
+            ImGui::TextDisabled("Classic: whole CH in RAM, %.0f MiB, loaded in %.1f s; the "
+                                "\"GPU page culling\" filter becomes a grid of the edges",
+                                Megabytes(classic.bytes), classic.loadSeconds);
+            break;
+        case cpu::ClassicState::Failed:
+            ImGui::TextColored(kFailure, "Classic: %s", classic.message.c_str());
+            break;
+        }
+    }
+}
 
-    StrategyCombo("Filter", state.filters);
-    StrategyCombo("Expansion", state.unfolds);
+void DebugUI::DrawTolerance(const DebugUIState& state) {
     const bool adaptive = state.unfolds.Current().Mode() == geometry::RefinementMode::Adaptive;
     if (!adaptive) {
         ImGui::BeginDisabled();
     }
-    ImGui::SliderFloat("Pixel tolerance", &state.pixelTolerance, 0.5f, 16.0f, "%.2f px",
-                       ImGuiSliderFlags_Logarithmic);
+    auto& settings = state.tolerance;
+    int mode = static_cast<int>(settings.mode);
+    ImGui::Combo("Tolerance", &mode, "Manual\0Auto: predictive\0Auto: PI feedback\0");
+    settings.mode = static_cast<renderer::ToleranceMode>(mode);
+    if (settings.mode == renderer::ToleranceMode::Manual) {
+        ImGui::SliderFloat("Pixel tolerance", &state.pixelTolerance, 0.5f, 16.0f, "%.2f px",
+                           ImGuiSliderFlags_Logarithmic);
+    } else {
+        ImGui::SliderFloat("Target frame rate", &settings.targetFps, 10.0f, 240.0f, "%.0f fps");
+        const auto& status = state.toleranceStatus;
+        ImGui::Text("Auto: %.2f px (step %d of %d), last frame %.1f ms of %.1f ms",
+                    static_cast<double>(renderer::StepPixels(status.step)), status.step,
+                    renderer::kToleranceSteps - 1, status.lastFrameMs, status.budgetMs);
+        const auto step = static_cast<std::size_t>(status.step);
+        ImGui::TextDisabled("Predicted at this step: %.1f ms moving, %.1f ms still; other "
+                            "work %.1f ms%s",
+                            status.movingMs[step], status.stillMs[step], status.otherMs,
+                            status.counted ? "" : " (segments per step not counted)");
+    }
+    ImGui::Checkbox("Twice the tolerance while moving", &settings.coarserWhileMoving);
+    if (state.toleranceCoarsened) {
+        ImGui::SameLine();
+        ImGui::TextColored(kWarning, "now %.2f px", static_cast<double>(state.tolerancePixels));
+    }
     if (!adaptive) {
         ImGui::EndDisabled();
+        ImGui::TextDisabled("The tolerance only applies to adaptive expansions.");
     }
-    ImGui::Text("Level %u, error code %u: %u candidates, %u segments drawn", stats.drawLevel,
-                stats.drawThreshold, stats.candidates, stats.drawnSegments);
-    if (stats.gpuFilterMs && stats.gpuUnfoldMs) {
-        ImGui::Text("GPU filter %.3f ms, expansion %.3f ms, draw %.3f ms", *stats.gpuFilterMs,
-                    *stats.gpuUnfoldMs, stats.gpuDrawMs.value_or(0.0));
-    }
-    StatusLines(stats.status);
+}
 
-    if (ImGui::Button("Validate against CPU")) {
-        actions.validate = true;
+void DebugUI::DrawCpuResults(const DebugUIState& state) {
+    const auto* result = state.cpu;
+    if (result == nullptr) {
+        return;
     }
-    ImGui::SameLine();
+    if (!result->unavailable.empty()) {
+        ImGui::TextColored(kWarning, "CPU: %s", result->unavailable.c_str());
+    } else {
+        ImGui::Text("CPU (%u threads): %llu candidates, %llu segments drawn", result->threads,
+                    Count(result->candidates), Count(result->segments.size()));
+        ImGui::Text("CPU prepare %.3f ms, filter %.3f ms, expansion %.3f ms, output %.3f ms "
+                    "(total %.3f ms)",
+                    result->prepareMs, result->filterMs, result->expandMs, result->outputMs,
+                    result->TotalMs());
+    }
+    if (!state.cpuDrawError.empty()) {
+        ImGui::TextColored(kFailure, "%s", state.cpuDrawError.c_str());
+    }
+    if (state.mode != cpu::ProcessingMode::Compare) {
+        return;
+    }
+    if (const auto* comparison = state.comparison) {
+        if (!comparison->notCompared.empty()) {
+            ImGui::TextColored(kWarning, "Not compared: %s", comparison->notCompared.c_str());
+        } else if (comparison->Identical()) {
+            ImGui::TextColored(kSuccess, "GPU = CPU: %llu roads in view, identical",
+                               Count(comparison->gpuInView));
+        } else {
+            ImGui::TextColored(kFailure,
+                               "GPU != CPU: %llu roads in view on the GPU, %llu on the CPU; %llu "
+                               "only on the GPU, %llu only on the CPU",
+                               Count(comparison->gpuInView), Count(comparison->cpuInView),
+                               Count(comparison->onlyGpu), Count(comparison->onlyCpu));
+        }
+    } else {
+        ImGui::TextDisabled("Comparing once the view is still and complete on both sides.");
+    }
+}
+
+void DebugUI::DrawPipeline(const DebugUIState& state, DebugUIActions& actions) {
+    if (!ImGui::CollapsingHeader("Pipeline", ImGuiTreeNodeFlags_DefaultOpen)) {
+        return;
+    }
+    const auto& stats = *state.stats;
+    DrawProcessing(state);
+    const bool gpuOn = state.mode != cpu::ProcessingMode::Cpu;
+    if (gpuOn) {
+        ImGui::TextDisabled("Loading: virtual map. Pages follow from the camera alone and "
+                            "stream into a GPU page pool.");
+        ImGui::Checkbox("Preload all pages to the GPU if they fit", &state.preloadAll);
+        if (state.preloadAll && !stats.preloadFits) {
+            ImGui::TextColored(kWarning, "Not every page fits the GPU pool; streaming as needed.");
+        }
+    }
+
+    StrategyCombo("Filter", state.filters);
+    StrategyCombo("Expansion", state.unfolds);
+    DrawTolerance(state);
+    if (gpuOn) {
+        ImGui::Text("GPU: level %u, error code %u: %u candidates, %u segments drawn",
+                    stats.drawLevel, stats.drawThreshold, stats.candidates, stats.drawnSegments);
+        if (stats.gpuFilterMs && stats.gpuUnfoldMs) {
+            ImGui::Text("GPU filter %.3f ms, expansion %.3f ms, draw %.3f ms", *stats.gpuFilterMs,
+                        *stats.gpuUnfoldMs, stats.gpuDrawMs.value_or(0.0));
+        }
+        StatusLines(stats.status);
+    }
+    DrawCpuResults(state);
+
+    if (gpuOn) {
+        if (ImGui::Button("Validate against CPU")) {
+            actions.validate = true;
+        }
+        ImGui::SameLine();
+    }
     if (ImGui::Button("Benchmark filter + expansion")) {
         actions.runBenchmark = true;
     }
@@ -316,6 +460,20 @@ void DebugUI::DrawPipeline(const DebugUIState& state, DebugUIActions& actions) {
                     result->filterMinMs, result->filterMaxMs, result->unfoldAverageMs,
                     result->unfoldMinMs, result->unfoldMaxMs);
         ImGui::TextDisabled("%u candidates, %u segments", result->candidates, result->segments);
+    }
+    if (const auto* result = state.cpuBenchmark) {
+        if (!result->unavailable.empty()) {
+            ImGui::TextColored(kWarning, "CPU benchmark: %s", result->unavailable.c_str());
+        } else {
+            ImGui::Text("CPU, %u threads, %u passes: filter %.3f ms (%.3f - %.3f), expansion "
+                        "%.3f ms (%.3f - %.3f)",
+                        result->threads, result->iterations, result->filterAverageMs,
+                        result->filterMinMs, result->filterMaxMs, result->expandAverageMs,
+                        result->expandMinMs, result->expandMaxMs);
+            ImGui::TextDisabled("Preparing %.3f ms per pass; %llu candidates, %llu segments",
+                                result->prepareAverageMs, Count(result->candidates),
+                                Count(result->segments));
+        }
     }
 }
 
@@ -393,7 +551,7 @@ void DebugUI::DrawZoomSweep(const DebugUIState& state, DebugUIActions& actions) 
             actions.startZoomSweep = true;
         }
         if (sweep != nullptr && !sweep->Summary().empty()) {
-            ImGui::TextWrapped("%s", sweep->Summary().c_str());
+            ImGui::TextUnformatted(sweep->Summary().c_str());
         }
     }
 }

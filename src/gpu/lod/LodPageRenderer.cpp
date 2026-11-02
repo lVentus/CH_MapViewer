@@ -20,10 +20,13 @@ using chmv::streaming::lod::kPageRecordCapacity;
 
 // The command buffer holds the indirect draw arguments followed by the segment count.
 constexpr std::size_t kCommandWords = 5;
-// Readback layout: command, candidate count, two spare words, status.
+// Readback layout: command, candidate count, two spare words, status, segments per tolerance
+// step.
 constexpr std::size_t kReadbackCandidateWord = 5;
 constexpr std::size_t kReadbackStatusWord = 8;
-constexpr std::size_t kReadbackWords = kReadbackStatusWord + kStatusWords;
+constexpr std::size_t kReadbackStepWord = kReadbackStatusWord + kStatusWords;
+constexpr auto kSteps = static_cast<std::size_t>(chmv::renderer::kToleranceSteps);
+constexpr std::size_t kReadbackWords = kReadbackStepWord + kSteps;
 // Segment room grows by doubling when a traversal draws more than the pages hold records.
 constexpr std::uint32_t kMaxSegmentScale = 8;
 
@@ -35,19 +38,6 @@ constexpr std::uint32_t kMaxSegmentScale = 8;
     constexpr double kLimit = 1073741823.0;
     const auto fixed = std::round(static_cast<double>(center) * kFixedCoordinateScale);
     return static_cast<GLint>(std::clamp(fixed, -kLimit, kLimit));
-}
-
-// The query box in fixed coordinates, rounded inward (and two units more), so a node that the
-// traversal keeps always lies in a page the planner chose with the float box.
-[[nodiscard]] std::array<std::int32_t, 4> CullBox(const chmv::streaming::lod::LodPageQuery& query) {
-    const auto inward = [](float value, double direction) {
-        constexpr double kLimit = 1073741824.0;
-        const auto fixed = static_cast<double>(value) * kFixedCoordinateScale;
-        const auto rounded = direction > 0.0 ? std::ceil(fixed) + 2.0 : std::floor(fixed) - 2.0;
-        return static_cast<std::int32_t>(std::clamp(rounded, -kLimit, kLimit));
-    };
-    return {inward(query.minX, 1.0), inward(query.minY, 1.0), inward(query.maxX, -1.0),
-            inward(query.maxY, -1.0)};
 }
 
 void CopyWords(const GPUBuffer& from, std::size_t fromWord, const GPUBuffer& to, std::size_t toWord,
@@ -77,7 +67,8 @@ void CopyWords(const GPUBuffer& from, std::size_t fromWord, const GPUBuffer& to,
 
 LodPageRenderer::LodPageRenderer(const std::filesystem::path& shaderDirectory)
     : roadProgram_(shaderDirectory / "lod_page_road.vert", shaderDirectory / "lod_page_road.frag"),
-      finishProgram_(shaderDirectory / "lod_draw_finish.comp") {
+      finishProgram_(shaderDirectory / "lod_draw_finish.comp"),
+      countProgram_(shaderDirectory / "lod_tolerance_counts.comp") {
     glGenVertexArrays(1, &vertexArray_);
     const std::array<std::uint32_t, kCommandWords> empty{};
     commandBuffer_.Allocate(sizeof(empty), empty.data());
@@ -92,6 +83,7 @@ LodPageRenderer::LodPageRenderer(const std::filesystem::path& shaderDirectory)
         mantissas[step] = chmv::streaming::lod::ErrorBoundMantissa(step);
     }
     errorBounds_.Allocate(sizeof(mantissas), mantissas.data(), GL_STATIC_DRAW);
+    stepCountBuffer_.Allocate(kSteps * 4u);
     GLint64 maxBlockBytes = 0;
     glGetInteger64v(GL_MAX_SHADER_STORAGE_BLOCK_SIZE, &maxBlockBytes);
     // 16 MiB is the least GL 4.3 guarantees.
@@ -172,7 +164,7 @@ void LodPageRenderer::Unfold(const LodPagePool& pool, const LodPagePass& pass,
     input.candidateCapacity = capacities.candidates;
     input.level = pass.query.level;
     input.threshold = pass.query.threshold;
-    input.cullBox = CullBox(pass.query);
+    input.cullBox = chmv::streaming::lod::TraversalCullBox(pass.query);
     input.hierarchyHeight = pass.hierarchyHeight;
     input.errorBounds = errorBounds_.Id();
     input.segmentBuffer = segmentBuffer_.Id();
@@ -192,9 +184,25 @@ void LodPageRenderer::Unfold(const LodPagePool& pool, const LodPagePass& pass,
                     GL_BUFFER_UPDATE_BARRIER_BIT);
 }
 
+void LodPageRenderer::CountSteps(const LodPagePool& pool, const LodPagePass& pass,
+                                 std::uint32_t stepBase) {
+    const std::array<std::uint32_t, kSteps> zero{};
+    stepCountBuffer_.Update(0, sizeof(zero), zero.data());
+    countProgram_.Bind();
+    const auto program = countProgram_.Id();
+    pool.BindForKernel(program);
+    slotList_.BindBase(GL_SHADER_STORAGE_BUFFER, 2);
+    stepCountBuffer_.BindBase(GL_SHADER_STORAGE_BUFFER, 5);
+    glUniform1ui(glGetUniformLocation(program, "uLevel"), pass.query.level);
+    glUniform1ui(glGetUniformLocation(program, "uStepBase"), stepBase);
+    ListDispatcher::Dispatch(slotList_.Id());
+    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT);
+}
+
 void LodPageRenderer::Process(const LodPagePool& pool, const LodPagePass& pass,
                               filtering::IRangeFilterStrategy& filter,
-                              unfolding::IUnfoldingStrategy& unfold) {
+                              unfolding::IUnfoldingStrategy& unfold,
+                              std::optional<std::uint32_t> stepBase) {
     const auto capacities = StartPass(pool, pass);
     if (pass.slots.empty()) {
         // Results of earlier passes still in flight would overwrite these.
@@ -207,6 +215,7 @@ void LodPageRenderer::Process(const LodPagePool& pool, const LodPagePass& pass,
         drawnSegments_ = 0;
         candidates_ = 0;
         status_ = {};
+        stepCounts_.reset();
         return;
     }
     filterTimer_.Begin();
@@ -215,6 +224,11 @@ void LodPageRenderer::Process(const LodPagePool& pool, const LodPagePass& pass,
     unfoldTimer_.Begin();
     Unfold(pool, pass, capacities, unfold);
     unfoldTimer_.End();
+    if (stepBase) {
+        countTimer_.Begin();
+        CountSteps(pool, pass, *stepBase);
+        countTimer_.End();
+    }
 
     auto& readback = readbacks_[nextReadback_];
     nextReadback_ = (nextReadback_ + 1u) % readbacks_.size();
@@ -224,8 +238,12 @@ void LodPageRenderer::Process(const LodPagePool& pool, const LodPagePass& pass,
     CopyWords(commandBuffer_, 0, readback.buffer, 0, kCommandWords);
     CopyWords(candidateList_, 0, readback.buffer, kReadbackCandidateWord, 1);
     CopyWords(statusBuffer_, 0, readback.buffer, kReadbackStatusWord, kStatusWords);
+    if (stepBase) {
+        CopyWords(stepCountBuffer_, 0, readback.buffer, kReadbackStepWord, kSteps);
+    }
     readback.fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
     readback.segmentScale = segmentScale_;
+    readback.counted = stepBase.has_value();
 }
 
 LodPageBenchmarkResult LodPageRenderer::Benchmark(const LodPagePool& pool,
@@ -292,6 +310,12 @@ void LodPageRenderer::Poll() {
         drawnSegments_ = words[4];
         candidates_ = words[kReadbackCandidateWord];
         std::copy_n(words.begin() + kReadbackStatusWord, kStatusWords, status_.begin());
+        if (readback.counted) {
+            stepCounts_.emplace();
+            std::copy_n(words.begin() + kReadbackStepWord, kSteps, stepCounts_->begin());
+        } else {
+            stepCounts_.reset();
+        }
 
         const auto ranOutOfRoom =
             status_[static_cast<std::size_t>(LodPageStatus::SegmentOverflow)] != 0u ||
@@ -350,8 +374,15 @@ void LodPageRenderer::Draw(const LodPagePool& pool, const renderer::MapCamera2D&
                  static_cast<GLsizei>(colors.size()), colors.front().data());
     glUniform1fv(glGetUniformLocation(program, "uRoadWidths[0]"),
                  static_cast<GLsizei>(widths.size()), widths.data());
+    const auto depths = styles.TypeDepths();
+    glUniform1fv(glGetUniformLocation(program, "uRoadDepths[0]"),
+                 static_cast<GLsizei>(depths.size()), depths.data());
 
     drawTimer_.Begin();
+    // Classes listed first on top: a road of an earlier class hides one of a later class, and
+    // of two roads of one class the first drawn stays.
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_LESS);
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glBindVertexArray(vertexArray_);
@@ -360,6 +391,7 @@ void LodPageRenderer::Draw(const LodPagePool& pool, const renderer::MapCamera2D&
     glBindBuffer(GL_DRAW_INDIRECT_BUFFER, 0);
     glBindVertexArray(0);
     glDisable(GL_BLEND);
+    glDisable(GL_DEPTH_TEST);
     drawTimer_.End();
 }
 

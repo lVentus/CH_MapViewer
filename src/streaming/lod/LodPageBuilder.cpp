@@ -1,7 +1,6 @@
 #include "streaming/lod/LodPageBuilder.h"
 
 #include "data/SystemMemory.h"
-#include "data/ch/CHTypes.h"
 #include "renderer/LODController.h"
 #include "renderer/MapCamera2D.h"
 #include "streaming/lod/LodPageCompression.h"
@@ -267,7 +266,6 @@ struct EdgeRow {
     std::uint32_t edge = 0;
     std::uint32_t source = 0;
     std::uint32_t target = 0;
-    std::int16_t type = 0;
     std::int16_t birth = -1;
     std::int16_t death = -1;
     float error = 0.0f;
@@ -279,7 +277,7 @@ public:
     EdgeRows(const std::filesystem::path& file, const FileHeader& header)
         : sources_(file, header.At(Section::EdgeSource)),
           targets_(file, header.At(Section::EdgeTarget)),
-          types_(file, header.At(Section::EdgeType)), births_(file, header.At(Section::EdgeBirth)),
+          births_(file, header.At(Section::EdgeBirth)),
           deaths_(file, header.At(Section::EdgeDeath)),
           errors_(file, header.At(Section::EdgeError)) {}
 
@@ -291,7 +289,6 @@ public:
             row.edge = edge;
             row.source = sources_.Next();
             row.target = targets_.Next();
-            row.type = types_.Next();
             row.birth = births_.Next();
             row.death = deaths_.Next();
             row.error = errors_.Next();
@@ -301,14 +298,13 @@ public:
     private:
         friend class EdgeRows;
         Range(ValueReader<std::uint32_t>& sources, ValueReader<std::uint32_t>& targets,
-              ValueReader<std::int16_t>& types, ValueReader<std::int16_t>& births,
-              ValueReader<std::int16_t>& deaths, ValueReader<float>& errors)
-            : sources_(sources), targets_(targets), types_(types), births_(births), deaths_(deaths),
+              ValueReader<std::int16_t>& births, ValueReader<std::int16_t>& deaths,
+              ValueReader<float>& errors)
+            : sources_(sources), targets_(targets), births_(births), deaths_(deaths),
               errors_(errors) {}
 
         ValueReader<std::uint32_t>& sources_;
         ValueReader<std::uint32_t>& targets_;
-        ValueReader<std::int16_t>& types_;
         ValueReader<std::int16_t>& births_;
         ValueReader<std::int16_t>& deaths_;
         ValueReader<float>& errors_;
@@ -316,14 +312,13 @@ public:
 
     [[nodiscard]] Range At(unsigned worker, IndexRange range) {
         return Range(sources_.At(worker, range), targets_.At(worker, range),
-                     types_.At(worker, range), births_.At(worker, range), deaths_.At(worker, range),
+                     births_.At(worker, range), deaths_.At(worker, range),
                      errors_.At(worker, range));
     }
 
 private:
     ColumnReaders<std::uint32_t> sources_;
     ColumnReaders<std::uint32_t> targets_;
-    ColumnReaders<std::int16_t> types_;
     ColumnReaders<std::int16_t> births_;
     ColumnReaders<std::int16_t> deaths_;
     ColumnReaders<float> errors_;
@@ -338,8 +333,10 @@ private:
 class RecordMaker {
 public:
     RecordMaker(const LodPageNodes& nodes, const ContextTable& contexts,
-                const ReferenceCurve& curve, const EdgeMask& shortcuts)
-        : nodes_(nodes), contexts_(contexts), curve_(curve), shortcuts_(shortcuts) {
+                const ReferenceCurve& curve, const EdgeMask& shortcuts,
+                std::span<const std::uint8_t> styles)
+        : nodes_(nodes), contexts_(contexts), curve_(curve), shortcuts_(shortcuts),
+          styles_(styles) {
         minX_ = *std::min_element(nodes.x.begin(), nodes.x.end());
         minY_ = *std::min_element(nodes.y.begin(), nodes.y.end());
         const auto maxX = *std::max_element(nodes.x.begin(), nodes.x.end());
@@ -452,7 +449,7 @@ private:
         record.childLevels = PackLevels(child);
         record.errors =
             static_cast<std::uint32_t>(errorCode) | (static_cast<std::uint32_t>(parentCode) << 16u);
-        record.style = static_cast<std::uint8_t>(data::RoadStyleIndexFromType(row.type));
+        record.style = styles_[row.edge];
     }
 
     [[nodiscard]] std::uint64_t Key(const EdgeRow& row, LevelInterval root, LevelInterval child,
@@ -477,6 +474,7 @@ private:
     const ContextTable& contexts_;
     const ReferenceCurve& curve_;
     const EdgeMask& shortcuts_;
+    std::span<const std::uint8_t> styles_;
     double minX_ = 0.0;
     double minY_ = 0.0;
     double scaleX_ = 1.0;
@@ -1747,10 +1745,10 @@ void RemoveStaleScratch(const std::filesystem::path& temporaryPath) {
 
 std::uint64_t LodPageBuilder::EstimateMemoryBytes(std::uint64_t nodeCount,
                                                   std::uint64_t edgeCount) {
-    // The fullest stage holds node positions and levels (10 B per node), the level contexts
-    // and each edge's record cell (7 B per edge) and a sort buffer that packs the pages in
-    // about kTargetPagePasses passes (about one record per edge).
-    return nodeCount * 10u + edgeCount * (7u + sizeof(Record) / kTargetPagePasses) +
+    // The fullest stage holds node positions and levels (10 B per node), the level contexts,
+    // each edge's record cell and road style (8 B per edge) and a sort buffer that packs the
+    // pages in about kTargetPagePasses passes (about one record per edge).
+    return nodeCount * 10u + edgeCount * (8u + sizeof(Record) / kTargetPagePasses) +
            WorkerCount() * kWorkerBytes + (512ull << 20u);
 }
 
@@ -1819,6 +1817,7 @@ namespace {
         HashOf(hashes, Section::EdgeError)
             .Update(errors.error.data(), errors.error.size() * sizeof(float));
     }
+    const auto styles = ComputeStyles(temporary.Path(), header, nodes, chunks, shortcuts, progress);
     // Records read the CH columns back while the page section is appended.
     output.Flush();
 
@@ -1830,7 +1829,7 @@ namespace {
     std::uint64_t representativeCount = 0;
     {
         const auto contexts = ComputeContexts(chunks, m, progress);
-        const RecordMaker maker(nodes, contexts, curve, shortcuts);
+        const RecordMaker maker(nodes, contexts, curve, shortcuts, styles);
         auto plan =
             PlanRecords(temporary.Path(), header, nodes, maker, contexts, output, hashes, progress);
         if (plan.recordCount > 0xffffffffull) {
@@ -1848,7 +1847,7 @@ namespace {
         header.At(Section::RecordEdge) = {offset, header.recordCount * 4u};
         header.At(Section::Pages) = {AlignSection(offset + header.recordCount * 4u), 0u};
 
-        const auto fixed = nodes.Bytes() + m * 7u + plan.extras.size() * sizeof(Record) +
+        const auto fixed = nodes.Bytes() + m * 8u + plan.extras.size() * sizeof(Record) +
                            contexts.extra.size() * kExtraContextBytes +
                            header.recordCount / kPageRecordCapacity *
                                (sizeof(PageEntry) * 3u + sizeof(ChildMask)) +

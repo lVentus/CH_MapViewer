@@ -99,6 +99,13 @@ struct ErrorTable {
                                        std::uint64_t edgeCount,
                                        const LodPageBuilder::ProgressCallback& progress);
 
+// The road style every edge draws with (EdgeStyle in LodPageFormat.h): originals from their
+// type, then shortcuts from their halves, children first.
+[[nodiscard]] std::vector<std::uint8_t>
+ComputeStyles(const std::filesystem::path& file, const FileHeader& header,
+              const LodPageNodes& nodes, LevelChunks& chunks, const EdgeMask& shortcuts,
+              const LodPageBuilder::ProgressCallback& progress);
+
 struct LevelContext {
     std::int16_t low = 1;
     std::int16_t high = 0;

@@ -44,9 +44,9 @@ void GPUTimer::Begin() {
     }
 }
 
-void GPUTimer::End() {
+std::uint64_t GPUTimer::End() {
     if (activeQuery_ < 0) {
-        return;
+        return 0;
     }
 
     const auto index = static_cast<std::size_t>(activeQuery_);
@@ -54,6 +54,7 @@ void GPUTimer::End() {
     pending_[index] = true;
     sequence_[index] = nextSequence_++;
     activeQuery_ = -1;
+    return sequence_[index];
 }
 
 void GPUTimer::CollectReadyResults() {

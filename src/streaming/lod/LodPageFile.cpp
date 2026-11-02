@@ -4,6 +4,7 @@
 #include "streaming/lod/LodPageIo.h"
 
 #include <algorithm>
+#include <bit>
 #include <cstring>
 #include <fstream>
 #include <stdexcept>
@@ -34,8 +35,7 @@ void ValidateHeader(const std::filesystem::path& path, const FileHeader& header,
     if (header.magic != kFileMagic) {
         Fail(path, "not a LOD page file");
     }
-    if (header.version != kFormatVersion &&
-        (header.version != kUncompressedFormatVersion || header.compression != Compression::None)) {
+    if (header.version != kFormatVersion) {
         Fail(path, "unsupported LOD page format version " + std::to_string(header.version));
     }
     if (header.headerBytes != kHeaderBytes || header.pageSlotWords != kPageSlotWords) {
@@ -102,10 +102,17 @@ void ValidateHeader(const std::filesystem::path& path, const FileHeader& header,
     }
 }
 
+// A page (or group) whose records are only walked through by traversals, never drawn, has the
+// empty level range, which no query matches.
+[[nodiscard]] bool ValidLevels(std::uint16_t minLevel, std::uint16_t maxLevel) {
+    return minLevel <= maxLevel || PackLevelRange(minLevel, maxLevel) == kEmptyLevelRange;
+}
+
 void ValidatePages(const std::filesystem::path& path, const FileHeader& header,
                    std::span<const PageEntry> pages, std::span<const PageGroup> groups) {
     const auto& section = header.At(Section::Pages);
-    for (const auto& page : pages) {
+    for (std::size_t p = 0; p < pages.size(); ++p) {
+        const auto& page = pages[p];
         const auto bytes = static_cast<std::uint64_t>(page.wordCount) * 4u;
         const auto relative = page.fileOffset - section.offset;
         if (page.recordCount == 0u || page.recordCount > kPageRecordCapacity ||
@@ -113,14 +120,14 @@ void ValidatePages(const std::filesystem::path& path, const FileHeader& header,
             page.wordCount != PageWordCount(page.recordCount, page.vertexCount) ||
             page.fileOffset < section.offset || relative > section.bytes ||
             bytes > section.bytes - relative || relative % 16u != 0u ||
-            page.minLevel > page.maxLevel ||
+            !ValidLevels(page.minLevel, page.maxLevel) ||
             static_cast<std::uint64_t>(page.firstRecord) + page.recordCount > header.recordCount) {
-            Fail(path, "corrupt page directory");
+            Fail(path, "corrupt page directory (page " + std::to_string(p) + ")");
         }
     }
     std::uint64_t covered = 0;
     for (const auto& group : groups) {
-        if (group.firstPage != covered || group.minLevel > group.maxLevel ||
+        if (group.firstPage != covered || !ValidLevels(group.minLevel, group.maxLevel) ||
             static_cast<std::uint64_t>(group.firstPage) + group.pageCount > pages.size()) {
             Fail(path, "corrupt page groups");
         }
@@ -356,7 +363,49 @@ void LodPageFile::ReadBlocks(const Blocks& blocks, std::uint64_t first, std::byt
         const auto inside = first - begin;
         const auto count = std::min(bytes, size - inside);
         if (count == size) {
-            decode(block, {destination, static_cast<std::size_t>(size)});
+            // A run of whole blocks: read a round of them at once and decode them in parallel.
+            auto end = block + 1u;
+            auto runBytes = size;
+            while (end < blocks.shuffles.size() && runBytes < bytes) {
+                const auto next = std::min<std::uint64_t>(blocks.blockBytes,
+                                                          blocks.bytes - end * blocks.blockBytes);
+                if (runBytes + next > bytes) {
+                    break;
+                }
+                runBytes += next;
+                ++end;
+            }
+            for (auto from = block; from < end;) {
+                auto to = from + 1u;
+                while (to < end && blocks.offsets[static_cast<std::size_t>(to) + 1u] -
+                                           blocks.offsets[static_cast<std::size_t>(from)] <=
+                                       kDecodeRoundBytes) {
+                    ++to;
+                }
+                const auto storedBegin = blocks.offsets[static_cast<std::size_t>(from)];
+                stored.resize(static_cast<std::size_t>(
+                    blocks.offsets[static_cast<std::size_t>(to)] - storedBegin));
+                ReadBytes(storedBegin, stored.data(), stored.size(), {});
+                RunParallel(static_cast<std::size_t>(to - from), [&](std::size_t task, unsigned) {
+                    const auto index = static_cast<std::size_t>(from) + task;
+                    const auto out = destination + (index - block) * blocks.blockBytes;
+                    const auto outBytes = std::min<std::uint64_t>(
+                        blocks.blockBytes, blocks.bytes - index * blocks.blockBytes);
+                    const auto frame = std::span<const std::byte>(stored).subspan(
+                        static_cast<std::size_t>(blocks.offsets[index] - storedBegin),
+                        static_cast<std::size_t>(blocks.offsets[index + 1u] -
+                                                 blocks.offsets[index]));
+                    if (!DecodeFrame(frame, blocks.shuffles[index],
+                                     {out, static_cast<std::size_t>(outBytes)})) {
+                        Fail(path_, "damaged compressed block");
+                    }
+                });
+                from = to;
+            }
+            destination += runBytes;
+            first += runBytes;
+            bytes -= runBytes;
+            continue;
         } else if (cache) {
             const std::lock_guard lock(cacheMutex_);
             if (cachedBlocks_ != &blocks || cachedBlock_ != block) {
@@ -620,6 +669,50 @@ void LodPageFile::ReadBytes(std::uint64_t offset, void* destination, std::uint64
             progress(done, bytes);
         }
     }
+}
+
+bool PageMatchesEntry(const PageEntry& entry, std::span<const std::uint32_t> words) {
+    if (words.size() != entry.wordCount ||
+        words[0] != (static_cast<std::uint32_t>(entry.recordCount) |
+                     (static_cast<std::uint32_t>(entry.vertexCount) << 16u))) {
+        return false;
+    }
+    for (std::uint32_t i = 0; i < entry.recordCount; ++i) {
+        const auto endpoints = words[kPageHeaderWords + i * kRecordWords];
+        if ((endpoints & 0xffffu) >= entry.vertexCount || (endpoints >> 16u) >= entry.vertexCount) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool ChildrenMatchEntry(std::span<const PageEntry> pages, const PageEntry& visit,
+                        std::uint32_t recordCount, std::span<const std::uint32_t> children) {
+    if (children.size() != visit.wordCount || children.size() < kChildMaskWords) {
+        return false;
+    }
+    std::uint32_t marked = 0;
+    for (std::uint32_t word = 0; word < kChildMaskWords; ++word) {
+        const auto bits = children[word];
+        const auto first = word * 32u;
+        const auto valid = recordCount <= first        ? 0u
+                           : recordCount >= first + 32u ? 0xffffffffu
+                                                        : (1u << (recordCount - first)) - 1u;
+        if ((bits & ~valid) != 0u) {
+            return false;
+        }
+        marked += static_cast<std::uint32_t>(std::popcount(bits));
+    }
+    if (children.size() != kChildMaskWords + 2u * marked) {
+        return false;
+    }
+    for (const auto ref : children.subspan(kChildMaskWords)) {
+        if (ref != kNoChildRef &&
+            ((ref >> 8u) >= pages.size() || (ref & 0xffu) >= pages[ref >> 8u].recordCount)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 SourceIdentity QuerySourceIdentity(const std::filesystem::path& path) {

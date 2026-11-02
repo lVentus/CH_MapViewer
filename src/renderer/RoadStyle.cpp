@@ -68,6 +68,15 @@ std::array<float, data::RoadStyleTypeCount> RoadStyleConfig::TypeWidths() const 
     return widths;
 }
 
+std::array<float, data::RoadStyleTypeCount> RoadStyleConfig::TypeDepths() const {
+    std::array<float, data::RoadStyleTypeCount> depths{};
+    const auto steps = static_cast<float>(classes.size() + 1u);
+    for (std::size_t type = 0; type < depths.size(); ++type) {
+        depths[type] = static_cast<float>(classOfType[type] + 1u) / steps;
+    }
+    return depths;
+}
+
 RoadStyleConfig UniformRoadStyle() {
     RoadStyleConfig styles;
     styles.classes.push_back({"road", {0.82f, 0.84f, 0.87f, 1.0f}, 1.5f});

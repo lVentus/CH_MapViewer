@@ -1,5 +1,6 @@
 #include "gpu/lod/LodPageRuntime.h"
 
+#include "cpu/CpuPasses.h"
 #include "data/SystemMemory.h"
 #include "gpu/GpuMemoryInfo.h"
 #include "gpu/filtering/IRangeFilterStrategy.h"
@@ -28,61 +29,8 @@ constexpr double kMovingUploadSliceMs = 4.0;
 constexpr double kStillUploadSliceMs = 12.0;
 // Pages for a ring of half a screen around the view are loaded after the view itself.
 constexpr double kPrefetchMargin = 0.5;
-// Roads just outside the screen still reach into it with half their stroke width.
-constexpr double kStrokeMarginPixels = renderer::kMaxRoadWidthPixels / 2.0;
 // Pages queued per frame while preloading everything, after the view's own.
 constexpr std::uint32_t kPreloadPagesPerFrame = 4096;
-
-// The shaders trust the page blob, so a page that does not match its directory entry is never
-// uploaded.
-[[nodiscard]] bool PageMatchesEntry(const format::PageEntry& entry,
-                                    std::span<const std::uint32_t> words) {
-    if (words.size() != entry.wordCount ||
-        words[0] != (static_cast<std::uint32_t>(entry.recordCount) |
-                     (static_cast<std::uint32_t>(entry.vertexCount) << 16u))) {
-        return false;
-    }
-    for (std::uint32_t i = 0; i < entry.recordCount; ++i) {
-        const auto endpoints = words[format::kPageHeaderWords + i * format::kRecordWords];
-        if ((endpoints & 0xffffu) >= entry.vertexCount || (endpoints >> 16u) >= entry.vertexCount) {
-            return false;
-        }
-    }
-    return true;
-}
-
-// The traversal kernels trust children blocks as well: marked records exist, and every
-// reference names an existing record of an existing page.
-[[nodiscard]] bool ChildrenMatchEntry(std::span<const format::PageEntry> pages,
-                                      const format::PageEntry& visit,
-                                      std::uint32_t recordCount,
-                                      std::span<const std::uint32_t> children) {
-    if (children.size() != visit.wordCount || children.size() < format::kChildMaskWords) {
-        return false;
-    }
-    std::uint32_t marked = 0;
-    for (std::uint32_t word = 0; word < format::kChildMaskWords; ++word) {
-        const auto bits = children[word];
-        const auto first = word * 32u;
-        const auto valid = recordCount <= first        ? 0u
-                           : recordCount >= first + 32u ? 0xffffffffu
-                                                        : (1u << (recordCount - first)) - 1u;
-        if ((bits & ~valid) != 0u) {
-            return false;
-        }
-        marked += static_cast<std::uint32_t>(std::popcount(bits));
-    }
-    if (children.size() != format::kChildMaskWords + 2u * marked) {
-        return false;
-    }
-    for (const auto ref : children.subspan(format::kChildMaskWords)) {
-        if (ref != format::kNoChildRef &&
-            ((ref >> 8u) >= pages.size() || (ref & 0xffu) >= pages[ref >> 8u].recordCount)) {
-            return false;
-        }
-    }
-    return true;
-}
 
 [[nodiscard]] double Milliseconds(Clock::time_point begin) {
     return std::chrono::duration<double, std::milli>(Clock::now() - begin).count();
@@ -121,22 +69,20 @@ constexpr std::uint32_t kPreloadPagesPerFrame = 4096;
     return static_cast<std::uint32_t>(std::min<std::uint64_t>(pageCount, budget / slotBytes));
 }
 
+// The same test as for CPU results.
 [[nodiscard]] bool ChordInView(std::span<const std::uint32_t> words, std::uint32_t record,
                                const std::array<double, 4>& view) {
     const auto recordCount = words[0] & 0xffffu;
     const auto endpoints = words[format::kPageHeaderWords + record * format::kRecordWords];
     const auto vertexBase = format::kPageHeaderWords + recordCount * format::kRecordWords;
     const auto coordinate = [&](std::uint32_t vertex, std::uint32_t axis) {
-        return static_cast<double>(std::bit_cast<std::int32_t>(
-                   words[vertexBase + vertex * format::kVertexWords + axis])) /
-               format::kFixedCoordinateScale;
+        return std::bit_cast<std::int32_t>(
+            words[vertexBase + vertex * format::kVertexWords + axis]);
     };
     const auto a = endpoints & 0xffffu;
     const auto b = endpoints >> 16u;
-    return std::max(coordinate(a, 0), coordinate(b, 0)) >= view[0] &&
-           std::min(coordinate(a, 0), coordinate(b, 0)) <= view[2] &&
-           std::max(coordinate(a, 1), coordinate(b, 1)) >= view[1] &&
-           std::min(coordinate(a, 1), coordinate(b, 1)) <= view[3];
+    return chmv::cpu::ChordTouches(coordinate(a, 0), coordinate(a, 1), coordinate(b, 0),
+                                   coordinate(b, 1), view);
 }
 
 } // namespace
@@ -251,7 +197,7 @@ bool LodPageRuntime::CameraMoved(const renderer::MapCamera2D& camera, int width,
 void LodPageRuntime::Update(const renderer::MapCamera2D& camera, const renderer::LODController& lod,
                             int width, int height, float pixelTolerance,
                             filtering::IRangeFilterStrategy& filter,
-                            unfolding::IUnfoldingStrategy& unfold) {
+                            unfolding::IUnfoldingStrategy& unfold, bool countSteps) {
     const auto begin = Clock::now();
     ++frame_;
     renderer_.Poll();
@@ -266,26 +212,15 @@ void LodPageRuntime::Update(const renderer::MapCamera2D& camera, const renderer:
     pool_.BeginFrame();
 
     // Everything this frame needs follows from the camera: view rectangle, level, tolerance.
-    const auto& header = file_->Header();
-    const auto viewScale = std::max(static_cast<double>(camera.ViewScale()), 1e-12);
-    const auto halfY = 1.0 / viewScale;
-    const auto halfX = halfY * static_cast<double>(width) / static_cast<double>(height);
-    const auto centerX = static_cast<double>(camera.CenterX());
-    const auto centerY = static_cast<double>(camera.CenterY());
-    const auto pixel = 2.0 / (viewScale * static_cast<double>(height));
-    const auto margin = kStrokeMarginPixels * pixel;
-    chmv::streaming::lod::LodPageQuery query;
-    query.minX = static_cast<float>(centerX - halfX - margin);
-    query.minY = static_cast<float>(centerY - halfY - margin);
-    query.maxX = static_cast<float>(centerX + halfX + margin);
-    query.maxY = static_cast<float>(centerY + halfY + margin);
-    query.level = static_cast<std::uint32_t>(std::clamp<long>(
-        std::lround(lod.ContinuousLevel(camera.ZoomFactor())), 0L, header.maxLevel));
-    query.threshold = unfolding::ThresholdFor(
-        unfold.Mode(), format::EncodeErrorTolerance(
-                           static_cast<double>(std::max(pixelTolerance, 0.01f)) * pixel));
-    const std::array<double, 4> view{centerX - halfX, centerY - halfY, centerX + halfX,
-                                     centerY + halfY};
+    const auto planned = chmv::streaming::lod::PlanView(camera, lod, width, height, pixelTolerance,
+                                                        file_->Header().maxLevel);
+    auto query = planned.query;
+    query.threshold = unfolding::ThresholdFor(unfold.Mode(), planned.toleranceCode);
+    const auto& view = planned.rectangle;
+    const auto centerX = (view[0] + view[2]) / 2.0;
+    const auto centerY = (view[1] + view[3]) / 2.0;
+    const auto halfX = (view[2] - view[0]) / 2.0;
+    const auto halfY = (view[3] - view[1]) / 2.0;
 
     auto ring = query;
     ring.minX = static_cast<float>(centerX - halfX * (1.0 + 2.0 * kPrefetchMargin));
@@ -385,11 +320,14 @@ void LodPageRuntime::Update(const renderer::MapCamera2D& camera, const renderer:
     };
     const DrawState drawState{drawQuery_.level, drawQuery_.threshold, true};
     const bool retry = renderer_.TakeRetry();
+    const bool count = countSteps && unfold.Mode() == geometry::RefinementMode::Adaptive;
     stats_.filtered = retry || !filteredQuery_ || !sameQuery(*filteredQuery_) ||
                       filterKey != filteredPages_ || filteredBy_ != &filter ||
-                      unfoldedBy_ != &unfold;
+                      unfoldedBy_ != &unfold || (count && !counted_);
     if (stats_.filtered) {
-        renderer_.Process(pool_, Pass(), filter, unfold);
+        renderer_.Process(pool_, Pass(), filter, unfold,
+                          count ? std::optional{planned.pixelCode} : std::nullopt);
+        counted_ = count;
         filteredQuery_ = drawQuery_;
         filteredPages_ = std::move(filterKey);
         filteredBy_ = &filter;
@@ -428,6 +366,9 @@ void LodPageRuntime::Update(const renderer::MapCamera2D& camera, const renderer:
     stats_.gpuFilterMs = renderer_.FilterMilliseconds();
     stats_.gpuUnfoldMs = renderer_.UnfoldMilliseconds();
     stats_.gpuDrawMs = renderer_.DrawMilliseconds();
+    stats_.gpuCountMs = renderer_.CountMilliseconds();
+    stats_.pixelCode = planned.pixelCode;
+    stats_.stepCounts = renderer_.StepCounts();
     if (reader_) {
         const auto reader = reader_->Stats();
         stats_.diskPagesRead = reader.pagesRead;
@@ -467,9 +408,11 @@ void LodPageRuntime::QueuePreload() {
 bool LodPageRuntime::Upload(std::uint32_t page, std::span<const std::uint32_t> words,
                             std::span<const std::uint32_t> children) {
     const auto& entry = file_->Pages()[page];
-    if (!PageMatchesEntry(entry, words) ||
-        (hierarchy_ && !ChildrenMatchEntry(file_->Pages(), file_->VisitPages()[page],
-                                           entry.recordCount, children))) {
+    // The shaders trust the page blob, so a page that does not match its directory entry is
+    // never uploaded.
+    if (!format::PageMatchesEntry(entry, words) ||
+        (hierarchy_ && !format::ChildrenMatchEntry(file_->Pages(), file_->VisitPages()[page],
+                                                   entry.recordCount, children))) {
         if (corrupt_[page] == 0u) {
             corrupt_[page] = 1u;
             ++stats_.corruptPages;
@@ -588,6 +531,38 @@ LodPageBenchmarkResult LodPageRuntime::Benchmark(filtering::IRangeFilterStrategy
         return {};
     }
     return renderer_.Benchmark(pool_, Pass(), filter, unfold, iterations);
+}
+
+std::vector<std::uint32_t> LodPageRuntime::DrawnEdgesInView() const {
+    std::vector<std::uint32_t> edges;
+    if (!poolReady_) {
+        return edges;
+    }
+    struct PageData {
+        std::vector<std::uint32_t> words;
+        std::vector<std::uint32_t> edges;
+    };
+    std::unordered_map<std::uint32_t, PageData> cache;
+    for (const auto item : renderer_.ReadSegments()) {
+        const auto page = pool_.PageOfSlot(item >> 8u);
+        auto [it, added] = cache.try_emplace(page);
+        auto& data = it->second;
+        if (added) {
+            const auto& entry = file_->Pages()[page];
+            if (pageImage_) {
+                const auto* first = pageImage_->data() + file_->PageWordOffset(page);
+                data.words.assign(first, first + entry.wordCount);
+            } else {
+                data.words = file_->ReadPage(page);
+            }
+            data.edges = file_->ReadRecordEdges(entry.firstRecord, entry.recordCount);
+        }
+        if (ChordInView(data.words, item & 0xffu, drawView_)) {
+            edges.push_back(data.edges[item & 0xffu]);
+        }
+    }
+    std::sort(edges.begin(), edges.end());
+    return edges;
 }
 
 LodPageValidation LodPageRuntime::Validate() const {

@@ -32,10 +32,11 @@ static_assert(std::endian::native == std::endian::little,
               "LOD page files are little-endian and mapped directly");
 
 inline constexpr std::array<char, 8> kFileMagic{'C', 'H', 'L', 'O', 'D', 'P', 'G', 'S'};
-// 4: everything compressed. A version 3 file is the same file uncompressed (it reads as
-// Compression::None) and is compressed on load; files of an older version are rebuilt.
-inline constexpr std::uint32_t kFormatVersion = 4;
-inline constexpr std::uint32_t kUncompressedFormatVersion = 3;
+// 5: a shortcut record draws with the road style of the roads it stands for (EdgeStyle below);
+// 4 used the shortcut's own type, which many datasets leave 0. 4: everything compressed. Files
+// of an older version are rebuilt; an uncompressed file of this version (as the builder writes
+// it before compressing) is compressed on load.
+inline constexpr std::uint32_t kFormatVersion = 5;
 inline constexpr std::uint64_t kHeaderBytes = 4096;
 inline constexpr std::uint64_t kSectionAlignment = 4096;
 
@@ -112,6 +113,30 @@ inline constexpr double kErrorCodeBiasOctaves = 40.0;
     const auto code =
         std::floor((std::log2(tolerance) + kErrorCodeBiasOctaves) * kErrorCodeStepsPerOctave);
     return static_cast<std::uint16_t>(std::clamp(code, 0.0, static_cast<double>(kErrorCodeMax)));
+}
+
+// The road style a CH edge draws with, and the length of the roads it stands for (fixed
+// coordinate units). An original edge has the style of its own type. A shortcut has that of the
+// roads it stands for: its two halves are joined as they are built up, the same style adds up
+// their lengths, different styles keep the longer half's (the first half's on a tie). The type
+// the source data gives a shortcut is not used: many datasets leave it 0.
+struct EdgeStyle {
+    std::uint8_t style = 0;
+    float length = 0.0f;
+};
+
+[[nodiscard]] inline EdgeStyle OriginalStyle(std::uint8_t style, std::int32_t ax, std::int32_t ay,
+                                             std::int32_t bx, std::int32_t by) {
+    const auto dx = static_cast<double>(bx) - static_cast<double>(ax);
+    const auto dy = static_cast<double>(by) - static_cast<double>(ay);
+    return {style, static_cast<float>(std::hypot(dx, dy))};
+}
+
+[[nodiscard]] inline EdgeStyle JoinStyles(const EdgeStyle& a, const EdgeStyle& b) {
+    if (a.style == b.style) {
+        return {a.style, a.length + b.length};
+    }
+    return b.length > a.length ? b : a;
 }
 
 // Geometry error bounds in fixed coordinate units, for culling with integers: at least the error
@@ -343,6 +368,8 @@ struct LevelBands {
     return static_cast<std::uint8_t>(errorCode >> 8u);
 }
 
+// minLevel / maxLevel of a page (or group) whose records are never drawn, only walked through by
+// traversals, form the empty range (minLevel 0xffff, maxLevel 0): no query selects it.
 struct PageEntry {
     std::uint64_t fileOffset = 0;
     std::uint32_t wordCount = 0;

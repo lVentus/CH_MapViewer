@@ -6,6 +6,7 @@
 #include "gpu/GraphicsProgram.h"
 #include "gpu/lod/LodPageLists.h"
 #include "renderer/RoadStyle.h"
+#include "renderer/ToleranceController.h"
 #include "streaming/lod/LodPageFormat.h"
 #include "streaming/lod/LodPagePlanner.h"
 
@@ -66,9 +67,11 @@ public:
     LodPageRenderer(const LodPageRenderer&) = delete;
     LodPageRenderer& operator=(const LodPageRenderer&) = delete;
 
-    // Only needed when the pass or a strategy changed.
+    // Only needed when the pass or a strategy changed. With stepBase (the error code of one
+    // pixel) it also counts the segments each tolerance step would draw from the same pages.
     void Process(const LodPagePool& pool, const LodPagePass& pass,
-                 filtering::IRangeFilterStrategy& filter, unfolding::IUnfoldingStrategy& unfold);
+                 filtering::IRangeFilterStrategy& filter, unfolding::IUnfoldingStrategy& unfold,
+                 std::optional<std::uint32_t> stepBase = std::nullopt);
     void Draw(const LodPagePool& pool, const renderer::MapCamera2D& camera, int width, int height,
               const renderer::RoadStyleConfig& styles);
     // Runs the pass `iterations` times and waits for the timings.
@@ -94,6 +97,14 @@ public:
     [[nodiscard]] std::optional<double> DrawMilliseconds() const {
         return drawTimer_.LastMilliseconds();
     }
+    [[nodiscard]] std::optional<double> CountMilliseconds() const {
+        return countTimer_.LastMilliseconds();
+    }
+    // Segments per tolerance step of the last finished pass, if it counted them.
+    [[nodiscard]] const std::optional<std::array<std::uint32_t, renderer::kToleranceSteps>>&
+    StepCounts() const {
+        return stepCounts_;
+    }
 
     // Synchronous copies of the last pass, for validation.
     [[nodiscard]] std::vector<std::uint32_t> ReadSegments() const;
@@ -105,6 +116,7 @@ private:
         GPUBuffer buffer;
         void* fence = nullptr;
         std::uint32_t segmentScale = 0;
+        bool counted = false;
     };
 
     struct Capacities {
@@ -119,15 +131,18 @@ private:
                 filtering::IRangeFilterStrategy& filter);
     void Unfold(const LodPagePool& pool, const LodPagePass& pass, Capacities capacities,
                 unfolding::IUnfoldingStrategy& unfold);
+    void CountSteps(const LodPagePool& pool, const LodPagePass& pass, std::uint32_t stepBase);
 
     GraphicsProgram roadProgram_;
     ComputeProgram finishProgram_;
+    ComputeProgram countProgram_;
     GPUBuffer slotList_;
     GPUBuffer candidateList_;
     GPUBuffer segmentBuffer_;
     GPUBuffer commandBuffer_;
     GPUBuffer statusBuffer_;
     GPUBuffer errorBounds_;
+    GPUBuffer stepCountBuffer_;
     std::vector<std::uint32_t> slotListWords_;
     // Pages the lists have room for; segments get segmentScale_ times the records of those,
     // all within the largest storage block the GPU binds.
@@ -141,11 +156,13 @@ private:
     benchmark::GPUTimer filterTimer_;
     benchmark::GPUTimer unfoldTimer_;
     benchmark::GPUTimer drawTimer_;
+    benchmark::GPUTimer countTimer_;
     std::array<Readback, 3> readbacks_;
     std::size_t nextReadback_ = 0;
     std::uint32_t drawnSegments_ = 0;
     std::uint32_t candidates_ = 0;
     std::array<std::uint32_t, kStatusWords> status_{};
+    std::optional<std::array<std::uint32_t, renderer::kToleranceSteps>> stepCounts_;
     bool retry_ = false;
 };
 

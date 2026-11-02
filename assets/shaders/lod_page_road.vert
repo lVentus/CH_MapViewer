@@ -14,8 +14,10 @@ uniform ivec2 uCameraFixed;
 uniform float uFixedToClip;
 uniform float uAspectScale;
 uniform vec2 uViewportSize;
-// Width in pixels per road type, from the road style config.
+// Width in pixels and depth per road type, from the road style config: the classes listed first
+// lie on top, whatever order the segments come in.
 uniform float uRoadWidths[64];
+uniform float uRoadDepths[64];
 
 vec2 clipPosition(uint vertexWord) {
     ivec2 fixedPosition = ivec2(int(pageWords[vertexWord]), int(pageWords[vertexWord + 1u]));
@@ -54,6 +56,6 @@ void main() {
     // Corners: (a,-) (a,+) (b,-) | (b,-) (a,+) (b,+)
     bool atB = corner == 2u || corner == 3u || corner == 5u;
     float side = (corner == 1u || corner == 4u || corner == 5u) ? 1.0 : -1.0;
-    gl_Position = vec4((atB ? b : a) + side * offset, 0.0, 1.0);
+    gl_Position = vec4((atB ? b : a) + side * offset, uRoadDepths[roadType] * 2.0 - 1.0, 1.0);
     gRoadType = roadType;
 }

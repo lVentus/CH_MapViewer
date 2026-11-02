@@ -30,6 +30,11 @@ endif()
 include(cmake/Zstd.cmake)
 
 add_library(chmv_data
+    src/cpu/ClassicPipeline.cpp
+    src/cpu/CpuPasses.cpp
+    src/cpu/CpuRuntime.cpp
+    src/cpu/CpuWorkers.cpp
+    src/cpu/PagePipeline.cpp
     src/data/AsyncDatasetLoader.cpp
     src/data/DatasetCatalog.cpp
     src/data/SystemMemory.cpp
@@ -37,6 +42,7 @@ add_library(chmv_data
     src/renderer/LODController.cpp
     src/renderer/MapCamera2D.cpp
     src/renderer/RoadStyle.cpp
+    src/renderer/ToleranceController.cpp
     src/streaming/lod/LodPageBuilder.cpp
     src/streaming/lod/LodPageCompression.cpp
     src/streaming/lod/LodPageFile.cpp
@@ -70,6 +76,7 @@ if(CHMV_BUILD_APP)
         src/main.cpp
         src/benchmark/GPUTimer.cpp
         src/benchmark/LodPageZoomSweep.cpp
+        src/core/AdaptiveTolerance.cpp
         src/core/Application.cpp
         src/core/Window.cpp
         src/gpu/ComputeProgram.cpp
@@ -85,6 +92,7 @@ if(CHMV_BUILD_APP)
         src/gpu/lod/LodPagePool.cpp
         src/gpu/lod/LodPageRenderer.cpp
         src/gpu/lod/LodPageRuntime.cpp
+        src/gpu/lod/SegmentRenderer.cpp
         src/gpu/unfolding/AdaptiveDFSUnfoldingStrategy.cpp
         src/gpu/unfolding/BFSUnfoldingStrategy.cpp
         src/gpu/unfolding/ExpansionKernels.cpp
