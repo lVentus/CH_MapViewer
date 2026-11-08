@@ -65,6 +65,8 @@ void Unshuffle(std::span<const std::byte> input, std::uint32_t width, std::span<
 [[nodiscard]] std::uint32_t ElementBytes(std::size_t index) {
     switch (index) {
     case StoredIndex(Section::NodeOsmId):
+    case StoredIndex(Section::NodeLatitude):
+    case StoredIndex(Section::NodeLongitude):
         return 8u;
     case StoredIndex(Section::EdgeType):
     case StoredIndex(Section::EdgeMaxSpeed):

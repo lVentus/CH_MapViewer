@@ -58,9 +58,12 @@ struct LodPageView {
     std::array<double, 4> rectangle{};
 };
 
+// zoomOutOctaves > 0 plans the same rectangle with the level and tolerance of a camera that
+// many octaves farther away (a coarser view of the same place).
 [[nodiscard]] LodPageView PlanView(const renderer::MapCamera2D& camera,
                                    const renderer::LODController& lod, int width, int height,
-                                   float pixelTolerance, std::int32_t maxLevel);
+                                   float pixelTolerance, std::int32_t maxLevel,
+                                   double zoomOutOctaves = 0.0);
 
 // The query box in fixed coordinates, rounded inward (and two units more), so a node that a
 // traversal keeps always lies in a page the planner chose with the float box.

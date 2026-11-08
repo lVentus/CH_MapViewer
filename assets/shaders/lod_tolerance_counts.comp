@@ -4,11 +4,13 @@
 // listed page, one invocation per record. A record is drawn at error threshold T when its own
 // error is within T and it is a root at the level, or lies below a parent there whose error is
 // above T (the dual-interval rule of LodPageFormat.h). With the thresholds uStepBase + 256 k
-// that is a range of steps, added up per workgroup and then once into the totals.
+// that is a range of steps, added up per workgroup and then once into the totals. With segment
+// culling, records whose chord misses the view are not counted, as they are not drawn.
 
 layout(local_size_x = 256) in;
 
 #include "lod_page_common.glsl"
+#include "lod_page_chord.glsl"
 
 layout(std430, binding = 2) readonly buffer SlotList {
     uint slotCount;
@@ -43,9 +45,10 @@ void main() {
     if (index < slotCount) {
         uint slot = slots[index];
         if (local < recordCount(slot)) {
-            uvec4 record = pageRecord((slot << 8u) | local);
+            uint item = (slot << 8u) | local;
+            uvec4 record = pageRecord(item);
             bool root = inLevelRange(record.y, uLevel);
-            if (root || inLevelRange(record.z, uLevel)) {
+            if ((root || inLevelRange(record.z, uLevel)) && keepDrawn(item, record)) {
                 uint first = firstStepReaching(record.w & 0xffffu);
                 uint end = root ? kSteps : firstStepReaching(record.w >> 16u);
                 if (first < end) {

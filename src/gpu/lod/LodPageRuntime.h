@@ -13,6 +13,7 @@
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -51,7 +52,13 @@ struct LodPageRuntimeStats {
     bool preloadAll = false;
     bool preloadFits = false;
 
-    // What the current frame asks for and what it draws.
+    // What the current frame asks for and what it draws. level and threshold are the camera's,
+    // or, when the view's pages do not fit in the GPU pool, those of the camera zoomOutOctaves
+    // farther away (with a raised level where even that is not enough).
+    std::uint32_t cameraLevel = 0;
+    std::uint32_t cameraThreshold = 0;
+    float zoomOutOctaves = 0.0f;
+    bool fittedToPool = false;
     std::uint32_t level = 0;
     std::uint32_t threshold = 0;
     std::uint32_t drawLevel = 0;
@@ -158,6 +165,9 @@ public:
     void SetPreloadAll(bool preload);
     // GPU pool budget, 0 = automatic. Either change rebuilds the pool with the next frame.
     void SetPoolBudget(std::uint64_t bytes);
+    // Drawn segments whose chord misses the view are dropped in the pass (it then reruns when
+    // the view moves, as a traversal does).
+    void SetCullSegments(bool cull) { cullSegments_ = cull; }
 
     [[nodiscard]] const LodPageRuntimeStats& Stats() const { return stats_; }
     [[nodiscard]] const chmv::streaming::lod::LodPageFile& File() const { return *file_; }
@@ -173,9 +183,10 @@ public:
     }
     // Synchronous checks of what the GPU currently draws.
     [[nodiscard]] LodPageValidation Validate() const;
-    [[nodiscard]] LodPageBenchmarkResult Benchmark(filtering::IRangeFilterStrategy& filter,
-                                                   unfolding::IUnfoldingStrategy& unfold,
-                                                   std::uint32_t iterations);
+    [[nodiscard]] LodPageBenchmarkResult
+    Benchmark(filtering::IRangeFilterStrategy& filter, unfolding::IUnfoldingStrategy& unfold,
+              std::uint32_t iterations, const renderer::MapCamera2D& camera, int width, int height,
+              const renderer::RoadStyleConfig& styles);
 
 private:
     struct DrawState {
@@ -190,6 +201,12 @@ private:
     [[nodiscard]] bool Upload(std::uint32_t page, std::span<const std::uint32_t> words,
                               std::span<const std::uint32_t> children);
     [[nodiscard]] bool CameraMoved(const renderer::MapCamera2D& camera, int width, int height);
+    // The query whose view pages fit in the pool: query itself, the view planned `steps` steps
+    // farther away (farther(steps)), or that with a raised level; `pages` gets its pages.
+    [[nodiscard]] chmv::streaming::lod::LodPageQuery
+    FitView(const chmv::streaming::lod::LodPageQuery& query,
+            const std::function<chmv::streaming::lod::LodPageQuery(std::uint32_t)>& farther,
+            std::vector<std::uint32_t>& pages, std::uint32_t& steps) const;
     [[nodiscard]] std::span<const chmv::streaming::lod::PageEntry> Directory() const;
     [[nodiscard]] std::span<const chmv::streaming::lod::PageGroup> Groups() const;
     [[nodiscard]] LodPagePass Pass() const;
@@ -205,6 +222,7 @@ private:
     bool hierarchy_ = false;
     bool poolReady_ = false;
     bool preloadAll_ = false;
+    bool cullSegments_ = false;
     std::uint32_t preloadCursor_ = 0;
 
     std::vector<std::uint32_t> required_;
@@ -225,6 +243,9 @@ private:
     // drawn pages were planned with, drawView_ the visible part of it.
     chmv::streaming::lod::LodPageQuery plannedQuery_;
     chmv::streaming::lod::LodPageQuery plannedRing_;
+    std::uint32_t fitSteps_ = 0;
+    std::uint32_t fittedLevel_ = 0;
+    std::uint32_t fittedThreshold_ = 0;
     chmv::streaming::lod::LodPageQuery drawQuery_;
     std::array<double, 4> drawView_{};
     bool planned_ = false;
@@ -235,6 +256,7 @@ private:
     const filtering::IRangeFilterStrategy* filteredBy_ = nullptr;
     const unfolding::IUnfoldingStrategy* unfoldedBy_ = nullptr;
     bool counted_ = false;
+    bool culled_ = false;
     double uploadBytesPerMs_ = 0.0;
     std::optional<std::chrono::steady_clock::time_point> incompleteSince_;
     std::array<float, 3> lastCamera_{};

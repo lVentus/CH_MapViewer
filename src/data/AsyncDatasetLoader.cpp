@@ -2,6 +2,7 @@
 
 #include "data/SystemMemory.h"
 #include "streaming/lod/LodPageBuilder.h"
+#include "streaming/lod/LodPageReport.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -166,9 +167,10 @@ void AsyncDatasetLoader::Load(const std::filesystem::path& path,
             progress_.store(range.begin + (range.end - range.begin) * fraction);
         };
     };
+    std::optional<lod::BuildResult> buildResult;
     const auto build = [&] {
-        const auto result =
-            lod::LodPageBuilder::Build(graphPath, rangesPath, path, buildProgress(true));
+        const auto& result = buildResult.emplace(
+            lod::LodPageBuilder::Build(graphPath, rangesPath, path, buildProgress(true)));
         std::cout << "LOD page file ready after " << result.seconds << " s: " << result.recordCount
                   << " records in " << result.pageCount << " pages (" << result.extraContextRecords
                   << " extra contexts, " << result.coverGapEdges << " split covers); "
@@ -220,6 +222,22 @@ void AsyncDatasetLoader::Load(const std::filesystem::path& path,
                   << "); rebuilding it in background...\n";
         build();
         open();
+    }
+    // Reports are for later analysis; failing to write them does not stop the load.
+    if (!reportRoot_.empty()) {
+        const auto reports = lod::ReportDirectory(reportRoot_, path);
+        try {
+            if (buildResult) {
+                lod::WriteBuildReport(*buildResult, reports);
+            }
+            if (buildResult || lod::LayoutReportOutdated(*file, reports)) {
+                lod::WriteLayoutReport(*file, reports);
+                std::cout << "Reports written to " << reports << '\n';
+            }
+        } catch (const std::exception& error) {
+            std::cout << "Could not write the reports to " << reports << ": " << error.what()
+                      << '\n';
+        }
     }
     const auto pageBytes = file->PageSectionBytes();
     const auto childBytes = file->Header().At(lod::Extension::PageChildren).bytes;

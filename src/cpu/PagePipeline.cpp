@@ -1,5 +1,6 @@
 #include "cpu/PagePipeline.h"
 
+#include "cpu/CpuWorkQueue.h"
 #include "cpu/CpuWorkers.h"
 #include "data/SystemMemory.h"
 #include "streaming/lod/LodPagePlanner.h"
@@ -72,21 +73,11 @@ class Walk {
 
     // The node's whole geometry lies within its error of its chord.
     [[nodiscard]] bool Visible(std::uint32_t item) const {
-        const auto words = store_.Words(item >> 8u);
-        const auto* record = Record(item);
-        const auto vertexBase = lod::kPageHeaderWords + (words[0] & 0xffffu) * lod::kRecordWords;
-        const auto coordinate = [&](std::uint32_t vertex, std::uint32_t axis) {
-            return std::int64_t{
-                std::bit_cast<std::int32_t>(words[vertexBase + vertex * lod::kVertexWords + axis])};
-        };
-        const auto a = record[0] & 0xffffu;
-        const auto b = record[0] >> 16u;
-        const auto bound = std::int64_t{lod::ErrorBound(record[3] & 0xffffu)};
-        return std::max(coordinate(a, 0), coordinate(b, 0)) >= cull_[0] - bound &&
-               std::min(coordinate(a, 0), coordinate(b, 0)) <= cull_[2] + bound &&
-               std::max(coordinate(a, 1), coordinate(b, 1)) >= cull_[1] - bound &&
-               std::min(coordinate(a, 1), coordinate(b, 1)) <= cull_[3] + bound;
+        return Touches(item, std::int64_t{lod::ErrorBound(Record(item)[3] & 0xffffu)});
     }
+
+    // The chord itself touches the cull box (segment culling).
+    [[nodiscard]] bool ChordInView(std::uint32_t item) const { return Touches(item, 0); }
 
     // Expanded unless the node is already accurate enough or is an original edge.
     [[nodiscard]] bool Expands(std::uint32_t item) const {
@@ -120,6 +111,23 @@ class Walk {
     }
 
   private:
+    // The chord's box, grown by `grow`, touches the cull box.
+    [[nodiscard]] bool Touches(std::uint32_t item, std::int64_t grow) const {
+        const auto words = store_.Words(item >> 8u);
+        const auto* record = Record(item);
+        const auto vertexBase = lod::kPageHeaderWords + (words[0] & 0xffffu) * lod::kRecordWords;
+        const auto coordinate = [&](std::uint32_t vertex, std::uint32_t axis) {
+            return std::int64_t{
+                std::bit_cast<std::int32_t>(words[vertexBase + vertex * lod::kVertexWords + axis])};
+        };
+        const auto a = record[0] & 0xffffu;
+        const auto b = record[0] >> 16u;
+        return std::max(coordinate(a, 0), coordinate(b, 0)) >= cull_[0] - grow &&
+               std::min(coordinate(a, 0), coordinate(b, 0)) <= cull_[2] + grow &&
+               std::max(coordinate(a, 1), coordinate(b, 1)) >= cull_[1] - grow &&
+               std::min(coordinate(a, 1), coordinate(b, 1)) <= cull_[3] + grow;
+    }
+
     const CpuPageStore& store_;
     std::uint32_t threshold_;
     std::array<std::int32_t, 4> cull_;
@@ -346,10 +354,11 @@ namespace {
 
 // Segments each tolerance step would draw from these pages, as lod_tolerance_counts.comp counts
 // them: a record is drawn at threshold T when its error is within T and it is a root at the
-// level, or lies below a parent there whose error is above T, so on a range of steps.
+// level, or lies below a parent there whose error is above T, so on a range of steps. With
+// `cull`, records whose chord misses its view are left out.
 [[nodiscard]] std::array<std::uint64_t, renderer::kToleranceSteps>
 CountSteps(const CpuPageStore& store, CpuWorkers& workers, std::span<const std::uint32_t> pages,
-           std::uint32_t level, std::uint32_t stepBase) {
+           std::uint32_t level, std::uint32_t stepBase, const Walk* cull) {
     constexpr auto kSteps = static_cast<std::uint32_t>(renderer::kToleranceSteps);
     const auto firstStepReaching = [&](std::uint32_t code) {
         if (code <= stepBase) {
@@ -370,7 +379,8 @@ CountSteps(const CpuPageStore& store, CpuWorkers& workers, std::span<const std::
                 const auto* record =
                     words.data() + lod::kPageHeaderWords + local * lod::kRecordWords;
                 const bool root = InLevelRange(record[1], level);
-                if (!root && !InLevelRange(record[2], level)) {
+                if ((!root && !InLevelRange(record[2], level)) ||
+                    (cull != nullptr && !cull->ChordInView((pages[index] << 8u) | local))) {
                     continue;
                 }
                 const auto first = firstStepReaching(record[3] & 0xffffu);
@@ -397,11 +407,12 @@ CountSteps(const CpuPageStore& store, CpuWorkers& workers, std::span<const std::
 
 CpuResult RunPagePass(CpuPageStore& store, CpuWorkers& workers, const lod::LodPageQuery& query,
                       CpuFilter filter, CpuExpansion expansion,
-                      std::optional<std::uint32_t> stepBase) {
+                      std::optional<std::uint32_t> stepBase, bool cullSegments) {
     CpuResult result;
     result.threads = workers.Threads();
     const auto& file = store.File();
-    const bool traverses = expansion == CpuExpansion::Dfs || expansion == CpuExpansion::Bfs;
+    const bool traverses = expansion == CpuExpansion::Dfs || expansion == CpuExpansion::Bfs ||
+                           expansion == CpuExpansion::Queue;
     const auto directory = traverses ? file.VisitPages() : file.Pages();
     const auto groups = traverses ? file.VisitGroups() : file.Groups();
     const auto threads = workers.Threads();
@@ -446,44 +457,85 @@ CpuResult RunPagePass(CpuPageStore& store, CpuWorkers& workers, const lod::LodPa
     // Candidates: records whose root or child interval holds the level.
     begin = Clock::now();
     const auto level = query.level;
-    workers.Run(TaskCount(pages.size(), kPagesPerTask), [&](std::size_t task, unsigned worker) {
-        auto& out = found[worker];
-        const auto last = std::min(pages.size(), (task + 1u) * kPagesPerTask);
-        for (auto index = task * kPagesPerTask; index < last; ++index) {
-            const auto page = pages[index];
-            const auto words = store.Words(page);
-            const auto count = words[0] & 0xffffu;
-            const auto keep = [&](std::uint32_t local) {
-                const auto* record =
-                    words.data() + lod::kPageHeaderWords + local * lod::kRecordWords;
-                if (InLevelRange(record[1], level) || InLevelRange(record[2], level)) {
-                    out.push_back((page << 8u) | local);
-                }
-            };
-            if (filter == CpuFilter::BirthOrdered) {
-                // Records of the level form a prefix of the order.
-                const auto order = store.Order(page);
-                std::uint32_t low = 0;
-                std::uint32_t high = count;
-                while (low < high) {
-                    const auto middle = (low + high) / 2u;
-                    if (HighestLevel(words, order[middle]) >= level) {
-                        low = middle + 1u;
-                    } else {
-                        high = middle;
+    const auto candidateOf = [&](std::span<const std::uint32_t> words, std::uint32_t local) {
+        const auto* record = words.data() + lod::kPageHeaderWords + local * lod::kRecordWords;
+        return InLevelRange(record[1], level) || InLevelRange(record[2], level);
+    };
+    std::vector<std::uint32_t> candidates;
+    if (filter == CpuFilter::TwoPass) {
+        // Count per page (keeping which records matched), then every page writes its candidates
+        // to its own place: no per-thread lists to merge, and the order is the page order.
+        std::vector<std::array<std::uint32_t, lod::kPageRecordCapacity / 32u>> masks(pages.size());
+        std::vector<std::uint32_t> offsets(pages.size() + 1u, 0u);
+        workers.Run(TaskCount(pages.size(), kPagesPerTask), [&](std::size_t task, unsigned) {
+            const auto last = std::min(pages.size(), (task + 1u) * kPagesPerTask);
+            for (auto index = task * kPagesPerTask; index < last; ++index) {
+                const auto words = store.Words(pages[index]);
+                auto& mask = masks[index];
+                mask.fill(0u);
+                std::uint32_t count = 0;
+                for (std::uint32_t local = 0; local < (words[0] & 0xffffu); ++local) {
+                    if (candidateOf(words, local)) {
+                        mask[local >> 5u] |= 1u << (local & 31u);
+                        ++count;
                     }
                 }
-                for (std::uint32_t k = 0; k < low; ++k) {
-                    keep(order[k]);
-                }
-            } else {
-                for (std::uint32_t local = 0; local < count; ++local) {
-                    keep(local);
+                offsets[index + 1u] = count;
+            }
+        });
+        for (std::size_t index = 0; index < pages.size(); ++index) {
+            offsets[index + 1u] += offsets[index];
+        }
+        candidates.resize(offsets.back());
+        workers.Run(TaskCount(pages.size(), kPagesPerTask), [&](std::size_t task, unsigned) {
+            const auto last = std::min(pages.size(), (task + 1u) * kPagesPerTask);
+            for (auto index = task * kPagesPerTask; index < last; ++index) {
+                auto at = offsets[index];
+                for (std::uint32_t local = 0; local < lod::kPageRecordCapacity; ++local) {
+                    if ((masks[index][local >> 5u] >> (local & 31u) & 1u) != 0u) {
+                        candidates[at++] = (pages[index] << 8u) | local;
+                    }
                 }
             }
-        }
-    });
-    const auto candidates = Gather(found);
+        });
+    } else {
+        workers.Run(TaskCount(pages.size(), kPagesPerTask), [&](std::size_t task, unsigned worker) {
+            auto& out = found[worker];
+            const auto last = std::min(pages.size(), (task + 1u) * kPagesPerTask);
+            for (auto index = task * kPagesPerTask; index < last; ++index) {
+                const auto page = pages[index];
+                const auto words = store.Words(page);
+                const auto count = words[0] & 0xffffu;
+                const auto keep = [&](std::uint32_t local) {
+                    if (candidateOf(words, local)) {
+                        out.push_back((page << 8u) | local);
+                    }
+                };
+                if (filter == CpuFilter::BirthOrdered) {
+                    // Records of the level form a prefix of the order.
+                    const auto order = store.Order(page);
+                    std::uint32_t low = 0;
+                    std::uint32_t high = count;
+                    while (low < high) {
+                        const auto middle = (low + high) / 2u;
+                        if (HighestLevel(words, order[middle]) >= level) {
+                            low = middle + 1u;
+                        } else {
+                            high = middle;
+                        }
+                    }
+                    for (std::uint32_t k = 0; k < low; ++k) {
+                        keep(order[k]);
+                    }
+                } else {
+                    for (std::uint32_t local = 0; local < count; ++local) {
+                        keep(local);
+                    }
+                }
+            }
+        });
+        candidates = Gather(found);
+    }
     result.candidates = candidates.size();
     result.filterMs += Milliseconds(begin);
 
@@ -493,6 +545,12 @@ CpuResult RunPagePass(CpuPageStore& store, CpuWorkers& workers, const lod::LodPa
     const auto threshold = query.threshold;
     std::vector<std::uint64_t> missing(threads, 0u);
     std::vector<std::uint32_t> drawn;
+    // A segment to draw, unless culling drops it.
+    const auto draw = [&](std::uint32_t item, unsigned worker) {
+        if (!cullSegments || walk.ChordInView(item)) {
+            found[worker].push_back(item);
+        }
+    };
     if (expansion == CpuExpansion::Roots || expansion == CpuExpansion::Intervals) {
         const bool childIntervals = expansion == CpuExpansion::Intervals;
         workers.Run(
@@ -504,7 +562,7 @@ CpuResult RunPagePass(CpuPageStore& store, CpuWorkers& workers, const lod::LodPa
                     const bool asChild = childIntervals && InLevelRange(record[2], level) &&
                                          threshold < (record[3] >> 16u);
                     if (errorCode <= threshold && (InLevelRange(record[1], level) || asChild)) {
-                        found[worker].push_back(candidates[i]);
+                        draw(candidates[i], worker);
                     }
                 }
             });
@@ -514,7 +572,6 @@ CpuResult RunPagePass(CpuPageStore& store, CpuWorkers& workers, const lod::LodPa
         workers.Run(TaskCount(candidates.size(), kItemsPerTask / 8u), [&](std::size_t task,
                                                                           unsigned worker) {
             auto& stack = stacks[worker];
-            auto& out = found[worker];
             const auto perTask = kItemsPerTask / 8u;
             const auto last = std::min(candidates.size(), (task + 1u) * perTask);
             for (auto i = task * perTask; i < last; ++i) {
@@ -529,7 +586,7 @@ CpuResult RunPagePass(CpuPageStore& store, CpuWorkers& workers, const lod::LodPa
                         continue;
                     }
                     if (!walk.Expands(node)) {
-                        out.push_back(node);
+                        draw(node, worker);
                         continue;
                     }
                     for (std::uint32_t which = 2u; which > 0u; --which) {
@@ -541,6 +598,38 @@ CpuResult RunPagePass(CpuPageStore& store, CpuWorkers& workers, const lod::LodPa
                 }
             }
         });
+        drawn = Gather(found);
+    } else if (expansion == CpuExpansion::Queue) {
+        std::vector<std::uint32_t> roots;
+        for (const auto item : candidates) {
+            if (InLevelRange(walk.Record(item)[1], level)) {
+                roots.push_back(item);
+            }
+        }
+        // Room for every record of the pages once; a node visited more often than that (several
+        // parents at one level) is walked by its worker.
+        std::size_t records = 0;
+        for (const auto page : pages) {
+            records += store.Words(page)[0] & 0xffffu;
+        }
+        RunWorkQueue(workers, roots, records,
+                     [&](std::uint32_t node, unsigned worker, std::array<std::uint32_t, 2>& next) {
+                         if (!walk.Visible(node)) {
+                             return 0;
+                         }
+                         if (!walk.Expands(node)) {
+                             draw(node, worker);
+                             return 0;
+                         }
+                         int count = 0;
+                         for (std::uint32_t which = 0; which < 2u; ++which) {
+                             const auto child = walk.Child(node, which, missing[worker]);
+                             if (child != kNoItem) {
+                                 next[static_cast<std::size_t>(count++)] = child;
+                             }
+                         }
+                         return count;
+                     });
         drawn = Gather(found);
     } else {
         std::vector<std::vector<std::uint32_t>> next(threads);
@@ -560,7 +649,7 @@ CpuResult RunPagePass(CpuPageStore& store, CpuWorkers& workers, const lod::LodPa
                             continue;
                         }
                         if (!walk.Expands(node)) {
-                            found[worker].push_back(node);
+                            draw(node, worker);
                             continue;
                         }
                         for (std::uint32_t which = 0; which < 2u; ++which) {
@@ -612,7 +701,8 @@ CpuResult RunPagePass(CpuPageStore& store, CpuWorkers& workers, const lod::LodPa
     result.outputMs = Milliseconds(begin);
     if (stepBase) {
         begin = Clock::now();
-        result.stepCounts = CountSteps(store, workers, pages, level, *stepBase);
+        result.stepCounts =
+            CountSteps(store, workers, pages, level, *stepBase, cullSegments ? &walk : nullptr);
         result.countMs = Milliseconds(begin);
     }
     return result;

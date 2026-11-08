@@ -1,5 +1,6 @@
 #pragma once
 
+#include "benchmark/TimingStats.h"
 #include "cpu/ClassicPipeline.h"
 #include "cpu/CpuPasses.h"
 #include "cpu/CpuWorkers.h"
@@ -18,18 +19,18 @@
 namespace chmv::cpu {
 
 // Repeated passes of one CPU method, timed with the wall clock.
+// Repeated CPU passes after an unmeasured one: preparing (pages), filter, expansion, output
+// and the whole pass.
 struct CpuBenchmarkResult {
     std::uint32_t iterations = 0;
     unsigned threads = 1;
     std::uint64_t candidates = 0;
     std::uint64_t segments = 0;
-    double prepareAverageMs = 0.0;
-    double filterMinMs = 0.0;
-    double filterAverageMs = 0.0;
-    double filterMaxMs = 0.0;
-    double expandMinMs = 0.0;
-    double expandAverageMs = 0.0;
-    double expandMaxMs = 0.0;
+    benchmark::TimingStats prepare;
+    benchmark::TimingStats filter;
+    benchmark::TimingStats expand;
+    benchmark::TimingStats output;
+    benchmark::TimingStats total;
     std::string unavailable;
 };
 
@@ -77,6 +78,7 @@ private:
         CpuMethod method = CpuMethod::Pages;
         std::optional<CpuFilter> filter;
         std::optional<CpuExpansion> expansion;
+        bool cullSegments = false;
         unsigned threads = 0;
         ClassicState classic = ClassicState::NotLoaded;
         std::optional<std::uint32_t> stepBase;

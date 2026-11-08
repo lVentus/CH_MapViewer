@@ -1,0 +1,2 @@
+time_utc,seconds,threads,peak_ram_mib,ram_budget_mib,page_passes,nodes,edges,records,pages,source_mib,file_mib,uncompressed_mib,s_read nodes,s_read edges,s_read ranges,s_resolve shortcuts,s_geometry errors,s_cover intervals,s_plan records,s_write pages,s_write hierarchy,s_verify against DFS,s_compress and check
+2026-11-08 16:47:23,166.70,16,13262,21210,1,71447621,278934762,269246055,1051778,17437.0,7695.7,19527.2,9.968,16.492,6.701,6.381,11.166,6.564,5.575,27.984,5.845,20.755,49.267

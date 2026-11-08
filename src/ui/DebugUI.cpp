@@ -1,5 +1,6 @@
 #include "ui/DebugUI.h"
 
+#include "benchmark/BenchmarkSuite.h"
 #include "benchmark/LodPageZoomSweep.h"
 #include "core/Window.h"
 #include "cpu/CpuRuntime.h"
@@ -18,6 +19,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <filesystem>
 #include <string>
 
@@ -106,7 +108,8 @@ void StatusLines(const std::array<std::uint32_t, gpu::lod::kStatusWords>& status
                            word(LodPageStatus::SegmentOverflow));
     }
     if (word(LodPageStatus::FrontierOverflow) != 0u) {
-        ImGui::TextColored(kWarning, "%u frontier entries dropped (buffer grows, pass repeats)",
+        ImGui::TextColored(kWarning,
+                           "%u frontier / queue entries dropped (buffer grows, pass repeats)",
                            word(LodPageStatus::FrontierOverflow));
     }
     if (word(LodPageStatus::StackOverflow) != 0u) {
@@ -413,6 +416,11 @@ void DebugUI::DrawPipeline(const DebugUIState& state, DebugUIActions& actions) {
 
     StrategyCombo("Filter", state.filters);
     StrategyCombo("Expansion", state.unfolds);
+    ImGui::Checkbox("Cull drawn segments to the view", &state.cullSegments);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Segments whose chord misses the view are dropped in the pass instead "
+                          "of being drawn off screen; the pass then reruns when the view moves.");
+    }
     DrawTolerance(state);
     if (gpuOn) {
         ImGui::Text("GPU: level %u, error code %u: %u candidates, %u segments drawn",
@@ -430,9 +438,6 @@ void DebugUI::DrawPipeline(const DebugUIState& state, DebugUIActions& actions) {
             actions.validate = true;
         }
         ImGui::SameLine();
-    }
-    if (ImGui::Button("Benchmark filter + expansion")) {
-        actions.runBenchmark = true;
     }
     if (const auto* check = state.validation; check != nullptr && !check->error.empty()) {
         ImGui::TextColored(kFailure, "Could not check: %s", check->error.c_str());
@@ -453,27 +458,68 @@ void DebugUI::DrawPipeline(const DebugUIState& state, DebugUIActions& actions) {
                             check->cpuMilliseconds);
         StatusLines(check->status);
     }
+    DrawBenchmarks(state, actions);
+}
+
+void DebugUI::DrawBenchmarks(const DebugUIState& state, DebugUIActions& actions) {
+    const bool suiteRunning = state.suite != nullptr && state.suite->Running();
+    if (suiteRunning) {
+        const auto& suite = *state.suite;
+        ImGui::TextColored(kWarning, "Benchmark suite: step %zu of %zu (camera held)",
+                           suite.Index() + 1u, suite.Count());
+        if (ImGui::Button("Cancel suite")) {
+            actions.cancelSuite = true;
+        }
+    } else {
+        if (ImGui::Button("Benchmark filter + expansion")) {
+            actions.runBenchmark = true;
+        }
+        ImGui::SameLine();
+        if (state.mode == cpu::ProcessingMode::Cpu) {
+            ImGui::BeginDisabled();
+        }
+        if (ImGui::Button("Benchmark all combinations")) {
+            actions.startSuite = true;
+        }
+        if (state.mode == cpu::ProcessingMode::Cpu) {
+            ImGui::EndDisabled();
+        }
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+            ImGui::SetTooltip("Every filter x expansion, without and with culling, at this view "
+                              "(GPU; in Compare mode the CPU too). Use a manual tolerance for "
+                              "repeatable numbers.");
+        }
+    }
+    ImGui::TextDisabled("Results: %s (benchmark.csv, one line per measure)",
+                        state.resultsDirectory.c_str());
     if (const auto* result = state.benchmark; result != nullptr && result->iterations != 0u) {
-        ImGui::Text("%u passes over %u pages: filter %.3f ms (%.3f - %.3f), expansion %.3f ms "
-                    "(%.3f - %.3f)",
-                    result->iterations, result->pages, result->filterAverageMs,
-                    result->filterMinMs, result->filterMaxMs, result->unfoldAverageMs,
-                    result->unfoldMinMs, result->unfoldMaxMs);
+        ImGui::Text("%u passes over %u pages: pass %.3f ms wall (median %.3f, p95 %.3f)",
+                    result->iterations, result->pages, result->passWall.mean,
+                    result->passWall.median, result->passWall.p95);
+        ImGui::Text("GPU timestamps: filter %.3f ms, expansion %.3f ms (p95 %.3f); draw %.3f ms "
+                    "wall, %.3f ms GPU",
+                    result->filterGpu.mean, result->unfoldGpu.mean, result->unfoldGpu.p95,
+                    result->drawWall.mean, result->drawGpu.mean);
         ImGui::TextDisabled("%u candidates, %u segments", result->candidates, result->segments);
     }
     if (const auto* result = state.cpuBenchmark) {
         if (!result->unavailable.empty()) {
             ImGui::TextColored(kWarning, "CPU benchmark: %s", result->unavailable.c_str());
         } else {
-            ImGui::Text("CPU, %u threads, %u passes: filter %.3f ms (%.3f - %.3f), expansion "
-                        "%.3f ms (%.3f - %.3f)",
-                        result->threads, result->iterations, result->filterAverageMs,
-                        result->filterMinMs, result->filterMaxMs, result->expandAverageMs,
-                        result->expandMinMs, result->expandMaxMs);
-            ImGui::TextDisabled("Preparing %.3f ms per pass; %llu candidates, %llu segments",
-                                result->prepareAverageMs, Count(result->candidates),
+            ImGui::Text("CPU, %u threads, %u passes: total %.3f ms (median %.3f, p95 %.3f)",
+                        result->threads, result->iterations, result->total.mean,
+                        result->total.median, result->total.p95);
+            ImGui::TextDisabled("Preparing %.3f ms, filter %.3f ms, expansion %.3f ms, output "
+                                "%.3f ms; %llu candidates, %llu segments",
+                                result->prepare.mean, result->filter.mean, result->expand.mean,
+                                result->output.mean, Count(result->candidates),
                                 Count(result->segments));
         }
+    }
+    if (state.suite != nullptr && !suiteRunning && !state.suite->Summary().empty() &&
+        ImGui::TreeNode("Last benchmark suite")) {
+        ImGui::TextUnformatted(state.suite->Summary().c_str());
+        ImGui::TreePop();
     }
 }
 
@@ -490,6 +536,14 @@ void DebugUI::DrawPageStats(const gpu::lod::LodPageRuntimeStats& stats) {
     ImGui::Text("GPU pool: %u / %u pages (%.0f MiB%s), %llu evictions", stats.residentPages,
                 stats.poolSlots, Megabytes(stats.poolBytes),
                 stats.hierarchy ? ", with children" : "", Count(stats.evictions));
+    if (stats.fittedToPool) {
+        ImGui::TextColored(kWarning,
+                           "GPU pool too small for this view: drawn as from %.1fx farther away "
+                           "(level %u instead of %u, error code %u instead of %u), %u pages",
+                           std::exp2(static_cast<double>(stats.zoomOutOctaves)), stats.level,
+                           stats.cameraLevel, stats.threshold, stats.cameraThreshold,
+                           stats.requiredPages);
+    }
     if (stats.poolFull) {
         ImGui::TextColored(kFailure, "GPU pool full: this view needs more pages than fit");
     }
@@ -539,7 +593,7 @@ void DebugUI::DrawZoomSweep(const DebugUIState& state, DebugUIActions& actions) 
         return;
     }
     ImGui::TextDisabled("Overview -> 3 km in 12 s, hold 3 s, back out, hold 3 s. Writes a "
-                        "per-frame CSV next to the dataset.");
+                        "per-frame CSV to the results folder.");
     const auto* sweep = state.sweep;
     if (sweep != nullptr && sweep->Running()) {
         ImGui::Text("Running: %s", sweep->PhaseName());

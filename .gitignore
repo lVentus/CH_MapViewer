@@ -11,4 +11,4 @@ CMakeUserPresets.json
 *.VC.VC.opendb
 .DS_Store
 /assets/data/*
-!/assets/data/README.md
+!/assets/data/README.md/results/

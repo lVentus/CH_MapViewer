@@ -50,6 +50,7 @@ add_library(chmv_data
     src/streaming/lod/LodPageIo.cpp
     src/streaming/lod/LodPagePlanner.cpp
     src/streaming/lod/LodPageReader.cpp
+    src/streaming/lod/LodPageReport.cpp
     src/streaming/lod/LodPageSource.cpp
 )
 
@@ -57,6 +58,10 @@ target_include_directories(chmv_data PUBLIC src)
 
 target_compile_features(chmv_data PUBLIC cxx_std_20)
 target_link_libraries(chmv_data PUBLIC Threads::Threads PRIVATE chmv_zstd)
+if(WIN32)
+    # GetProcessMemoryInfo (SystemMemory.cpp).
+    target_link_libraries(chmv_data PRIVATE psapi)
+endif()
 
 if(DEFINED CHMV_MSVC_RUNTIME_LIBRARY)
     set_property(TARGET chmv_data PROPERTY MSVC_RUNTIME_LIBRARY "${CHMV_MSVC_RUNTIME_LIBRARY}")
@@ -74,6 +79,8 @@ if(CHMV_BUILD_APP)
 
     add_executable(CH_MapViewer
         src/main.cpp
+        src/benchmark/BenchmarkLog.cpp
+        src/benchmark/BenchmarkSuite.cpp
         src/benchmark/GPUTimer.cpp
         src/benchmark/LodPageZoomSweep.cpp
         src/core/AdaptiveTolerance.cpp
@@ -88,6 +95,7 @@ if(CHMV_BUILD_APP)
         src/gpu/filtering/FullScanRangeFilterStrategy.cpp
         src/gpu/filtering/PageCullingRangeFilterStrategy.cpp
         src/gpu/filtering/RangeFilterStrategyManager.cpp
+        src/gpu/filtering/TwoPassRangeFilterStrategy.cpp
         src/gpu/lod/LodPageLists.cpp
         src/gpu/lod/LodPagePool.cpp
         src/gpu/lod/LodPageRenderer.cpp
@@ -96,7 +104,9 @@ if(CHMV_BUILD_APP)
         src/gpu/unfolding/AdaptiveDFSUnfoldingStrategy.cpp
         src/gpu/unfolding/BFSUnfoldingStrategy.cpp
         src/gpu/unfolding/ExpansionKernels.cpp
+        src/gpu/unfolding/PersistentQueueUnfoldingStrategy.cpp
         src/gpu/unfolding/UnfoldingStrategyManager.cpp
+        src/gpu/unfolding/WorkgroupQueueUnfoldingStrategy.cpp
         src/renderer/Renderer.cpp
         src/ui/DebugUI.cpp
     )

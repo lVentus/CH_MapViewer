@@ -40,7 +40,9 @@ void main() {
             continue;
         }
         if (!expands(node, record)) {
-            drawSegment(node);
+            if (keepDrawn(node, record)) {
+                drawSegment(node);
+            }
             continue;
         }
         // Second child first, so the walk goes left to right.

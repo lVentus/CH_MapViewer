@@ -1,6 +1,7 @@
 #pragma once
 
 #include "benchmark/GPUTimer.h"
+#include "benchmark/TimingStats.h"
 #include "gpu/ComputeProgram.h"
 #include "gpu/GPUBuffer.h"
 #include "gpu/GraphicsProgram.h"
@@ -35,26 +36,31 @@ namespace chmv::gpu::lod {
 class LodPagePool;
 
 // What one filter and expansion pass works on: the resident slots of the planned pages, and the
-// directory and query (level, threshold, box) they were planned with.
+// directory and query (level, threshold, box) they were planned with. cullSegments drops drawn
+// segments whose chord misses the query box.
 struct LodPagePass {
     std::span<const std::uint32_t> slots;
     std::span<const streaming::lod::PageEntry> directory;
     streaming::lod::LodPageQuery query;
     std::uint32_t hierarchyHeight = 0;
+    bool cullSegments = false;
 };
 
-// Repeated passes of the selected strategies, timed on the GPU.
+// Repeated passes of the selected strategies after a few unmeasured ones, timed two ways: GPU
+// timestamps around the filter and the expansion of every pass, and the wall time of batches of
+// passes ended by glFinish (per pass; dependable where timestamps are not, as on some
+// integrated GPUs). Drawing the result is timed the same two ways.
 struct LodPageBenchmarkResult {
     std::uint32_t iterations = 0;
     std::uint32_t pages = 0;
     std::uint32_t candidates = 0;
     std::uint32_t segments = 0;
-    double filterMinMs = 0.0;
-    double filterAverageMs = 0.0;
-    double filterMaxMs = 0.0;
-    double unfoldMinMs = 0.0;
-    double unfoldAverageMs = 0.0;
-    double unfoldMaxMs = 0.0;
+    benchmark::TimingStats filterGpu;
+    benchmark::TimingStats unfoldGpu;
+    benchmark::TimingStats passGpu;
+    benchmark::TimingStats passWall;
+    benchmark::TimingStats drawGpu;
+    benchmark::TimingStats drawWall;
 };
 
 // GPU half of the LOD page runtime: the selected filter and expansion turn resident pages into a
@@ -74,11 +80,13 @@ public:
                  std::optional<std::uint32_t> stepBase = std::nullopt);
     void Draw(const LodPagePool& pool, const renderer::MapCamera2D& camera, int width, int height,
               const renderer::RoadStyleConfig& styles);
-    // Runs the pass `iterations` times and waits for the timings.
-    [[nodiscard]] LodPageBenchmarkResult Benchmark(const LodPagePool& pool, const LodPagePass& pass,
-                                                   filtering::IRangeFilterStrategy& filter,
-                                                   unfolding::IUnfoldingStrategy& unfold,
-                                                   std::uint32_t iterations);
+    // Runs the pass and the draw `iterations` times each (and the batches again) and waits for
+    // the timings.
+    [[nodiscard]] LodPageBenchmarkResult
+    Benchmark(const LodPagePool& pool, const LodPagePass& pass,
+              filtering::IRangeFilterStrategy& filter, unfolding::IUnfoldingStrategy& unfold,
+              std::uint32_t iterations, const renderer::MapCamera2D& camera, int width, int height,
+              const renderer::RoadStyleConfig& styles);
     // Collects finished GPU results without waiting; they are a few frames old.
     void Poll();
     // True once after a finished pass ran out of room; the buffers have grown, so it is worth

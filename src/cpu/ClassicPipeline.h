@@ -25,11 +25,14 @@ public:
     [[nodiscard]] static std::unique_ptr<ClassicGraph> Load(const streaming::lod::LodPageFile& file,
                                                             const std::stop_token& stop);
 
-    // Filters: every edge (FullScan), the edges ordered by birth level (BirthOrdered), or a loose
-    // grid of the edges' boxes, grown by their error, per cell ordered by birth (Culling).
-    // Expansions: Roots, Dfs, Bfs (the dual-interval rule needs the page records).
+    // Filters: every edge (FullScan, or TwoPass: counted per block of edges first, then written
+    // to their places), the edges ordered by birth level (BirthOrdered), or a loose grid of the
+    // edges' boxes, grown by their error, per cell ordered by birth (Culling).
+    // Expansions: Roots, Dfs, Bfs, Queue (the dual-interval rule needs the page records).
+    // cullSegments drops drawn edges whose chord misses the query box.
     [[nodiscard]] CpuResult Run(CpuWorkers& workers, const streaming::lod::LodPageQuery& query,
-                                CpuFilter filter, CpuExpansion expansion) const;
+                                CpuFilter filter, CpuExpansion expansion,
+                                bool cullSegments = false) const;
 
     [[nodiscard]] std::uint64_t Bytes() const;
 

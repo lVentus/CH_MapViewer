@@ -73,8 +73,8 @@ void ValidateHeader(const std::filesystem::path& path, const FileHeader& header,
     const auto n = header.nodeCount;
     const auto m = header.edgeCount;
     expect(Section::NodeOsmId, n * 8u, "node OSM id");
-    expect(Section::NodeLatitude, n * 4u, "node latitude");
-    expect(Section::NodeLongitude, n * 4u, "node longitude");
+    expect(Section::NodeLatitude, n * 8u, "node latitude");
+    expect(Section::NodeLongitude, n * 8u, "node longitude");
     expect(Section::NodeElevation, n * 4u, "node elevation");
     expect(Section::NodeLevel, n * 4u, "node level");
     expect(Section::EdgeSource, m * 4u, "edge source");

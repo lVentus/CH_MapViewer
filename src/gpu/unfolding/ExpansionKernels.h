@@ -10,8 +10,8 @@
 namespace chmv::gpu::unfolding {
 
 // Binds what every expansion kernel reads and writes (lod_page_common.glsl and
-// lod_page_segments.glsl): the pool, `inputList` at 2, segments, status, draw command and their
-// uniforms. The program must be bound.
+// lod_page_segments.glsl): the pool, `inputList` at 2, segments, status, draw command, cull box
+// and their uniforms. The program must be bound.
 void BindExpansionKernel(std::uint32_t program, const UnfoldingInput& input,
                          std::uint32_t inputList);
 // The rest for kernels that walk the hierarchy (lod_page_traversal.glsl).

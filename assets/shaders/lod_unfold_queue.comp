@@ -1,0 +1,96 @@
+#version 430 core
+
+// Persistent work queue: a fixed number of workgroups stays on the GPU and takes nodes from one
+// global queue until no work is left anywhere. The candidates are the seeds (the roots among
+// them are walked); the children of an expanded node go to the end of the queue. Load balance
+// is global and dynamic, at the price of atomics on shared counters for every node.
+//
+// Every invocation holds one ticket at a time, the next seed or queue slot. A slot that is not
+// filled yet is polled again in the next turn of the same loop, in which the invocations that
+// do hold a node visit it: a waiting invocation never holds up the one it waits for, even in
+// the same subgroup. Waiting invocations only read (the slot, the pending count) and leave the
+// atomics to those that work. Queue slots are emptied when taken, so the queue is empty again
+// after every pass.
+
+layout(local_size_x = 64) in;
+
+#include "lod_page_common.glsl"
+#include "lod_page_segments.glsl"
+#include "lod_page_traversal.glsl"
+
+layout(std430, binding = 2) readonly buffer Candidates {
+    uint candidateCount;
+    uint candidateGroups[3];
+    uint candidates[];
+};
+// Header (lod_unfold_queue_start.comp), then the slots, kNoItem while empty. Polled with plain
+// reads, which must see the other invocations' atomics.
+layout(std430, binding = 7) coherent volatile buffer Queue {
+    uint queueHead;
+    uint queueTail;
+    uint queuePending;
+    uint queueSeeds;
+    uint queueGroups[4];
+    uint queue[];
+};
+
+uniform uint uLevel;
+uniform uint uQueueCapacity;
+
+// Children are counted as pending before their parent is done, so the count only reaches zero
+// once all work is done.
+void push(uint child) {
+    uint at = atomicAdd(queueTail, 1u);
+    if (at < uQueueCapacity) {
+        atomicAdd(queuePending, 1u);
+        atomicExchange(queue[at], child);
+    } else {
+        atomicAdd(status[kStatusFrontierOverflow], 1u);
+    }
+}
+
+void visit(uint node, bool seed) {
+    uvec4 record = pageRecord(node);
+    if (seed && !inLevelRange(record.y, uLevel)) {
+        return;
+    }
+    if (!nodeVisible(node, record)) {
+        return;
+    }
+    if (!expands(node, record)) {
+        if (keepDrawn(node, record)) {
+            drawSegment(node);
+        }
+        return;
+    }
+    for (uint which = 0u; which < 2u; ++which) {
+        uint child = childItem(node, which);
+        if (child != kNoItem) {
+            push(child);
+        }
+    }
+}
+
+void main() {
+    uint seeds = queueSeeds;
+    uint ticket = kNoItem;
+    for (;;) {
+        if (ticket == kNoItem) {
+            ticket = atomicAdd(queueHead, 1u);
+        }
+        bool seed = ticket < seeds;
+        uint node = kNoItem;
+        if (seed) {
+            node = candidates[ticket];
+        } else if (ticket - seeds < uQueueCapacity && queue[ticket - seeds] != kNoItem) {
+            node = atomicExchange(queue[ticket - seeds], kNoItem);
+        }
+        if (node != kNoItem) {
+            visit(node, seed);
+            atomicAdd(queuePending, 0xffffffffu);
+            ticket = kNoItem;
+        } else if (queuePending == 0u) {
+            break;
+        }
+    }
+}

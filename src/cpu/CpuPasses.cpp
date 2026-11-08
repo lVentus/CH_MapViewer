@@ -18,6 +18,12 @@ bool ChordTouches(std::int32_t ax, std::int32_t ay, std::int32_t bx, std::int32_
            std::min(normalized(ay), normalized(by)) <= rectangle[3];
 }
 
+bool ChordInCullBox(std::int32_t ax, std::int32_t ay, std::int32_t bx, std::int32_t by,
+                    const std::array<std::int32_t, 4>& cull) {
+    return std::max(ax, bx) >= cull[0] && std::min(ax, bx) <= cull[2] &&
+           std::max(ay, by) >= cull[1] && std::min(ay, by) <= cull[3];
+}
+
 std::vector<std::uint32_t> EdgesInView(std::span<const CpuSegment> segments,
                                        std::span<const std::uint32_t> edges,
                                        const std::array<double, 4>& rectangle) {

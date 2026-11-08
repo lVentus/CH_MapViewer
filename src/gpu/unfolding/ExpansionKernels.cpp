@@ -16,12 +16,13 @@ void BindExpansionKernel(std::uint32_t program, const UnfoldingInput& input,
     glUniform1ui(glGetUniformLocation(program, "uSegmentCapacity"), input.segmentCapacity);
     glUniform1ui(glGetUniformLocation(program, "uLevel"), input.level);
     glUniform1ui(glGetUniformLocation(program, "uThreshold"), input.threshold);
-}
-
-void BindTraversalKernel(std::uint32_t program, const UnfoldingInput& input) {
-    glBindBufferBase(GL_UNIFORM_BUFFER, 0, input.errorBounds);
     glUniform4i(glGetUniformLocation(program, "uCullBox"), input.cullBox[0], input.cullBox[1],
                 input.cullBox[2], input.cullBox[3]);
+    glUniform1ui(glGetUniformLocation(program, "uCullSegments"), input.cullSegments ? 1u : 0u);
+}
+
+void BindTraversalKernel(std::uint32_t, const UnfoldingInput& input) {
+    glBindBufferBase(GL_UNIFORM_BUFFER, 0, input.errorBounds);
 }
 
 IntervalKernel::IntervalKernel(const std::filesystem::path& shaderDirectory)

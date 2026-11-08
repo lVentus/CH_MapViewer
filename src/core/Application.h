@@ -1,5 +1,6 @@
 #pragma once
 
+#include "benchmark/BenchmarkSuite.h"
 #include "benchmark/LodPageZoomSweep.h"
 #include "core/AdaptiveTolerance.h"
 #include "core/Window.h"
@@ -51,6 +52,17 @@ private:
     [[nodiscard]] FrameCosts CurrentCosts(bool gpuOn, bool cpuOn) const;
     // GPU against CPU inside the view, once both show the same, complete, still view.
     void CompareGpuAndCpu();
+    // Where reports, benchmarks and sweeps of the current dataset go.
+    [[nodiscard]] std::filesystem::path ResultsDirectory() const;
+    // Benchmarks the current strategies (GPU and/or CPU, whichever runs) for a view of this
+    // size, appends the timings to benchmark.csv and returns what the suite summary needs.
+    benchmark::BenchmarkSuite::Outcome RunBenchmarks(const std::string& run, int width, int height,
+                                                     float tolerance, bool gpuOn, bool cpuOn);
+    void StartSuite();
+    // One frame of the suite, after the frame's pass.
+    void StepSuite(double seconds, int width, int height, float tolerance, bool gpuOn, bool cpuOn);
+    // Ends the suite (if any) and brings back the strategies chosen before it.
+    void StopSuite();
 
     Window window_;
     gpu::OpenGLContext context_;
@@ -68,6 +80,8 @@ private:
     std::filesystem::path shaderDirectory_;
     // Road styles come from a config file next to the shaders, reloaded when it changes.
     std::filesystem::path roadStylePath_;
+    // Reports, benchmarks and zoom sweeps go to <resultsRoot_>/<dataset>/, apart from the data.
+    std::filesystem::path resultsRoot_;
     std::filesystem::file_time_type roadStyleWriteTime_{};
     float roadStyleCheckSeconds_ = 0.0f;
     std::string roadStyleStatus_;
@@ -90,6 +104,15 @@ private:
     std::pair<std::uint64_t, std::uint64_t> comparedKey_{};
     std::optional<cpu::CpuBenchmarkResult> cpuBenchmark_;
     benchmark::LodPageZoomSweep lodPageSweep_;
+    benchmark::BenchmarkSuite suite_;
+    struct SuiteRestore {
+        std::size_t filter = 0;
+        std::size_t expansion = 0;
+        bool cullSegments = false;
+    };
+    std::optional<SuiteRestore> suiteRestore_;
+    // The benchmark button was pressed; it runs in the next frame, before its picture is drawn.
+    bool benchmarkRequested_ = false;
     std::optional<gpu::lod::LodPageValidation> validation_;
     std::optional<gpu::lod::LodPageBenchmarkResult> benchmark_;
     // Strategies the validation and benchmark results above were made with.
@@ -97,6 +120,8 @@ private:
     std::size_t resultUnfold_ = 0;
     float maxScreenErrorPixels_ = 1.0f;
     bool preloadAll_ = false;
+    // Drop drawn segments whose chord misses the view (GPU and CPU alike).
+    bool cullSegments_ = true;
     // GPU page pool budget; 0 = automatic.
     std::uint64_t gpuBudgetBytes_ = 0;
     double lastCursorX_ = 0.0;

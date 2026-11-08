@@ -4,16 +4,16 @@ CH_MapViewer is a Linux-first OpenGL renderer for contraction-hierarchy-based ro
 
 A dataset (`.sch` + `.sch.ranges`) is turned once into a self-contained page file (`<name>.chlod`, built in the background and checked against plain DFS). The viewer then has three independent parts:
 
-- **Loading (virtual map):** the pages a view needs follow from the camera alone; they are streamed into a GPU page pool from RAM (when the page file fits) or from disk. All pages can be preloaded into the GPU when they fit.
-- **Filter:** finds the records of the current level on the GPU — full scan, birth-ordered (records sorted per page, prefix search), or GPU page culling (the GPU picks the pages itself).
-- **Expansion:** decides what is drawn — none (roots only), full BFS, adaptive DFS, adaptive BFS, or dual interval (no traversal: every record decides from its stored intervals).
+- **Loading (virtual map):** the pages a view needs follow from the camera alone; they are streamed into a GPU page pool from RAM (when the page file fits) or from disk. All pages can be preloaded into the GPU when they fit. A view that needs more pages than the pool holds is drawn as from farther away (coarser level and tolerance, in quarter octaves; beyond the overview the level alone is raised) until its pages fit; the panel says by how much.
+- **Filter:** finds the records of the current level on the GPU — full scan, birth-ordered (records sorted per page, prefix search), GPU page culling (the GPU picks the pages itself), or two-pass scatter (count per page, prefix sum, then every candidate written to its place without atomics).
+- **Expansion:** decides what is drawn — none (roots only), full BFS, adaptive DFS, adaptive BFS, adaptive persistent queue (resident workgroups share one global work queue), adaptive workgroup queue (a workgroup walks its roots together from a queue in shared memory), or dual interval (no traversal: every record decides from its stored intervals).
 
-Filter and expansion are chosen at runtime; every combination draws the same roads, which the viewer can check against a CPU evaluation and benchmark on the GPU.
+Filter and expansion are chosen at runtime; every combination draws the same roads, which the viewer can check against a CPU evaluation and benchmark on the GPU. With "Cull drawn segments to the view" (on by default) segments whose chord misses the view are dropped in the pass instead of being drawn off screen.
 
 Processing runs on the GPU, on the CPU, or both side by side:
 
 - **CPU:** a CPU method decides what is drawn and the GPU only rasterizes it. Either the same pages and strategies on the CPU, or the classic method on the whole CH in RAM (roots by their [death, birth] interval, DFS/BFS expansion, a grid of the edges for culling). Both run on 1 to all hardware threads.
-- **Compare:** GPU on the left, CPU on the right, same view; once the view is still and complete, the roads in view are compared edge by edge (not when the GPU result was truncated by a full list). The benchmark button and the zoom sweep CSV record the CPU times as well (columns that do not apply are -1).
+- **Compare:** GPU on the left, CPU on the right, same view; once the view is still and complete, the roads in view are compared edge by edge (not when the GPU result was truncated by a full list). The benchmark buttons and the zoom sweep CSV record the CPU times as well (columns that do not apply are -1).
 
 The screen tolerance of the adaptive expansions is set by hand (0.5 to 16 px) or automatically, for a target frame rate (60 fps by default): 1 px when the machine is fast enough, coarser in quarter octaves up to 8 px when it is not. Each frame is timed on the GPU from its first command to the end of its drawing.
 
@@ -22,6 +22,15 @@ The screen tolerance of the adaptive expansions is set by hand (0.5 to 16 px) or
 - **Twice the tolerance while moving:** on top of either, until 150 ms after the camera stops.
 
 The zoom sweep CSV records the tolerance and the measured frame time of every frame.
+
+## Results for analysis
+
+Everything meant for later analysis goes to `results/<dataset>/` (next to `assets/`, apart from the data):
+
+- **Preprocessing** (written by every build): `preprocess_summary.txt` (stage times, RAM peak, threads, throughput, sizes), `preprocess_stages.csv`, and one line per build in `preprocess_history.csv`.
+- **Page file layout** (written whenever it is missing or older than the `.chlod`, so also for files built earlier): `layout_summary.txt`, `layout_layers.csv` (pages, fill, page box sizes and bytes per quality layer and zoom octave), `layout_levels.csv` (pages each level can select), `layout_page_fill.csv`, `layout_sections.csv` (every section uncompressed and stored).
+- **Benchmarks:** "Benchmark filter + expansion" runs 10 unmeasured and 100 measured passes and draws, timed by GPU timestamps and by the wall time of batches of 10 between two `glFinish` (dependable where timestamps are not), and appends mean, median, p95, p99, min, max and standard deviation of every measure to `benchmark.csv`, one line per measure with the conditions (renderer, strategies, culling, tolerance, view, level, pages, segments). In CPU and Compare mode the CPU pass is measured too. "Benchmark all combinations" does this for every filter × expansion, without and with culling, at the current view, and writes a table of the means to `benchmark_suite-<time>.txt`.
+- **Zoom sweeps:** `zoom_sweep_<time>.csv`.
 
 Damaged pages are left out on the CPU as on the GPU. A CPU page pass refuses a view whose pages would need more than a quarter of the free RAM (at least 512 MiB), and a CPU result too large for the GPU memory left is reported instead of drawn.
 
@@ -35,7 +44,7 @@ Damaged pages are left out on the CPU as on the GPU. A CPU page pass refuses a v
 - `gpu/lod`: GPU page pool, pass orchestration and the runtime
 - `gpu/filtering`, `gpu/unfolding`: the runtime-selectable strategies (`IRangeFilterStrategy`, `IUnfoldingStrategy`); a new strategy is one class plus its shaders, registered in `Application`
 - `renderer`: camera, LOD curve, road styles, tolerance controller and frame setup
-- `benchmark`: GPU timers and the zoom sweep
+- `benchmark`: GPU timers, timing statistics, the benchmark log and suite, the zoom sweep
 - `ui`: Dear ImGui tools and runtime controls
 
 ## Build

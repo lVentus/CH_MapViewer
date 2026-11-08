@@ -93,6 +93,7 @@ bool CpuRuntime::Update(const streaming::lod::LodPageQuery& query, CpuMethod met
     key.method = method;
     key.filter = strategy.filter;
     key.expansion = strategy.expansion;
+    key.cullSegments = strategy.cullSegments;
     key.threads = workers_->Threads();
     key.classic = method == CpuMethod::Classic ? Classic().state : ClassicState::NotLoaded;
     key.stepBase = stepBase;
@@ -126,9 +127,9 @@ CpuResult CpuRuntime::RunPass(const streaming::lod::LodPageQuery& query, CpuMeth
     try {
         if (method == CpuMethod::Pages) {
             return RunPagePass(store_, *workers_, query, *strategy.filter, *strategy.expansion,
-                               strategy.mode == geometry::RefinementMode::Adaptive
-                                   ? stepBase
-                                   : std::nullopt);
+                               strategy.mode == geometry::RefinementMode::Adaptive ? stepBase
+                                                                                   : std::nullopt,
+                               strategy.cullSegments);
         }
         const ClassicGraph* graph = nullptr;
         {
@@ -149,7 +150,8 @@ CpuResult CpuRuntime::RunPass(const streaming::lod::LodPageQuery& query, CpuMeth
             }
             graph = classic_.get();
         }
-        return graph->Run(*workers_, query, *strategy.filter, *strategy.expansion);
+        return graph->Run(*workers_, query, *strategy.filter, *strategy.expansion,
+                          strategy.cullSegments);
     } catch (const std::exception& error) {
         result.unavailable = std::string("CPU pass failed: ") + error.what();
         return result;
@@ -161,27 +163,28 @@ CpuBenchmarkResult CpuRuntime::Benchmark(const streaming::lod::LodPageQuery& que
                                          std::uint32_t maxIterations, double maxSeconds) {
     CpuBenchmarkResult benchmark;
     benchmark.threads = workers_->Threads();
+    // The first pass fetches the pages and fills the caches.
+    if (const auto first = Run(query, method, strategy); !first.unavailable.empty()) {
+        benchmark.unavailable = first.unavailable;
+        return benchmark;
+    }
     const auto begin = Clock::now();
-    double prepare = 0.0;
-    double filter = 0.0;
-    double expand = 0.0;
+    std::vector<double> prepare;
+    std::vector<double> filter;
+    std::vector<double> expand;
+    std::vector<double> output;
+    std::vector<double> total;
     while (benchmark.iterations < maxIterations) {
         const auto run = Run(query, method, strategy);
         if (!run.unavailable.empty()) {
             benchmark.unavailable = run.unavailable;
             return benchmark;
         }
-        if (benchmark.iterations == 0u) {
-            benchmark.filterMinMs = benchmark.filterMaxMs = run.filterMs;
-            benchmark.expandMinMs = benchmark.expandMaxMs = run.expandMs;
-        }
-        benchmark.filterMinMs = std::min(benchmark.filterMinMs, run.filterMs);
-        benchmark.filterMaxMs = std::max(benchmark.filterMaxMs, run.filterMs);
-        benchmark.expandMinMs = std::min(benchmark.expandMinMs, run.expandMs);
-        benchmark.expandMaxMs = std::max(benchmark.expandMaxMs, run.expandMs);
-        prepare += run.prepareMs;
-        filter += run.filterMs;
-        expand += run.expandMs;
+        prepare.push_back(run.prepareMs);
+        filter.push_back(run.filterMs);
+        expand.push_back(run.expandMs);
+        output.push_back(run.outputMs);
+        total.push_back(run.TotalMs());
         benchmark.candidates = run.candidates;
         benchmark.segments = run.segments.size();
         ++benchmark.iterations;
@@ -190,10 +193,11 @@ CpuBenchmarkResult CpuRuntime::Benchmark(const streaming::lod::LodPageQuery& que
             break;
         }
     }
-    const auto iterations = static_cast<double>(std::max(benchmark.iterations, 1u));
-    benchmark.prepareAverageMs = prepare / iterations;
-    benchmark.filterAverageMs = filter / iterations;
-    benchmark.expandAverageMs = expand / iterations;
+    benchmark.prepare = benchmark::Summarize(std::move(prepare));
+    benchmark.filter = benchmark::Summarize(std::move(filter));
+    benchmark.expand = benchmark::Summarize(std::move(expand));
+    benchmark.output = benchmark::Summarize(std::move(output));
+    benchmark.total = benchmark::Summarize(std::move(total));
     return benchmark;
 }
 

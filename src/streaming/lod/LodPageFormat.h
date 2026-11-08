@@ -32,19 +32,18 @@ static_assert(std::endian::native == std::endian::little,
               "LOD page files are little-endian and mapped directly");
 
 inline constexpr std::array<char, 8> kFileMagic{'C', 'H', 'L', 'O', 'D', 'P', 'G', 'S'};
-// 5: a shortcut record draws with the road style of the roads it stands for (EdgeStyle below);
-// 4 used the shortcut's own type, which many datasets leave 0. 4: everything compressed. Files
-// of an older version are rebuilt; an uncompressed file of this version (as the builder writes
-// it before compressing) is compressed on load.
-inline constexpr std::uint32_t kFormatVersion = 5;
+// 6: latitude/longitude are doubles; 5 stored 1e-7 degree integers and could not hold sources
+// written from floats (EUR). 5: a shortcut record draws with the road style of the roads it
+// stands for (EdgeStyle below); 4 used the shortcut's own type, which many datasets leave 0.
+// 4: everything compressed. Files of an older version are rebuilt; an uncompressed file of this
+// version (as the builder writes it before compressing) is compressed on load.
+inline constexpr std::uint32_t kFormatVersion = 6;
 inline constexpr std::uint64_t kHeaderBytes = 4096;
 inline constexpr std::uint64_t kSectionAlignment = 4096;
 
 // Node coordinates in the render layer: normalized projected coordinates times 2^29, as int32.
 // Normalized coordinates stay within about +-1, so differences never overflow int32.
 inline constexpr double kFixedCoordinateScale = 536870912.0;
-// Latitude/longitude in the CH layer: integer 1e-7 degrees (OSM's own resolution).
-inline constexpr double kDegreeScale = 1e7;
 
 // Physical calibration shared with the camera (MapCamera2D / Application).
 inline constexpr double kMetersPerProjectedDegree = 111319.49079327357;
@@ -188,8 +187,8 @@ inline constexpr std::uint32_t kErrorBoundMantissas = 1024;
 
 enum class Section : std::uint32_t {
     NodeOsmId,     // uint64
-    NodeLatitude,  // int32, 1e-7 degrees
-    NodeLongitude, // int32, 1e-7 degrees
+    NodeLatitude,  // double, degrees; gives back the source decimal exactly
+    NodeLongitude, // double, degrees
     NodeElevation, // float
     NodeLevel,     // uint32
     EdgeSource,    // uint32

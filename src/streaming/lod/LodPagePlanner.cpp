@@ -25,7 +25,8 @@ void CollectLodPages(std::span<const PageGroup> groups, std::span<const PageEntr
 }
 
 LodPageView PlanView(const renderer::MapCamera2D& camera, const renderer::LODController& lod,
-                     int width, int height, float pixelTolerance, std::int32_t maxLevel) {
+                     int width, int height, float pixelTolerance, std::int32_t maxLevel,
+                     double zoomOutOctaves) {
     // Roads just outside the screen still reach into it with half their stroke width.
     constexpr double kStrokeMarginPixels = renderer::kMaxRoadWidthPixels / 2.0;
     const auto viewScale = std::max(static_cast<double>(camera.ViewScale()), 1e-12);
@@ -40,10 +41,12 @@ LodPageView PlanView(const renderer::MapCamera2D& camera, const renderer::LODCon
     view.query.minY = static_cast<float>(centerY - halfY - margin);
     view.query.maxX = static_cast<float>(centerX + halfX + margin);
     view.query.maxY = static_cast<float>(centerY + halfY + margin);
-    view.query.level = static_cast<std::uint32_t>(
-        std::clamp<long>(std::lround(lod.ContinuousLevel(camera.ZoomFactor())), 0L, maxLevel));
-    view.toleranceCode =
-        EncodeErrorTolerance(static_cast<double>(std::max(pixelTolerance, 0.01f)) * pixel);
+    const auto farther = std::exp2(zoomOutOctaves);
+    view.query.level = static_cast<std::uint32_t>(std::clamp<long>(
+        std::lround(lod.ContinuousLevel(static_cast<float>(camera.ZoomFactor() / farther))), 0L,
+        maxLevel));
+    view.toleranceCode = EncodeErrorTolerance(static_cast<double>(std::max(pixelTolerance, 0.01f)) *
+                                              pixel * farther);
     view.pixelCode = EncodeErrorTolerance(pixel);
     view.rectangle = {centerX - halfX, centerY - halfY, centerX + halfX, centerY + halfY};
     return view;

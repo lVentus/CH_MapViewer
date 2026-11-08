@@ -76,10 +76,12 @@ private:
 // One CPU pass over the pages, mirroring the GPU kernels: plan the pages of the query (from
 // the visit directory for traversals), find the candidates with the filter, expand them, and
 // turn what is drawn into segments. With stepBase (the error code of one pixel) it also counts
-// the segments each tolerance step would draw from the same pages.
+// the segments each tolerance step would draw from the same pages. cullSegments drops drawn
+// segments whose chord misses the query box.
 [[nodiscard]] CpuResult RunPagePass(CpuPageStore& store, CpuWorkers& workers,
                                     const streaming::lod::LodPageQuery& query, CpuFilter filter,
                                     CpuExpansion expansion,
-                                    std::optional<std::uint32_t> stepBase = std::nullopt);
+                                    std::optional<std::uint32_t> stepBase = std::nullopt,
+                                    bool cullSegments = false);
 
 } // namespace chmv::cpu

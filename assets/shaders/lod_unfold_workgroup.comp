@@ -1,0 +1,122 @@
+#version 430 core
+
+// Workgroup queue: one workgroup per 256 candidates walks the subtrees of its roots together.
+// The nodes still to visit wait in shared memory; in every round each invocation takes one of
+// the most recently added (so the queue stays small, as a stack would), visits it and adds its
+// children. A long walk is thus shared by the whole workgroup instead of one invocation, the
+// GPU's own scheduler balances the workgroups, and there is a single dispatch and no global
+// counter except for the output. Children that do not fit in shared memory are walked by the
+// invocation that found them, depth first. STACK_SIZE (defined by the host) is at least the
+// hierarchy height plus one.
+
+layout(local_size_x = 256) in;
+
+#include "lod_page_common.glsl"
+#include "lod_page_segments.glsl"
+#include "lod_page_traversal.glsl"
+
+layout(std430, binding = 2) readonly buffer Candidates {
+    uint candidateCount;
+    uint candidateGroups[3];
+    uint candidates[];
+};
+
+uniform uint uLevel;
+
+const uint kQueueSize = 2048u;
+
+shared uint sQueue[kQueueSize];
+shared uint sCount;
+
+// The overflow path, as lod_unfold_dfs.comp.
+void walkAlone(uint start) {
+    uint stack[STACK_SIZE];
+    uint depth = 1u;
+    stack[0] = start;
+    while (depth > 0u) {
+        depth -= 1u;
+        uint node = stack[depth];
+        uvec4 record = pageRecord(node);
+        if (!nodeVisible(node, record)) {
+            continue;
+        }
+        if (!expands(node, record)) {
+            if (keepDrawn(node, record)) {
+                drawSegment(node);
+            }
+            continue;
+        }
+        for (uint which = 2u; which > 0u; --which) {
+            uint child = childItem(node, which - 1u);
+            if (child == kNoItem) {
+                continue;
+            }
+            if (depth == uint(STACK_SIZE)) {
+                atomicAdd(status[kStatusStackOverflow], 1u);
+                continue;
+            }
+            stack[depth] = child;
+            depth += 1u;
+        }
+    }
+}
+
+void enqueue(uint node) {
+    uint at = atomicAdd(sCount, 1u);
+    if (at < kQueueSize) {
+        sQueue[at] = node;
+    } else {
+        walkAlone(node);
+    }
+}
+
+void main() {
+    uint local = gl_LocalInvocationID.x;
+    if (local == 0u) {
+        sCount = 0u;
+    }
+    barrier();
+    uint index = linearInvocation();
+    if (index < candidateCount) {
+        uint item = candidates[index];
+        if (inLevelRange(pageRecord(item).y, uLevel)) {
+            enqueue(item);
+        }
+    }
+    for (;;) {
+        barrier();
+        // Additions beyond the queue were walked alone.
+        if (local == 0u) {
+            sCount = min(sCount, kQueueSize);
+        }
+        barrier();
+        uint count = sCount;
+        if (count == 0u) {
+            break;
+        }
+        uint take = min(count, gl_WorkGroupSize.x);
+        uint node = local < take ? sQueue[count - take + local] : kNoItem;
+        barrier();
+        if (local == 0u) {
+            sCount = count - take;
+        }
+        barrier();
+        bool draw = false;
+        if (node != kNoItem) {
+            uvec4 record = pageRecord(node);
+            if (nodeVisible(node, record)) {
+                if (expands(node, record)) {
+                    for (uint which = 0u; which < 2u; ++which) {
+                        uint child = childItem(node, which);
+                        if (child != kNoItem) {
+                            enqueue(child);
+                        }
+                    }
+                } else {
+                    draw = keepDrawn(node, record);
+                }
+            }
+        }
+        drawSegments(draw, node);
+    }
+}

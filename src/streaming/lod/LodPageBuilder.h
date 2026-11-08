@@ -1,5 +1,7 @@
 #pragma once
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -19,6 +21,10 @@ enum class BuildStage {
     Verify,
     Compress,
 };
+
+inline constexpr std::size_t kBuildStageCount = static_cast<std::size_t>(BuildStage::Compress) + 1u;
+
+[[nodiscard]] const char* BuildStageName(BuildStage stage);
 
 struct BuildProgress {
     BuildStage stage = BuildStage::ReadNodes;
@@ -42,6 +48,13 @@ struct BuildResult {
     std::uint64_t fileBytes = 0;
     std::uint64_t uncompressedBytes = 0;
     double seconds = 0.0;
+    // Sizes of the .sch and .ranges, the threads used, wall time of every stage, and the most
+    // RAM the process held during the build (sampled).
+    std::uint64_t graphBytes = 0;
+    std::uint64_t rangesBytes = 0;
+    unsigned threads = 0;
+    std::array<double, kBuildStageCount> stageSeconds{};
+    std::uint64_t peakResidentBytes = 0;
 };
 
 // Builds the self-contained LOD page file from a .sch/.ranges pair, out of core: edge data

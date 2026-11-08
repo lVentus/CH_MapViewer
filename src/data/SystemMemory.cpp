@@ -6,8 +6,11 @@
 #ifdef _WIN32
 #define NOMINMAX
 #include <windows.h>
+// After windows.h, which it needs.
+#include <psapi.h>
 #elif defined(__linux__)
 #include <sys/sysinfo.h>
+#include <unistd.h>
 #endif
 
 namespace chmv::data {
@@ -45,6 +48,24 @@ SystemMemoryInfo QuerySystemMemoryInfo() {
     }
 #endif
     return result;
+}
+
+std::uint64_t QueryProcessResidentBytes() {
+#ifdef _WIN32
+    PROCESS_MEMORY_COUNTERS counters{};
+    if (GetProcessMemoryInfo(GetCurrentProcess(), &counters, sizeof(counters)) != 0) {
+        return counters.WorkingSetSize;
+    }
+#elif defined(__linux__)
+    // Second field of statm: resident pages.
+    std::ifstream statm("/proc/self/statm");
+    std::uint64_t sizePages = 0;
+    std::uint64_t residentPages = 0;
+    if (statm >> sizePages >> residentPages) {
+        return residentPages * static_cast<std::uint64_t>(sysconf(_SC_PAGESIZE));
+    }
+#endif
+    return 0;
 }
 
 } // namespace chmv::data

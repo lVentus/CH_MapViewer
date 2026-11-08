@@ -292,51 +292,34 @@ template <typename T>
     return static_cast<T>(value);
 }
 
-// Decimal degrees with at most seven significant decimals, as exact 1e-7 integers.
-[[nodiscard]] std::int32_t ParseDegrees(const RecordParser& tokens, std::string_view token) {
-    std::size_t i = 0;
-    bool negative = false;
-    if (i < token.size() && (token[i] == '-' || token[i] == '+')) {
-        negative = token[i] == '-';
-        ++i;
-    }
-    std::int64_t whole = 0;
-    std::int64_t fraction = 0;
-    int fractionDigits = 0;
-    bool anyDigit = false;
-    bool afterPoint = false;
-    for (; i < token.size(); ++i) {
-        const auto ch = token[i];
-        if (ch == '.' && !afterPoint) {
-            afterPoint = true;
-            continue;
-        }
-        if (ch < '0' || ch > '9') {
-            BadToken(tokens, token, "coordinate");
-        }
-        anyDigit = true;
-        const auto digit = static_cast<std::int64_t>(ch - '0');
-        if (!afterPoint) {
-            whole = whole * 10 + digit;
-            if (whole > 180) {
-                BadToken(tokens, token, "coordinate");
-            }
-        } else if (fractionDigits < 7) {
-            fraction = fraction * 10 + digit;
-            ++fractionDigits;
-        } else if (digit != 0) {
-            throw std::runtime_error(tokens.Name() + ": coordinate '" + std::string(token) +
-                                     "' has more than 7 decimals and cannot be stored exactly");
-        }
-    }
-    if (!anyDigit) {
+// Decimal degrees in any notation (EUR is written from floats: 50.98522568, -4.89999984e-05),
+// as the nearest double. With at most 15 significant digits that double gives the source
+// decimal back exactly; longer coordinates are rejected rather than rounded.
+[[nodiscard]] double ParseDegrees(const RecordParser& tokens, std::string_view token) {
+    const auto value = ParseNumber<double>(tokens, token, "coordinate");
+    if (!(std::abs(value) <= 180.0)) {
         BadToken(tokens, token, "coordinate");
     }
-    for (; fractionDigits < 7; ++fractionDigits) {
-        fraction *= 10;
+    // From the first non-zero digit to the last one, before any exponent.
+    int digits = 0;
+    int zeros = 0;
+    for (const auto ch : token) {
+        if (ch == 'e' || ch == 'E') {
+            break;
+        }
+        if (ch == '0') {
+            zeros += digits != 0 ? 1 : 0;
+        } else if (ch >= '1' && ch <= '9') {
+            digits += zeros + 1;
+            zeros = 0;
+        }
     }
-    const auto value = whole * 10000000 + fraction;
-    return static_cast<std::int32_t>(negative ? -value : value);
+    if (digits > std::numeric_limits<double>::digits10) {
+        throw std::runtime_error(tokens.Name() + ": coordinate '" + std::string(token) +
+                                 "' has more than 15 significant digits and cannot be stored "
+                                 "exactly");
+    }
+    return value;
 }
 
 [[nodiscard]] std::uint32_t ParseWeight(const RecordParser& tokens, std::string_view token) {
@@ -360,8 +343,8 @@ void PlaceCHSections(FileHeader& header, std::uint64_t& offset) {
     const auto m = header.edgeCount;
     const std::array<std::pair<Section, std::uint64_t>, 17> sizes{{
         {Section::NodeOsmId, n * 8u},
-        {Section::NodeLatitude, n * 4u},
-        {Section::NodeLongitude, n * 4u},
+        {Section::NodeLatitude, n * 8u},
+        {Section::NodeLongitude, n * 8u},
         {Section::NodeElevation, n * 4u},
         {Section::NodeLevel, n * 4u},
         {Section::EdgeSource, m * 4u},
@@ -436,17 +419,17 @@ LodPageNodes ReadLodPageSource(const std::filesystem::path& graphPath,
         }
     };
 
-    // Latitude goes to y and longitude to x; both become projected fixed point below.
-    nodes.x.resize(n);
-    nodes.y.resize(n);
+    // Kept until the projection below turns them into nodes.x/y.
+    std::vector<double> latitude(n);
+    std::vector<double> longitude(n);
     nodes.level.resize(n);
     {
         ColumnWriter<std::uint64_t> osmIds(output, header.At(Section::NodeOsmId),
                                            HashOf(hashes, Section::NodeOsmId));
-        ColumnWriter<std::int32_t> latitudes(output, header.At(Section::NodeLatitude),
-                                             HashOf(hashes, Section::NodeLatitude));
-        ColumnWriter<std::int32_t> longitudes(output, header.At(Section::NodeLongitude),
-                                              HashOf(hashes, Section::NodeLongitude));
+        ColumnWriter<double> latitudes(output, header.At(Section::NodeLatitude),
+                                       HashOf(hashes, Section::NodeLatitude));
+        ColumnWriter<double> longitudes(output, header.At(Section::NodeLongitude),
+                                        HashOf(hashes, Section::NodeLongitude));
         ColumnWriter<float> elevations(output, header.At(Section::NodeElevation),
                                        HashOf(hashes, Section::NodeElevation));
         ColumnWriter<std::uint32_t> levels(output, header.At(Section::NodeLevel),
@@ -477,10 +460,10 @@ LodPageNodes ReadLodPageSource(const std::filesystem::path& graphPath,
                     osm[local] = ParseNumber<std::uint64_t>(graph, token, "OSM id");
                     break;
                 case 2u:
-                    nodes.y[i] = ParseDegrees(graph, token);
+                    latitude[i] = ParseDegrees(graph, token);
                     break;
                 case 3u:
-                    nodes.x[i] = ParseDegrees(graph, token);
+                    longitude[i] = ParseDegrees(graph, token);
                     break;
                 case 4u:
                     elevation[local] = ParseNumber<float>(graph, token, "elevation");
@@ -500,12 +483,10 @@ LodPageNodes ReadLodPageSource(const std::filesystem::path& graphPath,
                 RunTogether({
                     [&] { osmIds.Append(osm); },
                     [&] {
-                        latitudes.Append(
-                            std::span<const std::int32_t>(nodes.y).subspan(from, count));
+                        latitudes.Append(std::span<const double>(latitude).subspan(from, count));
                     },
                     [&] {
-                        longitudes.Append(
-                            std::span<const std::int32_t>(nodes.x).subspan(from, count));
+                        longitudes.Append(std::span<const double>(longitude).subspan(from, count));
                     },
                     [&] { elevations.Append(elevation); },
                     [&] { levels.Append(level); },
@@ -671,20 +652,20 @@ LodPageNodes ReadLodPageSource(const std::filesystem::path& graphPath,
     }
 
     struct Bounds {
-        std::int32_t minLatitude = std::numeric_limits<std::int32_t>::max();
-        std::int32_t maxLatitude = std::numeric_limits<std::int32_t>::min();
-        std::int32_t minLongitude = std::numeric_limits<std::int32_t>::max();
-        std::int32_t maxLongitude = std::numeric_limits<std::int32_t>::min();
+        double minLatitude = std::numeric_limits<double>::max();
+        double maxLatitude = std::numeric_limits<double>::lowest();
+        double minLongitude = std::numeric_limits<double>::max();
+        double maxLongitude = std::numeric_limits<double>::lowest();
     };
     const auto pieces = SplitRange(0u, nodeCount, 1u << 16u);
     std::vector<Bounds> pieceBounds(pieces.size());
     RunParallel(pieces.size(), [&](std::size_t task, unsigned) {
         auto& bounds = pieceBounds[task];
         for (auto i = pieces[task].first; i < pieces[task].second; ++i) {
-            bounds.minLatitude = std::min(bounds.minLatitude, nodes.y[i]);
-            bounds.maxLatitude = std::max(bounds.maxLatitude, nodes.y[i]);
-            bounds.minLongitude = std::min(bounds.minLongitude, nodes.x[i]);
-            bounds.maxLongitude = std::max(bounds.maxLongitude, nodes.x[i]);
+            bounds.minLatitude = std::min(bounds.minLatitude, latitude[i]);
+            bounds.maxLatitude = std::max(bounds.maxLatitude, latitude[i]);
+            bounds.minLongitude = std::min(bounds.minLongitude, longitude[i]);
+            bounds.maxLongitude = std::max(bounds.maxLongitude, longitude[i]);
         }
     });
     Bounds bounds;
@@ -697,10 +678,10 @@ LodPageNodes ReadLodPageSource(const std::filesystem::path& graphPath,
 
     // Same projection as the full-resident loader: ComputeCHProjection only looks at bounds.
     std::array<data::CHNode, 2> corners{};
-    corners[0].latitude = bounds.minLatitude / kDegreeScale;
-    corners[0].longitude = bounds.minLongitude / kDegreeScale;
-    corners[1].latitude = bounds.maxLatitude / kDegreeScale;
-    corners[1].longitude = bounds.maxLongitude / kDegreeScale;
+    corners[0].latitude = bounds.minLatitude;
+    corners[0].longitude = bounds.minLongitude;
+    corners[1].latitude = bounds.maxLatitude;
+    corners[1].longitude = bounds.maxLongitude;
     const auto projection = data::ComputeCHProjection(corners);
     header.centerLatitude = projection.centerLatitude;
     header.centerLongitude = projection.centerLongitude;
@@ -711,11 +692,12 @@ LodPageNodes ReadLodPageSource(const std::filesystem::path& graphPath,
     header.minLongitude = corners[0].longitude;
     header.maxLongitude = corners[1].longitude;
 
+    nodes.x.resize(n);
+    nodes.y.resize(n);
     RunParallel(pieces.size(), [&](std::size_t task, unsigned) {
         constexpr double kLimit = 1073741823.0;
         for (auto i = pieces[task].first; i < pieces[task].second; ++i) {
-            const auto point =
-                projection.Project(nodes.y[i] / kDegreeScale, nodes.x[i] / kDegreeScale);
+            const auto point = projection.Project(latitude[i], longitude[i]);
             const auto x = std::round(point.x * kFixedCoordinateScale);
             const auto y = std::round(point.y * kFixedCoordinateScale);
             if (std::abs(x) > kLimit || std::abs(y) > kLimit) {

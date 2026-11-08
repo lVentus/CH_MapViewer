@@ -1,0 +1,12 @@
+stage,seconds,percent
+read nodes,9.968,6.0
+read edges,16.492,9.9
+read ranges,6.701,4.0
+resolve shortcuts,6.381,3.8
+geometry errors,11.166,6.7
+cover intervals,6.564,3.9
+plan records,5.575,3.3
+write pages,27.984,16.8
+write hierarchy,5.845,3.5
+verify against DFS,20.755,12.5
+compress and check,49.267,29.6

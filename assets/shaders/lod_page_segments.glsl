@@ -1,6 +1,8 @@
 // Output of the expansion kernels: the segment list the road shader draws, and its count in the
 // indirect draw command (lod_draw_finish.comp turns the count into vertices).
 
+#include "lod_page_chord.glsl"
+
 layout(std430, binding = 3) writeonly buffer Segments { uint segments[]; };
 layout(std430, binding = 5) buffer DrawCommand {
     uint vertexCount;

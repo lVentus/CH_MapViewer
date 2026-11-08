@@ -1,5 +1,7 @@
+#include "benchmark/TimingStats.h"
 #include "cpu/ClassicPipeline.h"
 #include "cpu/CpuRuntime.h"
+#include "cpu/CpuWorkQueue.h"
 #include "cpu/CpuWorkers.h"
 #include "cpu/PagePipeline.h"
 #include "data/AsyncDatasetLoader.h"
@@ -14,6 +16,7 @@
 #include "streaming/lod/LodPageIo.h"
 #include "streaming/lod/LodPagePlanner.h"
 #include "streaming/lod/LodPageReader.h"
+#include "streaming/lod/LodPageReport.h"
 
 #include <algorithm>
 #include <array>
@@ -25,11 +28,13 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iomanip>
 #include <iostream>
 #include <memory>
 #include <optional>
 #include <random>
+#include <sstream>
 #include <stdexcept>
 #include <stop_token>
 #include <string>
@@ -45,23 +50,26 @@ void Require(bool condition, const char* message) {
     }
 }
 
+const std::string kBentRoadNodes = "0 100 48.0000000 9.0000000 0 4\n"
+                                   "1 101 48.0100000 9.0100000 0 0\n"
+                                   "2 102 48.0000000 9.0200000 0 2\n"
+                                   "3 103 48.0100000 9.0300000 0 1\n"
+                                   "4 104 48.0000000 9.0400000 0 3\n";
+
 // Five nodes along a bent road: originals 0-3 at level 0, shortcuts 4 (0-2) and 5 (2-4) at
 // level 1, shortcut 6 (0-4) above them. Extra lines add shortcuts or change ranges.
 struct LodTestGraph {
     std::filesystem::path graphPath;
     std::filesystem::path rangesPath;
 
-    LodTestGraph(const std::vector<std::string>& extraEdges, const std::string& ranges) {
+    LodTestGraph(const std::vector<std::string>& extraEdges, const std::string& ranges,
+                 const std::string& nodes = kBentRoadNodes) {
         const auto base = std::filesystem::temp_directory_path() / "chmv_lod_test";
         graphPath = base.string() + ".sch";
         rangesPath = base.string() + ".sch.ranges";
         std::ofstream graph(graphPath);
         graph << "# bent road\n5\n" << 7u + extraEdges.size() << "\n";
-        graph << "0 100 48.0000000 9.0000000 0 4\n";
-        graph << "1 101 48.0100000 9.0100000 0 0\n";
-        graph << "2 102 48.0000000 9.0200000 0 2\n";
-        graph << "3 103 48.0100000 9.0300000 0 1\n";
-        graph << "4 104 48.0000000 9.0400000 0 3\n";
+        graph << nodes;
         graph << "0 1 10 1 50 -1 -1\n1 2 10 1 50 -1 -1\n2 3 10.0 2 50 -1 -1\n";
         graph << "3 4 10 2 50 -1 -1\n0 2 20 1 50 0 1\n2 4 20 2 50 2 3\n0 4 40 1 50 4 5\n";
         for (const auto& edge : extraEdges) {
@@ -401,10 +409,11 @@ void RequireCpuPassesMatchDfs(const std::shared_ptr<const chmv::streaming::lod::
                 const auto roots = RootsCut(*file, level, threshold);
                 lod::LodPageQuery query{-1e9f, -1e9f, 1e9f, 1e9f, level, threshold};
                 for (const auto filter : {cpu::CpuFilter::FullScan, cpu::CpuFilter::BirthOrdered,
-                                          cpu::CpuFilter::Culling}) {
+                                          cpu::CpuFilter::Culling, cpu::CpuFilter::TwoPass}) {
                     for (const auto expansion :
                          {cpu::CpuExpansion::Roots, cpu::CpuExpansion::Intervals,
-                          cpu::CpuExpansion::Dfs, cpu::CpuExpansion::Bfs}) {
+                          cpu::CpuExpansion::Dfs, cpu::CpuExpansion::Bfs,
+                          cpu::CpuExpansion::Queue}) {
                         const auto& want =
                             expansion == cpu::CpuExpansion::Roots ? roots : expected;
                         const auto fromDisk =
@@ -425,6 +434,140 @@ void RequireCpuPassesMatchDfs(const std::shared_ptr<const chmv::streaming::lod::
                     }
                 }
             }
+        }
+    }
+}
+
+// Reports: a build writes its summary, stage times and a history line per build; the layout
+// report covers every page and section of the file.
+void TestReports() {
+    namespace lod = chmv::streaming::lod;
+    const RandomRoadsGraph source(3u, 30u, 6u);
+    const auto filePath = lod::LodPageFile::DefaultPath(source.graphPath);
+    const auto directory = std::filesystem::temp_directory_path() / "chmv_reports_test";
+    std::filesystem::remove_all(directory);
+    lod::BuildResult result;
+    for (int build = 0; build < 2; ++build) {
+        result = lod::LodPageBuilder::Build(source.graphPath, source.rangesPath, filePath);
+        lod::WriteBuildReport(result, directory);
+    }
+    const auto file = lod::LodPageFile::Open(filePath);
+    Require(lod::LayoutReportOutdated(*file, directory), "a missing layout report is outdated");
+    lod::WriteLayoutReport(*file, directory);
+    Require(!lod::LayoutReportOutdated(*file, directory), "a fresh layout report is current");
+
+    const auto lines = [&](const char* name) {
+        std::ifstream in(directory / name);
+        std::vector<std::string> all;
+        for (std::string line; std::getline(in, line);) {
+            all.push_back(line);
+        }
+        return all;
+    };
+    double stageTotal = 0.0;
+    for (const auto seconds : result.stageSeconds) {
+        stageTotal += seconds;
+    }
+    Require(stageTotal > 0.0 && stageTotal <= result.seconds * 1.01 &&
+                result.peakResidentBytes > 0u && result.threads > 0u,
+            "a build reports its stage times, RAM and threads");
+    Require(lines("preprocess_history.csv").size() == 3u &&
+                lines("preprocess_stages.csv").size() == lod::kBuildStageCount + 1u,
+            "every build adds a history line, stages are listed");
+    const auto summary = lines("layout_summary.txt");
+    const auto records = "Records:            " + std::to_string(file->Header().recordCount);
+    Require(std::any_of(summary.begin(), summary.end(),
+                        [&](const std::string& line) { return line.rfind(records, 0) == 0; }),
+            "the layout summary counts the records");
+    // The layer table adds up to every page and record.
+    std::uint64_t pages = 0;
+    std::uint64_t layerRecords = 0;
+    const auto layers = lines("layout_layers.csv");
+    for (std::size_t row = 1; row < layers.size(); ++row) {
+        std::stringstream fields(layers[row]);
+        std::string field;
+        std::vector<std::string> values;
+        while (std::getline(fields, field, ',')) {
+            values.push_back(field);
+        }
+        pages += std::stoull(values[2]);
+        layerRecords += std::stoull(values[4]);
+    }
+    Require(pages == file->Header().pageCount && layerRecords == file->Header().recordCount &&
+                lines("layout_sections.csv").size() == lod::kStoredCount + 1u &&
+                lines("layout_levels.csv").size() ==
+                    static_cast<std::size_t>(file->Header().maxLevel) + 2u,
+            "the layout tables cover every page, record, section and level");
+    std::filesystem::remove_all(directory);
+}
+
+// Timing statistics: nearest-rank percentiles, median of an even count, population deviation.
+void TestTimingStats() {
+    const auto stats = chmv::benchmark::Summarize({4.0, 1.0, 3.0, 2.0});
+    Require(stats.samples == 4u && stats.mean == 2.5 && stats.median == 2.5 && stats.min == 1.0 &&
+                stats.max == 4.0 && stats.p95 == 4.0 && std::abs(stats.stddev - 1.118034) < 1e-6,
+            "timing statistics of four samples");
+    std::vector<double> hundred;
+    for (int i = 1; i <= 100; ++i) {
+        hundred.push_back(i);
+    }
+    const auto many = chmv::benchmark::Summarize(hundred);
+    Require(many.p95 == 95.0 && many.p99 == 99.0 && many.median == 50.5,
+            "percentiles by nearest rank");
+    Require(chmv::benchmark::Summarize({}).samples == 0u, "no samples, no statistics");
+}
+
+// The CPU work queue: on random trees, every leaf is visited exactly once, with any number of
+// threads and any queue capacity (children that do not fit are walked by their worker).
+void TestWorkQueue() {
+    namespace cpu = chmv::cpu;
+    std::mt19937 random(5u);
+    // Node n has children left[n], right[n], or none.
+    constexpr std::uint32_t kNone = 0xffffffffu;
+    std::vector<std::uint32_t> left;
+    std::vector<std::uint32_t> right;
+    std::vector<std::uint32_t> seeds;
+    const std::function<std::uint32_t(std::uint32_t)> grow = [&](std::uint32_t depth) {
+        const auto node = static_cast<std::uint32_t>(left.size());
+        left.push_back(kNone);
+        right.push_back(kNone);
+        if (depth < 14u && random() % 3u != 0u) {
+            const auto a = grow(depth + 1u);
+            const auto b = grow(depth + 1u);
+            left[node] = a;
+            right[node] = b;
+        }
+        return node;
+    };
+    for (int tree = 0; tree < 200; ++tree) {
+        seeds.push_back(grow(0u));
+    }
+    std::vector<std::uint32_t> expected;
+    for (std::uint32_t node = 0; node < left.size(); ++node) {
+        if (left[node] == kNone) {
+            expected.push_back(node);
+        }
+    }
+    for (const unsigned threads : {1u, 3u, 7u}) {
+        cpu::CpuWorkers workers(threads);
+        for (const std::size_t capacity : {std::size_t{1}, std::size_t{37}, left.size()}) {
+            std::vector<std::vector<std::uint32_t>> found(threads);
+            cpu::RunWorkQueue(
+                workers, seeds, capacity,
+                [&](std::uint32_t node, unsigned worker, std::array<std::uint32_t, 2>& children) {
+                    if (left[node] == kNone) {
+                        found[worker].push_back(node);
+                        return 0;
+                    }
+                    children = {left[node], right[node]};
+                    return 2;
+                });
+            std::vector<std::uint32_t> leaves;
+            for (const auto& part : found) {
+                leaves.insert(leaves.end(), part.begin(), part.end());
+            }
+            std::sort(leaves.begin(), leaves.end());
+            Require(leaves == expected, "the work queue visits every leaf exactly once");
         }
     }
 }
@@ -474,8 +617,9 @@ void TestCpuPartialViews() {
     std::uniform_real_distribution<double> unit(0.0, 1.0);
     constexpr std::array<std::uint32_t, 7> kThresholds{0u,     20000u, 24000u, 26000u,
                                                        28000u, 30000u, lod::kErrorCodeMax};
-    std::vector<int> combinations(12);
-    for (int k = 0; k < 12; ++k) {
+    // Every filter x expansion (4 x 5), without and with segment culling.
+    std::vector<int> combinations(40);
+    for (int k = 0; k < 40; ++k) {
         combinations[static_cast<std::size_t>(k)] = k;
     }
     for (std::uint32_t round = 0; round < 60u; ++round) {
@@ -503,20 +647,32 @@ void TestCpuPartialViews() {
         const auto wantDfs = cpu::EdgesInView(dfs.segments, dfs.edges, view);
         const auto wantRoots = cpu::EdgesInView(roots.segments, roots.edges, view);
         std::shuffle(combinations.begin(), combinations.end(), random);
+        // With culling, every drawn chord touches the cull box, and nothing in view is lost.
+        const auto cullBox = lod::TraversalCullBox(query);
+        const auto culled = [&](const cpu::CpuResult& result) {
+            return std::all_of(result.segments.begin(), result.segments.end(),
+                               [&](const cpu::CpuSegment& s) {
+                                   return cpu::ChordInCullBox(s.ax, s.ay, s.bx, s.by, cullBox);
+                               });
+        };
         for (const int k : combinations) {
-            const auto filter = static_cast<cpu::CpuFilter>(k / 4);
-            const auto expansion = static_cast<cpu::CpuExpansion>(k % 4);
+            const auto filter = static_cast<cpu::CpuFilter>(k % 20 / 5);
+            const auto expansion = static_cast<cpu::CpuExpansion>(k % 5);
+            const bool cull = k >= 20;
             const auto& want = expansion == cpu::CpuExpansion::Roots ? wantRoots : wantDfs;
             auto& workers = (round & 1u) != 0u ? four : one;
             for (auto* store : {&disk, ram.get()}) {
-                const auto result = cpu::RunPagePass(*store, workers, query, filter, expansion);
+                const auto result =
+                    cpu::RunPagePass(*store, workers, query, filter, expansion, std::nullopt, cull);
                 Require(result.unavailable.empty() &&
-                            cpu::EdgesInView(result.segments, result.edges, view) == want,
+                            cpu::EdgesInView(result.segments, result.edges, view) == want &&
+                            (!cull || culled(result)),
                         "a page pass draws the view as the whole-CH walk does");
             }
             if (expansion != cpu::CpuExpansion::Intervals) {
-                const auto result = classic->Run(workers, query, filter, expansion);
-                Require(cpu::EdgesInView(result.segments, result.edges, view) == want,
+                const auto result = classic->Run(workers, query, filter, expansion, cull);
+                Require(cpu::EdgesInView(result.segments, result.edges, view) == want &&
+                            (!cull || culled(result)),
                         "a classic pass draws the view as the whole-CH walk does");
             }
         }
@@ -536,6 +692,19 @@ void TestCpuPartialViews() {
                         (*result.stepCounts)[static_cast<std::size_t>(step)] ==
                             result.segments.size(),
                     "the segments of every tolerance step are counted");
+            // Culled to a part of the map, only what is drawn there is counted.
+            const lod::LodPageQuery part{static_cast<float>(minX),
+                                         static_cast<float>(minY),
+                                         static_cast<float>((minX + maxX) / 2.0),
+                                         static_cast<float>((minY + maxY) / 2.0),
+                                         level,
+                                         threshold};
+            const auto culled = cpu::RunPagePass(disk, four, part, cpu::CpuFilter::FullScan,
+                                                 cpu::CpuExpansion::Intervals, kBase, true);
+            Require(culled.stepCounts.has_value() &&
+                        (*culled.stepCounts)[static_cast<std::size_t>(step)] ==
+                            culled.segments.size(),
+                    "with culling, the segments of every tolerance step are counted");
         }
     }
 
@@ -871,8 +1040,10 @@ void TestCompressedPageFile() {
         const auto benchmark =
             runtime.Benchmark(query, cpu::CpuMethod::Pages, strategy, 5u, 0.0);
         Require(benchmark.unavailable.empty() && benchmark.iterations == 3u &&
-                    benchmark.segments == expected.size() &&
-                    benchmark.filterMinMs <= benchmark.filterMaxMs,
+                    benchmark.segments == expected.size() && benchmark.filter.samples == 3u &&
+                    benchmark.filter.min <= benchmark.filter.median &&
+                    benchmark.filter.median <= benchmark.filter.max &&
+                    benchmark.total.mean >= benchmark.filter.mean,
                 "the CPU benchmark repeats the pass");
     }
     {
@@ -1087,8 +1258,8 @@ void TestLodPageBuilder() {
         Require(file->ReadSection<std::uint32_t>(lod::Section::EdgeWeight) ==
                     std::vector<std::uint32_t>{10, 10, 10, 10, 20, 20, 40},
                 "edge weights must survive exactly");
-        Require(file->ReadSection<std::int32_t>(lod::Section::NodeLatitude)[1] == 480100000,
-                "latitudes are stored as exact 1e-7 degrees");
+        Require(file->ReadSection<double>(lod::Section::NodeLatitude)[1] == 48.01,
+                "latitudes are stored as the source decimal");
 
         const auto coarse = std::uint32_t{lod::kErrorCodeMax};
         Require(LodPageCut(*file, 2, coarse) == std::vector<std::uint32_t>{6},
@@ -1146,6 +1317,60 @@ void TestLodPageBuilder() {
         RequireLodCutsMatchDfs(*file, "pages of walk-only records change the cut");
         RequireTraversalsMatchDfs(*file, "traversal through walk-only pages differs from DFS");
         RequireCpuPassesMatchDfs(file, "CPU passes differ from DFS");
+    }
+}
+
+void TestSourceCoordinates() {
+    namespace lod = chmv::streaming::lod;
+    struct Content {
+        std::vector<double> latitude;
+        std::vector<double> longitude;
+        std::vector<std::uint32_t> pages;
+    };
+    const auto build = [](const std::string& nodes) {
+        const LodTestGraph source({}, "0 0 0\n1 0 0\n2 0 0\n3 0 0\n4 1 1\n5 1 1\n6 2 2\n", nodes);
+        const auto filePath = lod::LodPageFile::DefaultPath(source.graphPath);
+        (void)lod::LodPageBuilder::Build(source.graphPath, source.rangesPath, filePath);
+        const auto file = lod::LodPageFile::Open(filePath);
+        RequireLodCutsMatchDfs(*file, "page cut differs from DFS");
+        return Content{file->ReadSection<double>(lod::Section::NodeLatitude),
+                       file->ReadSection<double>(lod::Section::NodeLongitude),
+                       file->ReadPageWords({})};
+    };
+    {
+        const auto plain = build(kBentRoadNodes);
+        const auto other = build("0 100 48 9 0 4\n"
+                                 "1 101 4.801e1 9.01000000000000 0 0\n"
+                                 "2 102 48.000 0.902E1 0 2\n"
+                                 "3 103 48.01 9.03 0 1\n"
+                                 "4 104 480e-1 9.0400 0 3\n");
+        Require(plain.latitude == other.latitude && plain.longitude == other.longitude &&
+                    plain.pages == other.pages,
+                "the notation of a coordinate must not change the file");
+    }
+    {
+        // EUR is written from floats: eight or more decimals, exponents near the prime meridian.
+        const auto floats = build("0 100 50.98522568 -4.89999984e-05 0 4\n"
+                                  "1 101 50.99522568 0.01234559994 0 0\n"
+                                  "2 102 50.98522568 0.02000000017 0 2\n"
+                                  "3 103 50.99522568 0.03123456705 0 1\n"
+                                  "4 104 50.98522568 0.0399999991 0 3\n");
+        Require(floats.latitude[0] == 50.98522568 && floats.longitude[0] == -4.89999984e-05 &&
+                    floats.longitude[1] == 0.01234559994,
+                "float-written coordinates are stored as the source decimal");
+    }
+    {
+        bool rejected = false;
+        try {
+            (void)build("0 100 48.0000000000000001 9 0 4\n"
+                        "1 101 48.01 9.01 0 0\n"
+                        "2 102 48 9.02 0 2\n"
+                        "3 103 48.01 9.03 0 1\n"
+                        "4 104 48 9.04 0 3\n");
+        } catch (const std::runtime_error& error) {
+            rejected = std::string(error.what()).find("significant digits") != std::string::npos;
+        }
+        Require(rejected, "a coordinate a double cannot give back must be rejected");
     }
 }
 
@@ -1346,8 +1571,12 @@ int main() {
         TestToleranceController();
         TestCompression();
         TestLodPageBuilder();
+        TestSourceCoordinates();
         TestShortcutStyles();
         TestCompressedPageFile();
+        TestWorkQueue();
+        TestReports();
+        TestTimingStats();
         TestCpuPartialViews();
         TestAsyncDatasetLoader();
         std::cout << "All tests passed.\n";

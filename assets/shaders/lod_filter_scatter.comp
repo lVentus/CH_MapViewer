@@ -1,0 +1,56 @@
+#version 430 core
+
+// Two-pass filter, step 3: one workgroup per listed page; every matching record finds its rank
+// in the page's mask and writes itself to the page's offset plus that rank. No atomics, and the
+// candidates come out in page order, whatever the GPU's scheduling.
+
+layout(local_size_x = 256) in;
+
+#include "lod_page_common.glsl"
+
+layout(std430, binding = 2) readonly buffer SlotList {
+    uint slotCount;
+    uint slotGroups[3];
+    uint slots[];
+};
+layout(std430, binding = 3) buffer Candidates {
+    uint candidateCount;
+    uint candidateGroups[3];
+    uint candidates[];
+};
+layout(std430, binding = 5) readonly buffer Masks { uint masks[]; };
+layout(std430, binding = 6) readonly buffer Prefix {
+    uint prefixTotal;
+    uint prefixGroups[3];
+    uint prefix[];
+};
+
+uniform uint uCandidateCapacity;
+
+void main() {
+    uint index = linearGroup();
+    uint local = gl_LocalInvocationID.x;
+    if (index == 0u && local == 0u) {
+        candidateCount = min(prefixTotal, uCandidateCapacity);
+        if (prefixTotal > uCandidateCapacity) {
+            atomicAdd(status[kStatusCandidateOverflow], prefixTotal - uCandidateCapacity);
+        }
+    }
+    if (index >= slotCount) {
+        return;
+    }
+    uint word = local >> 5u;
+    uint bit = local & 31u;
+    uint mine = masks[index * 8u + word];
+    if (((mine >> bit) & 1u) == 0u) {
+        return;
+    }
+    uint rank = uint(bitCount(mine & ((1u << bit) - 1u)));
+    for (uint before = 0u; before < word; ++before) {
+        rank += uint(bitCount(masks[index * 8u + before]));
+    }
+    uint at = prefix[index] + rank;
+    if (at < uCandidateCapacity) {
+        candidates[at] = (slots[index] << 8u) | local;
+    }
+}

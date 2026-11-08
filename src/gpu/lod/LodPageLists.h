@@ -21,7 +21,7 @@ enum class LodPageStatus : std::uint32_t {
     MissingPage,       // children skipped because their page is not resident (outside the
                        // view when it is complete, since the planner loads every page of it)
     StackOverflow,     // a depth-first walk ran out of stack
-    FrontierOverflow,  // a breadth-first frontier ran out of space
+    FrontierOverflow,  // a breadth-first frontier or the work queue ran out of space
     Count,
 };
 

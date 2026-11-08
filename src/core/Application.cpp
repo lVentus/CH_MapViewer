@@ -1,14 +1,21 @@
 #include "core/Application.h"
 
+#include "benchmark/BenchmarkLog.h"
 #include "gpu/filtering/BirthOrderedRangeFilterStrategy.h"
 #include "gpu/filtering/FullScanRangeFilterStrategy.h"
 #include "gpu/filtering/PageCullingRangeFilterStrategy.h"
+#include "gpu/filtering/TwoPassRangeFilterStrategy.h"
 #include "gpu/unfolding/AdaptiveDFSUnfoldingStrategy.h"
 #include "gpu/unfolding/BFSUnfoldingStrategy.h"
 #include "gpu/unfolding/DualIntervalUnfoldingStrategy.h"
 #include "gpu/unfolding/IUnfoldingStrategy.h"
 #include "gpu/unfolding/NoUnfoldingStrategy.h"
+#include "gpu/unfolding/PersistentQueueUnfoldingStrategy.h"
+#include "gpu/unfolding/WorkgroupQueueUnfoldingStrategy.h"
 #include "streaming/lod/LodPagePlanner.h"
+#include "streaming/lod/LodPageReport.h"
+
+#include <glad/gl.h>
 
 #include <algorithm>
 #include <array>
@@ -32,9 +39,11 @@ constexpr std::uint64_t kMiB = 1024ull * 1024ull;
 
 Application::Application(const std::filesystem::path& assetDirectory)
     : window_("CH_MapViewer"), context_(window_), segmentRenderer_(assetDirectory / "shaders"),
-      debugUI_(window_),
-      datasetCatalog_(assetDirectory / "data"), shaderDirectory_(assetDirectory / "shaders"),
-      roadStylePath_(assetDirectory / "road_styles.cfg") {
+      debugUI_(window_), datasetCatalog_(assetDirectory / "data"),
+      datasetLoader_(assetDirectory.parent_path() / "results"),
+      shaderDirectory_(assetDirectory / "shaders"),
+      roadStylePath_(assetDirectory / "road_styles.cfg"),
+      resultsRoot_(assetDirectory.parent_path() / "results") {
     ReloadRoadStyles();
     // Filters find the records of the current level, expansions decide which of them (or of
     // their descendants) are drawn. Both lists are open for more strategies; each one names
@@ -48,6 +57,9 @@ Application::Application(const std::filesystem::path& assetDirectory)
     rangeFilterStrategyManager_.Register(
         std::make_unique<gpu::filtering::PageCullingRangeFilterStrategy>(shaderDirectory_));
     cpuFilters_.push_back(cpu::CpuFilter::Culling);
+    rangeFilterStrategyManager_.Register(
+        std::make_unique<gpu::filtering::TwoPassRangeFilterStrategy>(shaderDirectory_));
+    cpuFilters_.push_back(cpu::CpuFilter::TwoPass);
 
     strategyManager_.Register(
         std::make_unique<gpu::unfolding::NoUnfoldingStrategy>(shaderDirectory_));
@@ -61,6 +73,14 @@ Application::Application(const std::filesystem::path& assetDirectory)
     strategyManager_.Register(std::make_unique<gpu::unfolding::BFSUnfoldingStrategy>(
         shaderDirectory_, geometry::RefinementMode::Adaptive));
     cpuExpansions_.push_back(cpu::CpuExpansion::Bfs);
+    strategyManager_.Register(
+        std::make_unique<gpu::unfolding::PersistentQueueUnfoldingStrategy>(shaderDirectory_));
+    cpuExpansions_.push_back(cpu::CpuExpansion::Queue);
+    // On the CPU a thread is the workgroup: the depth-first walk takes chunks of roots and
+    // keeps what it still has to visit on its own stack.
+    strategyManager_.Register(
+        std::make_unique<gpu::unfolding::WorkgroupQueueUnfoldingStrategy>(shaderDirectory_));
+    cpuExpansions_.push_back(cpu::CpuExpansion::Dfs);
     strategyManager_.Register(
         std::make_unique<gpu::unfolding::DualIntervalUnfoldingStrategy>(shaderDirectory_));
     cpuExpansions_.push_back(cpu::CpuExpansion::Intervals);
@@ -109,6 +129,7 @@ void Application::LoadDataset(const data::DatasetEntry& dataset) {
     // The current dataset goes first: its page reader keeps the file open (an outdated file is
     // rebuilt in place), and its RAM image and GPU pool must not count against the new one.
     lodPageSweep_.Cancel();
+    StopSuite();
     lodPages_.reset();
     cpuRuntime_.reset();
     validation_.reset();
@@ -126,6 +147,7 @@ void Application::LoadDataset(const data::DatasetEntry& dataset) {
 
 void Application::InstallDataset(streaming::lod::LodPageDataset dataset) {
     lodPageSweep_.Cancel();
+    StopSuite();
     lodPages_.reset();
     cpuRuntime_.reset();
     validation_.reset();
@@ -162,6 +184,7 @@ cpu::CpuStrategy Application::CurrentCpuStrategy() const {
     strategy.filter = cpuFilters_[rangeFilterStrategyManager_.CurrentIndex()];
     strategy.expansion = cpuExpansions_[strategyManager_.CurrentIndex()];
     strategy.mode = strategyManager_.Current().Mode();
+    strategy.cullSegments = cullSegments_;
     return strategy;
 }
 
@@ -175,6 +198,11 @@ bool Application::UpdateCpu(int width, int height, float tolerance, bool countSt
     auto query = view.query;
     query.threshold =
         gpu::unfolding::ThresholdFor(strategyManager_.Current().Mode(), view.toleranceCode);
+    // Side by side, the CPU draws what the GPU draws (coarser when its pool is too small).
+    if (processingMode_ == cpu::ProcessingMode::Compare) {
+        query.level = lodPages_->Stats().level;
+        query.threshold = lodPages_->Stats().threshold;
+    }
     cpuView_ = view.rectangle;
     cpuPixelCode_ = view.pixelCode;
     const bool computed =
@@ -237,7 +265,7 @@ void Application::CompareGpuAndCpu() {
     const char* full = overflow(gpu::lod::LodPageStatus::CandidateOverflow) ? "candidate list"
                        : overflow(gpu::lod::LodPageStatus::SegmentOverflow) ? "segment list"
                        : overflow(gpu::lod::LodPageStatus::FrontierOverflow)
-                           ? "breadth-first frontier"
+                           ? "breadth-first frontier or work queue"
                        : overflow(gpu::lod::LodPageStatus::StackOverflow) ? "depth-first stack"
                                                                            : nullptr;
     if (full != nullptr) {
@@ -285,6 +313,13 @@ int Application::Run() {
         debugUI_.BeginFrame();
         if (lodPageSweep_.Running()) {
             lodPageSweep_.Advance(camera_, deltaSeconds);
+        } else if (suite_.Running()) {
+            // The camera stays put while the suite runs; its steps choose the strategies.
+            camera_.Update(deltaSeconds);
+            const auto& step = suite_.Current();
+            rangeFilterStrategyManager_.Select(step.filter);
+            strategyManager_.Select(step.expansion);
+            cullSegments_ = step.cullSegments;
         } else {
             UpdateCameraInput(deltaSeconds);
         }
@@ -311,6 +346,7 @@ int Application::Run() {
         if (lodPages_) {
             if (gpuOn) {
                 lodPages_->SetPreloadAll(preloadAll_);
+                lodPages_->SetCullSegments(cullSegments_);
                 lodPages_->Update(camera_, lodController_, viewWidth, height, tolerance, filter,
                                   unfold, countSteps);
                 passRan = lodPages_->Stats().filtered;
@@ -319,6 +355,16 @@ int Application::Run() {
             const bool cpuComputed =
                 cpuOn && UpdateCpu(viewWidth, height, tolerance, countSteps && !gpuOn);
             passRan = passRan || cpuComputed;
+            // Benchmarks run before this frame's picture is drawn, which paints over their draws.
+            if (benchmarkRequested_) {
+                benchmarkRequested_ = false;
+                (void)RunBenchmarks(streaming::lod::ReportTimestamp(true), viewWidth, height,
+                                    tolerance, gpuOn, cpuOn);
+            }
+            if (suite_.Running()) {
+                StepSuite(static_cast<double>(deltaSeconds), viewWidth, height, tolerance, gpuOn,
+                          cpuOn);
+            }
             if (!sideBySide) {
                 if (gpuOn) {
                     lodPages_->Draw(camera_, width, height, roadStyleConfig_);
@@ -359,12 +405,15 @@ int Application::Run() {
             .tolerancePixels = tolerance,
             .toleranceCoarsened = tolerance_.Coarsened(),
             .preloadAll = preloadAll_,
+            .cullSegments = cullSegments_,
             .roadStyleStatus = roadStyleStatus_,
             .roadStyleError = roadStyleError_,
             .stats = lodPages_ ? &lodPages_->Stats() : nullptr,
             .validation = validation_ ? &*validation_ : nullptr,
             .benchmark = benchmark_ ? &*benchmark_ : nullptr,
             .sweep = &lodPageSweep_,
+            .suite = &suite_,
+            .resultsDirectory = lodPages_ ? ResultsDirectory().string() : std::string(),
             .mode = processingMode_,
             .cpuMethod = cpuMethod_,
             .cpuThreads = cpuThreads_,
@@ -400,44 +449,24 @@ int Application::Run() {
                           << check.candidateMismatches << " differ)\n";
             }
         }
-        if (actions.runBenchmark && lodPages_ && gpuOn) {
-            benchmark_ = lodPages_->Benchmark(filter, unfold, kBenchmarkPasses);
-            const auto& result = *benchmark_;
-            std::cout << "[Benchmark] " << filter.Name() << " + " << unfold.Name() << ", "
-                      << result.iterations << " passes over " << result.pages << " pages: filter "
-                      << result.filterAverageMs << " ms (" << result.filterMinMs << " - "
-                      << result.filterMaxMs << "), expansion " << result.unfoldAverageMs << " ms ("
-                      << result.unfoldMinMs << " - " << result.unfoldMaxMs << "); "
-                      << result.candidates << " candidates, " << result.segments << " segments\n";
+        if (actions.runBenchmark && lodPages_) {
+            benchmarkRequested_ = true;
         }
-        if (actions.runBenchmark && cpuRuntime_ && cpuOn) {
-            cpuBenchmark_ = cpuRuntime_->Benchmark(cpuRuntime_->ResultQuery(), cpuMethod_,
-                                                   CurrentCpuStrategy(), kBenchmarkPasses,
-                                                   kCpuBenchmarkSeconds);
-            const auto& result = *cpuBenchmark_;
-            std::cout << "[Benchmark] CPU "
-                      << (cpuMethod_ == cpu::CpuMethod::Pages ? "pages" : "classic") << ", "
-                      << filter.Name() << " + " << unfold.Name() << ", " << result.threads
-                      << " threads: ";
-            if (!result.unavailable.empty()) {
-                std::cout << result.unavailable << '\n';
-            } else {
-                std::cout << result.iterations << " passes: filter " << result.filterAverageMs
-                          << " ms (" << result.filterMinMs << " - " << result.filterMaxMs
-                          << "), expansion " << result.expandAverageMs << " ms ("
-                          << result.expandMinMs << " - " << result.expandMaxMs
-                          << "), preparing " << result.prepareAverageMs << " ms; "
-                          << result.candidates << " candidates, " << result.segments
-                          << " segments\n";
-            }
+        if (actions.startSuite && lodPages_ && gpuOn) {
+            StartSuite();
+        }
+        if (actions.cancelSuite) {
+            StopSuite();
         }
         if (actions.datasetRequest) {
             LoadDataset(datasetCatalog_.Entries()[*actions.datasetRequest]);
         }
         if (actions.startZoomSweep && lodPages_) {
-            auto csvPath = lodPages_->File().Path();
-            csvPath.replace_extension(".lod_zoom_sweep.csv");
-            lodPageSweep_.Start(csvPath, camera_);
+            const auto directory = ResultsDirectory();
+            std::filesystem::create_directories(directory);
+            lodPageSweep_.Start(
+                directory / ("zoom_sweep_" + streaming::lod::ReportTimestamp(true) + ".csv"),
+                camera_);
         }
         if (actions.cancelZoomSweep) {
             lodPageSweep_.Cancel();
@@ -456,6 +485,166 @@ int Application::Run() {
         }
     }
     return 0;
+}
+
+std::filesystem::path Application::ResultsDirectory() const {
+    return streaming::lod::ReportDirectory(resultsRoot_, lodPages_->File().Path());
+}
+
+benchmark::BenchmarkSuite::Outcome Application::RunBenchmarks(const std::string& run, int width,
+                                                              int height, float tolerance,
+                                                              bool gpuOn, bool cpuOn) {
+    const auto& filter = rangeFilterStrategyManager_.Current();
+    const auto& unfold = strategyManager_.Current();
+    benchmark::BenchmarkSuite::Outcome outcome;
+    outcome.filter = filter.Name();
+    outcome.expansion = unfold.Name();
+    outcome.cullSegments = cullSegments_;
+
+    benchmark::BenchmarkContext context;
+    context.run = run;
+    const auto* renderer = reinterpret_cast<const char*>(glGetString(GL_RENDERER));
+    context.renderer = renderer != nullptr ? renderer : "";
+    context.filter = outcome.filter;
+    context.expansion = outcome.expansion;
+    context.cullSegments = cullSegments_;
+    context.tolerancePixels = tolerance;
+    context.width = width;
+    context.height = height;
+    context.viewHeightMeters = camera_.ViewHalfHeightMeters() * 2.0;
+    const auto directory = ResultsDirectory();
+    const auto log = [&](const std::vector<benchmark::NamedTiming>& timings) {
+        try {
+            benchmark::AppendBenchmark(directory, context, timings);
+        } catch (const std::exception& error) {
+            std::cout << "[Benchmark] " << error.what() << '\n';
+        }
+    };
+
+    if (gpuOn) {
+        benchmark_ =
+            lodPages_->Benchmark(rangeFilterStrategyManager_.Current(), strategyManager_.Current(),
+                                 kBenchmarkPasses, camera_, width, height, roadStyleConfig_);
+        const auto& result = *benchmark_;
+        const auto& stats = lodPages_->Stats();
+        context.processor = "GPU";
+        context.cameraLevel = stats.cameraLevel;
+        context.level = lodPages_->DrawQuery().level;
+        context.threshold = lodPages_->DrawQuery().threshold;
+        context.pages = result.pages;
+        context.candidates = result.candidates;
+        context.segments = result.segments;
+        log({{"filter_gpu", result.filterGpu},
+             {"expansion_gpu", result.unfoldGpu},
+             {"pass_gpu", result.passGpu},
+             {"pass_wall", result.passWall},
+             {"draw_gpu", result.drawGpu},
+             {"draw_wall", result.drawWall}});
+        outcome.passWallMs = result.passWall.mean;
+        outcome.passGpuMs = result.passGpu.mean;
+        outcome.drawWallMs = result.drawWall.mean;
+        outcome.segments = result.segments;
+        std::cout << "[Benchmark] " << outcome.filter << " + " << outcome.expansion
+                  << (cullSegments_ ? " (culled)" : "") << ", " << result.iterations
+                  << " passes over " << result.pages << " pages: pass " << result.passWall.mean
+                  << " ms wall (p95 " << result.passWall.p95 << "), GPU filter "
+                  << result.filterGpu.mean << " ms + expansion " << result.unfoldGpu.mean
+                  << " ms; draw " << result.drawWall.mean << " ms wall; " << result.candidates
+                  << " candidates, " << result.segments << " segments\n";
+    }
+    if (cpuOn) {
+        cpuBenchmark_ =
+            cpuRuntime_->Benchmark(cpuRuntime_->ResultQuery(), cpuMethod_, CurrentCpuStrategy(),
+                                   kBenchmarkPasses, kCpuBenchmarkSeconds);
+        const auto& result = *cpuBenchmark_;
+        const auto method = cpuMethod_ == cpu::CpuMethod::Pages ? "pages" : "classic";
+        std::cout << "[Benchmark] CPU " << method << ", " << outcome.filter << " + "
+                  << outcome.expansion << ", " << result.threads << " threads: ";
+        if (!result.unavailable.empty()) {
+            std::cout << result.unavailable << '\n';
+            outcome.note = "CPU: " + result.unavailable;
+        } else {
+            context.processor = std::string("CPU ") + method;
+            context.cpuThreads = result.threads;
+            context.cameraLevel = context.level = cpuRuntime_->ResultQuery().level;
+            context.threshold = cpuRuntime_->ResultQuery().threshold;
+            context.pages = cpuRuntime_->Result().pages;
+            context.candidates = result.candidates;
+            context.segments = result.segments;
+            log({{"cpu_prepare", result.prepare},
+                 {"cpu_filter", result.filter},
+                 {"cpu_expansion", result.expand},
+                 {"cpu_output", result.output},
+                 {"cpu_total", result.total}});
+            outcome.cpuTotalMs = result.total.mean;
+            std::cout << result.iterations << " passes: total " << result.total.mean << " ms (p95 "
+                      << result.total.p95 << "), filter " << result.filter.mean << " ms, expansion "
+                      << result.expand.mean << " ms, preparing " << result.prepare.mean << " ms; "
+                      << result.candidates << " candidates, " << result.segments << " segments\n";
+        }
+    }
+    std::cout << "[Benchmark] written to " << (directory / "benchmark.csv") << '\n';
+    return outcome;
+}
+
+void Application::StartSuite() {
+    // Expansions that walk the hierarchy last, so the GPU pool is rebuilt only once.
+    std::vector<benchmark::BenchmarkSuite::Step> steps;
+    for (const bool traversals : {false, true}) {
+        const auto unfolds = strategyManager_.Strategies();
+        for (std::size_t expansion = 0; expansion < unfolds.size(); ++expansion) {
+            if (unfolds[expansion]->Traverses() != traversals) {
+                continue;
+            }
+            for (std::size_t filter = 0; filter < rangeFilterStrategyManager_.Strategies().size();
+                 ++filter) {
+                for (const bool cull : {false, true}) {
+                    steps.push_back({filter, expansion, cull});
+                }
+            }
+        }
+    }
+    suiteRestore_ = {rangeFilterStrategyManager_.CurrentIndex(), strategyManager_.CurrentIndex(),
+                     cullSegments_};
+    const auto run = "suite-" + streaming::lod::ReportTimestamp(true);
+    suite_.Start(std::move(steps), run, ResultsDirectory() / ("benchmark_" + run + ".txt"));
+    std::cout << "[Benchmark] suite " << run << ": " << suite_.Count() << " steps\n";
+}
+
+void Application::StepSuite(double seconds, int width, int height, float tolerance, bool gpuOn,
+                            bool cpuOn) {
+    const auto& stats = lodPages_->Stats();
+    switch (suite_.Advance(stats.complete && !stats.filtered, seconds)) {
+    case benchmark::BenchmarkSuite::Wait::Waiting:
+        return;
+    case benchmark::BenchmarkSuite::Wait::Ready:
+        suite_.Finish(RunBenchmarks(suite_.Run(), width, height, tolerance, gpuOn, cpuOn));
+        break;
+    case benchmark::BenchmarkSuite::Wait::TimedOut: {
+        benchmark::BenchmarkSuite::Outcome skipped;
+        skipped.filter = rangeFilterStrategyManager_.Current().Name();
+        skipped.expansion = strategyManager_.Current().Name();
+        skipped.cullSegments = cullSegments_;
+        skipped.note = "skipped, the view did not complete within 30 s";
+        suite_.Finish(std::move(skipped));
+        break;
+    }
+    }
+    if (!suite_.Running()) {
+        std::cout << suite_.Summary();
+        StopSuite();
+    }
+}
+
+void Application::StopSuite() {
+    if (!suiteRestore_) {
+        return;
+    }
+    suite_.Cancel();
+    rangeFilterStrategyManager_.Select(suiteRestore_->filter);
+    strategyManager_.Select(suiteRestore_->expansion);
+    cullSegments_ = suiteRestore_->cullSegments;
+    suiteRestore_.reset();
 }
 
 void Application::UpdateCameraInput(float deltaSeconds) {

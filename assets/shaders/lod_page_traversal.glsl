@@ -1,6 +1,8 @@
 // Walking the hierarchy (needs the PageChildren extension in the pool): a node is a
 // representative record, its children are found through the children block of its page, and
-// pages are found through the slot of every page.
+// pages are found through the slot of every page. Comes after lod_page_segments.glsl, whose
+// cull box (lod_page_chord.glsl) lies inside the rectangle the planner used, so every page a
+// visible node lives in is resident.
 
 layout(std430, binding = 6) readonly buffer SlotOfPage { uint slotOfPage[]; };
 // ErrorBoundMantissa() of LodPageFormat.h, four per entry.
@@ -8,9 +10,6 @@ layout(std140, binding = 0) uniform ErrorBounds { uvec4 boundMantissas[256]; };
 
 uniform uint uPageWords;
 uniform uint uThreshold;
-// Fixed coordinates, inside the rectangle the planner used, so every page a visible node lives
-// in is resident.
-uniform ivec4 uCullBox;
 
 const uint kMaxErrorBound = (1u << 30u) - 1u;
 
@@ -33,22 +32,12 @@ uint errorBound(uint code) {
     return min((mantissa >> shift) + rest, kMaxErrorBound);
 }
 
-ivec2 vertexPosition(uint base, uint vertexBase, uint index) {
-    uint word = base + vertexBase + index * 2u;
-    return ivec2(int(pageWords[word]), int(pageWords[word + 1u]));
-}
-
 // The node's whole geometry lies within its error of its chord.
 bool nodeVisible(uint item, uvec4 record) {
-    uint base = slotBase(item >> 8u);
-    uint vertexBase = 4u + (pageWords[base] & 0xffffu) * 4u;
-    ivec2 a = vertexPosition(base, vertexBase, record.x & 0xffffu);
-    ivec2 b = vertexPosition(base, vertexBase, record.x >> 16u);
-    int bound = int(errorBound(record.w & 0xffffu));
-    ivec2 low = min(a, b);
-    ivec2 high = max(a, b);
-    return high.x >= uCullBox.x - bound && low.x <= uCullBox.z + bound &&
-           high.y >= uCullBox.y - bound && low.y <= uCullBox.w + bound;
+    ivec2 a;
+    ivec2 b;
+    chordEnds(item, record, a, b);
+    return chordTouches(a, b, int(errorBound(record.w & 0xffffu)));
 }
 
 // Expanded unless the node is already accurate enough or is an original edge.

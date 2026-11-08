@@ -3,7 +3,7 @@
 // Expansion without traversal: every candidate decides on its own from its two level intervals
 // and its error interval. With uChildIntervals = 0 only roots are drawn (no expansion);
 // otherwise this is the dual-interval rule of LodPageFormat.h, which gives exactly the cut a
-// traversal would find.
+// traversal would find. The chord is only read for segments that are drawn, to cull them.
 
 layout(local_size_x = 256) in;
 
@@ -31,7 +31,8 @@ void main() {
         uint parentCode = record.w >> 16u;
         bool asChild = uChildIntervals != 0u && inLevelRange(record.z, uLevel) &&
                        uThreshold < parentCode;
-        draw = errorCode <= uThreshold && (inLevelRange(record.y, uLevel) || asChild);
+        draw = errorCode <= uThreshold && (inLevelRange(record.y, uLevel) || asChild) &&
+               keepDrawn(item, record);
     }
     drawSegments(draw, item);
 }

@@ -24,9 +24,12 @@ struct UnfoldingInput {
     std::uint32_t level = 0;
     // Error code from ThresholdFor(Mode(), tolerance).
     std::uint32_t threshold = 0;
-    // For traversals: view in fixed coordinates (minX, minY, maxX, maxY), the hierarchy height
-    // and the uniform buffer of ErrorBoundMantissa() values.
+    // View in fixed coordinates (minX, minY, maxX, maxY): traversals skip subtrees outside it,
+    // and with cullSegments no strategy draws a segment whose chord misses it.
     std::array<std::int32_t, 4> cullBox{};
+    bool cullSegments = false;
+    // For traversals: the hierarchy height and the uniform buffer of ErrorBoundMantissa()
+    // values.
     std::uint32_t hierarchyHeight = 0;
     std::uint32_t errorBounds = 0;
     std::uint32_t segmentBuffer = 0;

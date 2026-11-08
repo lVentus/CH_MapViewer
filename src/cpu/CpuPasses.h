@@ -17,28 +17,34 @@
 namespace chmv::cpu {
 
 // Counterparts of the GPU filters: test every record (FullScan), only the prefix of records
-// ordered by their highest level (BirthOrdered), or pick pages / grid cells by their box and
-// levels before testing records (Culling).
+// ordered by their highest level (BirthOrdered), pick pages / grid cells by their box and
+// levels before testing records (Culling), or count per page first and then write every
+// candidate to its place (TwoPass).
 enum class CpuFilter {
     FullScan,
     BirthOrdered,
     Culling,
+    TwoPass,
 };
 
 // Counterparts of the GPU expansions: roots as they are, the dual-interval rule (Intervals,
-// needs page records), or walking the hierarchy depth first or a depth at a time.
+// needs page records), or walking the hierarchy depth first, a depth at a time, or from one
+// work queue shared by all threads (Queue).
 enum class CpuExpansion {
     Roots,
     Intervals,
     Dfs,
     Bfs,
+    Queue,
 };
 
 // The CPU counterpart of a GPU filter + expansion choice; empty where there is none yet.
+// cullSegments drops drawn segments whose chord misses the view, as on the GPU.
 struct CpuStrategy {
     std::optional<CpuFilter> filter;
     std::optional<CpuExpansion> expansion;
     geometry::RefinementMode mode = geometry::RefinementMode::None;
+    bool cullSegments = false;
 };
 
 // Who computes what is drawn: the GPU pipeline, a CPU method (the GPU only rasterizes), or both
@@ -103,6 +109,11 @@ struct CpuResult {
 // Chord of a segment against the view rectangle, as the GPU result is checked.
 [[nodiscard]] bool ChordTouches(std::int32_t ax, std::int32_t ay, std::int32_t bx, std::int32_t by,
                                 const std::array<double, 4>& rectangle);
+
+// Chord of a segment against a cull box in fixed coordinates, as segment culling tests it
+// (lod_page_chord.glsl).
+[[nodiscard]] bool ChordInCullBox(std::int32_t ax, std::int32_t ay, std::int32_t bx,
+                                  std::int32_t by, const std::array<std::int32_t, 4>& cull);
 
 // Sorted multisets of edges: how many of `expected` are missing from `actual`, and how many of
 // `actual` are not in `expected`.

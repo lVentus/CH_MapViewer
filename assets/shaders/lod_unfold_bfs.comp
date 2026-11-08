@@ -40,7 +40,9 @@ void main() {
         return;
     }
     if (!expands(node, record)) {
-        drawSegment(node);
+        if (keepDrawn(node, record)) {
+            drawSegment(node);
+        }
         return;
     }
     for (uint which = 0u; which < 2u; ++which) {

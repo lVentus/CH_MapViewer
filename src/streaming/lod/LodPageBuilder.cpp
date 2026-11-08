@@ -20,6 +20,7 @@
 #include <cstring>
 #include <iomanip>
 #include <limits>
+#include <mutex>
 #include <span>
 #include <sstream>
 #include <stdexcept>
@@ -1747,16 +1748,20 @@ std::uint64_t LodPageBuilder::EstimateMemoryBytes(std::uint64_t nodeCount,
                                                   std::uint64_t edgeCount) {
     // The fullest stage holds node positions and levels (10 B per node), the level contexts,
     // each edge's record cell and road style (8 B per edge) and a sort buffer that packs the
-    // pages in about kTargetPagePasses passes (about one record per edge).
-    return nodeCount * 10u + edgeCount * (8u + sizeof(Record) / kTargetPagePasses) +
+    // pages in about kTargetPagePasses passes (about one record per edge). Projecting the nodes
+    // briefly needs 26 B per node (latitude/longitude as read, positions, levels), which only
+    // decides for graphs with very few edges per node.
+    return std::max<std::uint64_t>(
+               nodeCount * 26u,
+               nodeCount * 10u + edgeCount * (8u + sizeof(Record) / kTargetPagePasses)) +
            WorkerCount() * kWorkerBytes + (512ull << 20u);
 }
 
 std::uint64_t LodPageBuilder::EstimateDiskBytes(std::uint64_t nodeCount, std::uint64_t edgeCount) {
-    // The uncompressed file (24 B per node, about 66 B per edge) next to its compressed copy
+    // The uncompressed file (32 B per node, about 66 B per edge) next to its compressed copy
     // (about 40 % of it), with some slack; the scratch files of the earlier stages (shortcut
     // levels, hierarchy) need less than the copy.
-    return nodeCount * 32u + edgeCount * 100u;
+    return nodeCount * 42u + edgeCount * 100u;
 }
 
 namespace {
@@ -1983,6 +1988,95 @@ void WriteCompressed(const std::filesystem::path& raw, const std::filesystem::pa
 
 } // namespace
 
+namespace {
+
+// Times the stages from their progress reports and samples the RAM the process holds, at every
+// new stage and at most every kSampleInterval in between. A stage lasts until the next one
+// reports; the time before the first report counts to reading the nodes.
+class StageMeter {
+public:
+    StageMeter() : since_(Clock::now()) {
+        Sample(since_);
+    }
+
+    void Note(const BuildProgress& step) {
+        const std::lock_guard lock(mutex_);
+        const auto now = Clock::now();
+        const auto stage = static_cast<std::size_t>(step.stage);
+        if (!started_ || stage != stage_) {
+            Close(now);
+            stage_ = stage;
+            since_ = now;
+            started_ = true;
+            Sample(now);
+        } else if (now - sampled_ >= kSampleInterval) {
+            Sample(now);
+        }
+    }
+
+    void Finish(BuildResult& result) {
+        const std::lock_guard lock(mutex_);
+        const auto now = Clock::now();
+        Close(now);
+        started_ = false;
+        Sample(now);
+        result.stageSeconds = seconds_;
+        result.peakResidentBytes = peak_;
+    }
+
+private:
+    using Clock = std::chrono::steady_clock;
+    static constexpr auto kSampleInterval = std::chrono::milliseconds(200);
+
+    void Close(Clock::time_point now) {
+        if (started_) {
+            seconds_[stage_] += std::chrono::duration<double>(now - since_).count();
+        }
+    }
+    void Sample(Clock::time_point now) {
+        peak_ = std::max(peak_, data::QueryProcessResidentBytes());
+        sampled_ = now;
+    }
+
+    std::mutex mutex_;
+    std::array<double, kBuildStageCount> seconds_{};
+    std::size_t stage_ = static_cast<std::size_t>(BuildStage::ReadNodes);
+    bool started_ = true;
+    Clock::time_point since_{};
+    Clock::time_point sampled_{};
+    std::uint64_t peak_ = 0;
+};
+
+} // namespace
+
+const char* BuildStageName(BuildStage stage) {
+    switch (stage) {
+    case BuildStage::ReadNodes:
+        return "read nodes";
+    case BuildStage::ReadEdges:
+        return "read edges";
+    case BuildStage::ReadRanges:
+        return "read ranges";
+    case BuildStage::ResolveShortcuts:
+        return "resolve shortcuts";
+    case BuildStage::ComputeErrors:
+        return "geometry errors";
+    case BuildStage::ComputeContexts:
+        return "cover intervals";
+    case BuildStage::LayoutPages:
+        return "plan records";
+    case BuildStage::WritePages:
+        return "write pages";
+    case BuildStage::WriteHierarchy:
+        return "write hierarchy";
+    case BuildStage::Verify:
+        return "verify against DFS";
+    case BuildStage::Compress:
+        return "compress and check";
+    }
+    return "?";
+}
+
 BuildResult LodPageBuilder::Build(const std::filesystem::path& graphPath,
                                   const std::filesystem::path& rangesPath,
                                   const std::filesystem::path& outputPath,
@@ -1999,17 +2093,28 @@ BuildResult LodPageBuilder::Build(const std::filesystem::path& graphPath,
                         : memory.availablePhysicalBytes != 0u
                             ? memory.availablePhysicalBytes / 4u * 3u
                             : 4ull << 30u;
-    auto result = BuildUncompressed(graphPath, rangesPath, outputPath, temporary, budget, progress);
+    StageMeter meter;
+    const ProgressCallback metered = [&](const BuildProgress& step) {
+        meter.Note(step);
+        if (progress) {
+            progress(step);
+        }
+    };
+    auto result = BuildUncompressed(graphPath, rangesPath, outputPath, temporary, budget, metered);
 
     // The scratch files are gone; the checked file is compressed next to it.
     auto compressedPath = temporaryPath;
     compressedPath += ".zst";
     TemporaryFile compressed(compressedPath);
-    WriteCompressed(temporary.Path(), compressed.Path(), progress);
+    WriteCompressed(temporary.Path(), compressed.Path(), metered);
     result.uncompressedBytes = std::filesystem::file_size(temporary.Path());
     result.fileBytes = std::filesystem::file_size(compressed.Path());
     compressed.MoveTo(outputPath);
 
+    meter.Finish(result);
+    result.graphBytes = std::filesystem::file_size(graphPath);
+    result.rangesBytes = std::filesystem::file_size(rangesPath);
+    result.threads = WorkerCount();
     result.path = outputPath;
     result.seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count();

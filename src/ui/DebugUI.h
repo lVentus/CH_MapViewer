@@ -9,8 +9,9 @@
 #include <string>
 
 namespace chmv::benchmark {
+class BenchmarkSuite;
 class LodPageZoomSweep;
-}
+} // namespace chmv::benchmark
 
 namespace chmv::cpu {
 struct ClassicStatus;
@@ -51,6 +52,8 @@ struct DebugUIActions {
     std::optional<std::size_t> datasetRequest;
     bool validate = false;
     bool runBenchmark = false;
+    bool startSuite = false;
+    bool cancelSuite = false;
     bool startZoomSweep = false;
     bool cancelZoomSweep = false;
     std::optional<std::uint32_t> gpuBudgetMiB;
@@ -72,12 +75,16 @@ struct DebugUIState {
     float tolerancePixels = 1.0f;
     bool toleranceCoarsened = false;
     bool& preloadAll;
+    bool& cullSegments;
     const std::string& roadStyleStatus;
     bool roadStyleError = false;
     const gpu::lod::LodPageRuntimeStats* stats = nullptr;
     const gpu::lod::LodPageValidation* validation = nullptr;
     const gpu::lod::LodPageBenchmarkResult* benchmark = nullptr;
     const benchmark::LodPageZoomSweep* sweep = nullptr;
+    const benchmark::BenchmarkSuite* suite = nullptr;
+    // Where benchmarks, reports and sweeps of the dataset are written.
+    std::string resultsDirectory;
     // Who computes what is drawn, and the CPU side: method, threads, result (null when the CPU
     // does not run), classic method state, the GPU/CPU comparison of the current view (null
     // until there is one) and the CPU benchmark.
@@ -117,6 +124,7 @@ private:
     static void DrawPageStats(const gpu::lod::LodPageRuntimeStats& stats);
     void DrawMemory(const DebugUIState& state, DebugUIActions& actions);
     static void DrawZoomSweep(const DebugUIState& state, DebugUIActions& actions);
+    static void DrawBenchmarks(const DebugUIState& state, DebugUIActions& actions);
 
     std::size_t selectedDataset_ = 0;
     int gpuBudgetMiB_ = 0;

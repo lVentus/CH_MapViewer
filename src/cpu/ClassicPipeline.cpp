@@ -1,5 +1,6 @@
 #include "cpu/ClassicPipeline.h"
 
+#include "cpu/CpuWorkQueue.h"
 #include "cpu/CpuWorkers.h"
 #include "data/ch/CHProjection.h"
 #include "data/ch/CHTypes.h"
@@ -58,7 +59,7 @@ std::uint64_t ClassicGraph::EstimateBytes(const lod::FileHeader& header) {
     // Nodes: coordinates, and latitude/longitude while projecting. Edges: the CH columns kept
     // (23 B), birth order and grid (10 B), and one column being converted (or the road styles
     // being derived).
-    return header.nodeCount * 16u + header.edgeCount * 37u + (64ull << 20u);
+    return header.nodeCount * 24u + header.edgeCount * 37u + (64ull << 20u);
 }
 
 std::unique_ptr<ClassicGraph> ClassicGraph::Load(const lod::LodPageFile& file,
@@ -74,9 +75,9 @@ std::unique_ptr<ClassicGraph> ClassicGraph::Load(const lod::LodPageFile& file,
     const auto edges = static_cast<std::size_t>(header.edgeCount);
     {
         // The projection the builder used, so coordinates match the pages to the unit.
-        const auto latitude = file.ReadSection<std::int32_t>(lod::Section::NodeLatitude);
+        const auto latitude = file.ReadSection<double>(lod::Section::NodeLatitude);
         check();
-        const auto longitude = file.ReadSection<std::int32_t>(lod::Section::NodeLongitude);
+        const auto longitude = file.ReadSection<double>(lod::Section::NodeLongitude);
         check();
         const data::CHProjection projection{header.centerLatitude, header.centerLongitude,
                                             header.longitudeScale, header.normalization};
@@ -85,8 +86,7 @@ std::unique_ptr<ClassicGraph> ClassicGraph::Load(const lod::LodPageFile& file,
         const auto ranges = lod::SplitRange(0u, nodes, kEdgesPerTask);
         lod::RunParallel(ranges.size(), [&](std::size_t task, unsigned) {
             for (auto i = ranges[task].first; i < ranges[task].second; ++i) {
-                const auto point = projection.Project(latitude[i] / lod::kDegreeScale,
-                                                      longitude[i] / lod::kDegreeScale);
+                const auto point = projection.Project(latitude[i], longitude[i]);
                 graph->x_[i] =
                     static_cast<std::int32_t>(std::round(point.x * lod::kFixedCoordinateScale));
                 graph->y_[i] =
@@ -310,7 +310,7 @@ void ClassicGraph::BuildFilters() {
 }
 
 CpuResult ClassicGraph::Run(CpuWorkers& workers, const lod::LodPageQuery& query, CpuFilter filter,
-                            CpuExpansion expansion) const {
+                            CpuExpansion expansion, bool cullSegments) const {
     CpuResult result;
     result.threads = workers.Threads();
     if (expansion == CpuExpansion::Intervals) {
@@ -325,7 +325,33 @@ CpuResult ClassicGraph::Run(CpuWorkers& workers, const lod::LodPageQuery& query,
 
     // Roots.
     auto begin = Clock::now();
-    if (filter == CpuFilter::FullScan) {
+    std::vector<std::uint32_t> roots;
+    if (filter == CpuFilter::TwoPass) {
+        // Count per block of edges, then every block writes its roots to its own place.
+        const auto blocks = TaskCount(birth_.size(), kEdgesPerTask);
+        std::vector<std::size_t> offsets(blocks + 1u, 0u);
+        workers.Run(blocks, [&](std::size_t block, unsigned) {
+            const auto last = std::min(birth_.size(), (block + 1u) * kEdgesPerTask);
+            std::size_t count = 0;
+            for (auto e = block * kEdgesPerTask; e < last; ++e) {
+                count += Alive(static_cast<std::uint32_t>(e), level) ? 1u : 0u;
+            }
+            offsets[block + 1u] = count;
+        });
+        for (std::size_t block = 0; block < blocks; ++block) {
+            offsets[block + 1u] += offsets[block];
+        }
+        roots.resize(offsets.back());
+        workers.Run(blocks, [&](std::size_t block, unsigned) {
+            const auto last = std::min(birth_.size(), (block + 1u) * kEdgesPerTask);
+            auto at = offsets[block];
+            for (auto e = block * kEdgesPerTask; e < last; ++e) {
+                if (Alive(static_cast<std::uint32_t>(e), level)) {
+                    roots[at++] = static_cast<std::uint32_t>(e);
+                }
+            }
+        });
+    } else if (filter == CpuFilter::FullScan) {
         workers.Run(TaskCount(birth_.size(), kEdgesPerTask),
                     [&](std::size_t task, unsigned worker) {
                         const auto last = std::min(birth_.size(), (task + 1u) * kEdgesPerTask);
@@ -387,7 +413,9 @@ CpuResult ClassicGraph::Run(CpuWorkers& workers, const lod::LodPageQuery& query,
             }
         });
     }
-    const auto roots = Gather(found);
+    if (filter != CpuFilter::TwoPass) {
+        roots = Gather(found);
+    }
     result.candidates = roots.size();
     result.filterMs = Milliseconds(begin);
 
@@ -398,13 +426,20 @@ CpuResult ClassicGraph::Run(CpuWorkers& workers, const lod::LodPageQuery& query,
         return errorCode_[e] > threshold && childA_[e] != data::InvalidEdgeId &&
                childB_[e] != data::InvalidEdgeId;
     };
+    // An edge to draw, unless culling drops it.
+    const auto draw = [&](std::uint32_t e, unsigned worker) {
+        if (!cullSegments ||
+            ChordInCullBox(x_[source_[e]], y_[source_[e]], x_[target_[e]], y_[target_[e]], cull)) {
+            found[worker].push_back(e);
+        }
+    };
     std::vector<std::uint32_t> drawn;
     if (expansion == CpuExpansion::Roots) {
         workers.Run(TaskCount(roots.size(), kItemsPerTask), [&](std::size_t task, unsigned worker) {
             const auto last = std::min(roots.size(), (task + 1u) * kItemsPerTask);
             for (auto i = task * kItemsPerTask; i < last; ++i) {
                 if (errorCode_[roots[i]] <= threshold && Visible(roots[i], cull)) {
-                    found[worker].push_back(roots[i]);
+                    draw(roots[i], worker);
                 }
             }
         });
@@ -413,7 +448,6 @@ CpuResult ClassicGraph::Run(CpuWorkers& workers, const lod::LodPageQuery& query,
         std::vector<std::vector<std::uint32_t>> stacks(threads);
         workers.Run(TaskCount(roots.size(), kRootsPerTask), [&](std::size_t task, unsigned worker) {
             auto& stack = stacks[worker];
-            auto& out = found[worker];
             const auto last = std::min(roots.size(), (task + 1u) * kRootsPerTask);
             for (auto i = task * kRootsPerTask; i < last; ++i) {
                 stack.push_back(roots[i]);
@@ -424,7 +458,7 @@ CpuResult ClassicGraph::Run(CpuWorkers& workers, const lod::LodPageQuery& query,
                         continue;
                     }
                     if (!expands(e)) {
-                        out.push_back(e);
+                        draw(e, worker);
                         continue;
                     }
                     stack.push_back(childB_[e]);
@@ -432,6 +466,23 @@ CpuResult ClassicGraph::Run(CpuWorkers& workers, const lod::LodPageQuery& query,
                 }
             }
         });
+        drawn = Gather(found);
+    } else if (expansion == CpuExpansion::Queue) {
+        // Room for a few times the roots, at most 2^24 edges; the rest is walked by the worker
+        // that finds it.
+        constexpr std::size_t kMaxQueue = std::size_t{1} << 24u;
+        RunWorkQueue(workers, roots, std::min(roots.size() * 4u + 4096u, kMaxQueue),
+                     [&](std::uint32_t e, unsigned worker, std::array<std::uint32_t, 2>& next) {
+                         if (!Visible(e, cull)) {
+                             return 0;
+                         }
+                         if (!expands(e)) {
+                             draw(e, worker);
+                             return 0;
+                         }
+                         next = {childA_[e], childB_[e]};
+                         return 2;
+                     });
         drawn = Gather(found);
     } else {
         std::vector<std::vector<std::uint32_t>> next(threads);
@@ -446,7 +497,7 @@ CpuResult ClassicGraph::Run(CpuWorkers& workers, const lod::LodPageQuery& query,
                             continue;
                         }
                         if (!expands(e)) {
-                            found[worker].push_back(e);
+                            draw(e, worker);
                             continue;
                         }
                         next[worker].push_back(childA_[e]);

@@ -1,0 +1,34 @@
+LOD page file build
+Finished:           2026-11-08 16:47:23 UTC
+Output:             D:\Project\毕业\CH_MapViewer\assets\data\GER\GER.chlod
+Sources:            13396.0 MiB .sch + 4041.0 MiB .ranges
+Threads:            16 (hardware 16)
+RAM:                peak 13262 MiB held by the process (sampled), budget 21210 MiB
+Page passes:        1 (writing pages within the budget)
+
+Time
+Total:              166.7 s
+  read nodes               9.97 s    6.0 %
+  read edges              16.49 s    9.9 %
+  read ranges              6.70 s    4.0 %
+  resolve shortcuts        6.38 s    3.8 %
+  geometry errors         11.17 s    6.7 %
+  cover intervals          6.56 s    3.9 %
+  plan records             5.57 s    3.3 %
+  write pages             27.98 s   16.8 %
+  write hierarchy          5.84 s    3.5 %
+  verify against DFS      20.75 s   12.5 %
+  compress and check      49.27 s   29.6 %
+Reading sources:    525.8 MiB/s
+Overall:            1.67 M edges/s
+
+Result
+Nodes / edges:      71447621 / 278934762
+Records / pages:    269246055 / 1051778
+Extra contexts:     0
+Split covers:       0
+Walk-only records:  9490
+Checked cuts:       4 reference cuts equal to DFS
+File:               7695.7 MiB (39.4 % of 19527.2 MiB uncompressed)
+
+preprocess_stages.csv: the times above; preprocess_history.csv: one line per build

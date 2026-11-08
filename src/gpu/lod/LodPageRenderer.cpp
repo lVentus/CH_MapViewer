@@ -8,6 +8,7 @@
 #include <glad/gl.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <limits>
 #include <utility>
@@ -29,6 +30,10 @@ constexpr auto kSteps = static_cast<std::size_t>(chmv::renderer::kToleranceSteps
 constexpr std::size_t kReadbackWords = kReadbackStepWord + kSteps;
 // Segment room grows by doubling when a traversal draws more than the pages hold records.
 constexpr std::uint32_t kMaxSegmentScale = 8;
+// Benchmark: unmeasured passes first (shaders, caches, buffer growth), and calls per batch of
+// the wall-time measurement.
+constexpr std::uint32_t kWarmUpPasses = 10;
+constexpr std::uint32_t kWallBatch = 10;
 
 [[nodiscard]] GLsync AsSync(void* fence) {
     return static_cast<GLsync>(fence);
@@ -165,6 +170,7 @@ void LodPageRenderer::Unfold(const LodPagePool& pool, const LodPagePass& pass,
     input.level = pass.query.level;
     input.threshold = pass.query.threshold;
     input.cullBox = chmv::streaming::lod::TraversalCullBox(pass.query);
+    input.cullSegments = pass.cullSegments;
     input.hierarchyHeight = pass.hierarchyHeight;
     input.errorBounds = errorBounds_.Id();
     input.segmentBuffer = segmentBuffer_.Id();
@@ -195,6 +201,10 @@ void LodPageRenderer::CountSteps(const LodPagePool& pool, const LodPagePass& pas
     stepCountBuffer_.BindBase(GL_SHADER_STORAGE_BUFFER, 5);
     glUniform1ui(glGetUniformLocation(program, "uLevel"), pass.query.level);
     glUniform1ui(glGetUniformLocation(program, "uStepBase"), stepBase);
+    const auto cullBox = chmv::streaming::lod::TraversalCullBox(pass.query);
+    glUniform4i(glGetUniformLocation(program, "uCullBox"), cullBox[0], cullBox[1], cullBox[2],
+                cullBox[3]);
+    glUniform1ui(glGetUniformLocation(program, "uCullSegments"), pass.cullSegments ? 1u : 0u);
     ListDispatcher::Dispatch(slotList_.Id());
     glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT);
 }
@@ -246,18 +256,47 @@ void LodPageRenderer::Process(const LodPagePool& pool, const LodPagePass& pass,
     readback.counted = stepBase.has_value();
 }
 
-LodPageBenchmarkResult LodPageRenderer::Benchmark(const LodPagePool& pool,
-                                                  const LodPagePass& pass,
+LodPageBenchmarkResult LodPageRenderer::Benchmark(const LodPagePool& pool, const LodPagePass& pass,
                                                   filtering::IRangeFilterStrategy& filter,
                                                   unfolding::IUnfoldingStrategy& unfold,
-                                                  std::uint32_t iterations) {
+                                                  std::uint32_t iterations,
+                                                  const renderer::MapCamera2D& camera, int width,
+                                                  int height,
+                                                  const renderer::RoadStyleConfig& styles) {
     LodPageBenchmarkResult result;
     result.pages = static_cast<std::uint32_t>(pass.slots.size());
     if (pass.slots.empty() || iterations == 0u) {
         return result;
     }
-    // Three timestamps per pass: start, after the filter, after the expansion.
-    std::vector<GLuint> queries(std::size_t{iterations} * 3u);
+    using Clock = std::chrono::steady_clock;
+    const auto runPass = [&] {
+        const auto capacities = StartPass(pool, pass);
+        Filter(pool, pass, capacities, filter);
+        Unfold(pool, pass, capacities, unfold);
+    };
+    const auto draw = [&] { Draw(pool, camera, width, height, styles); };
+    // Wall time per call, from batches of kWallBatch calls between two glFinish.
+    const auto wallTimes = [&](const auto& work) {
+        std::vector<double> perCall;
+        for (std::uint32_t done = 0; done < iterations; done += kWallBatch) {
+            const auto batch = std::min(kWallBatch, iterations - done);
+            glFinish();
+            const auto begin = Clock::now();
+            for (std::uint32_t i = 0; i < batch; ++i) {
+                work();
+            }
+            glFinish();
+            perCall.push_back(
+                std::chrono::duration<double, std::milli>(Clock::now() - begin).count() / batch);
+        }
+        return perCall;
+    };
+    for (std::uint32_t i = 0; i < kWarmUpPasses; ++i) {
+        runPass();
+    }
+
+    // Timestamps: start, after the filter, after the expansion of every pass; around every draw.
+    std::vector<GLuint> queries(std::size_t{iterations} * 5u);
     glGenQueries(static_cast<GLsizei>(queries.size()), queries.data());
     glFinish();
     for (std::uint32_t i = 0; i < iterations; ++i) {
@@ -268,26 +307,39 @@ LodPageBenchmarkResult LodPageRenderer::Benchmark(const LodPagePool& pool,
         Unfold(pool, pass, capacities, unfold);
         glQueryCounter(queries[i * 3u + 2u], GL_TIMESTAMP);
     }
+    const auto drawQueries = std::size_t{iterations} * 3u;
+    for (std::uint32_t i = 0; i < iterations; ++i) {
+        glQueryCounter(queries[drawQueries + i * 2u], GL_TIMESTAMP);
+        draw();
+        glQueryCounter(queries[drawQueries + i * 2u + 1u], GL_TIMESTAMP);
+    }
     glFinish();
-
     std::vector<GLuint64> times(queries.size());
     for (std::size_t q = 0; q < queries.size(); ++q) {
         glGetQueryObjectui64v(queries[q], GL_QUERY_RESULT, &times[q]);
     }
     glDeleteQueries(static_cast<GLsizei>(queries.size()), queries.data());
-
-    result.iterations = iterations;
-    result.filterMinMs = result.unfoldMinMs = std::numeric_limits<double>::max();
+    const auto milliseconds = [&](std::size_t from, std::size_t to) {
+        return static_cast<double>(times[to] - times[from]) * 1e-6;
+    };
+    std::vector<double> filterMs;
+    std::vector<double> unfoldMs;
+    std::vector<double> passMs;
+    std::vector<double> drawMs;
     for (std::uint32_t i = 0; i < iterations; ++i) {
-        const auto filterMs = static_cast<double>(times[i * 3u + 1u] - times[i * 3u]) * 1e-6;
-        const auto unfoldMs = static_cast<double>(times[i * 3u + 2u] - times[i * 3u + 1u]) * 1e-6;
-        result.filterMinMs = std::min(result.filterMinMs, filterMs);
-        result.filterMaxMs = std::max(result.filterMaxMs, filterMs);
-        result.filterAverageMs += filterMs / iterations;
-        result.unfoldMinMs = std::min(result.unfoldMinMs, unfoldMs);
-        result.unfoldMaxMs = std::max(result.unfoldMaxMs, unfoldMs);
-        result.unfoldAverageMs += unfoldMs / iterations;
+        filterMs.push_back(milliseconds(i * 3u, i * 3u + 1u));
+        unfoldMs.push_back(milliseconds(i * 3u + 1u, i * 3u + 2u));
+        passMs.push_back(milliseconds(i * 3u, i * 3u + 2u));
+        drawMs.push_back(milliseconds(drawQueries + i * 2u, drawQueries + i * 2u + 1u));
     }
+    result.iterations = iterations;
+    result.filterGpu = benchmark::Summarize(std::move(filterMs));
+    result.unfoldGpu = benchmark::Summarize(std::move(unfoldMs));
+    result.passGpu = benchmark::Summarize(std::move(passMs));
+    result.drawGpu = benchmark::Summarize(std::move(drawMs));
+    result.passWall = benchmark::Summarize(wallTimes(runPass));
+    result.drawWall = benchmark::Summarize(wallTimes(draw));
+
     result.candidates = ReadWords(candidateList_, 0, 1)[0];
     result.segments = ReadWords(commandBuffer_, 0, kCommandWords)[4];
     drawnSegments_ = result.segments;

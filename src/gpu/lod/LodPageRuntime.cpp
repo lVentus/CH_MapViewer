@@ -31,6 +31,10 @@ constexpr double kStillUploadSliceMs = 12.0;
 constexpr double kPrefetchMargin = 0.5;
 // Pages queued per frame while preloading everything, after the view's own.
 constexpr std::uint32_t kPreloadPagesPerFrame = 4096;
+// A view too large for the GPU pool is drawn as from farther away, in quarter octaves, at most
+// 16 octaves.
+constexpr std::uint32_t kFitStepsPerOctave = 4;
+constexpr std::uint32_t kMaxFitSteps = 64;
 
 [[nodiscard]] double Milliseconds(Clock::time_point begin) {
     return std::chrono::duration<double, std::milli>(Clock::now() - begin).count();
@@ -182,6 +186,7 @@ LodPagePass LodPageRuntime::Pass() const {
     pass.directory = Directory();
     pass.query = drawQuery_;
     pass.hierarchyHeight = file_->Header().maxHierarchyHeight;
+    pass.cullSegments = cullSegments_;
     return pass;
 }
 
@@ -228,18 +233,37 @@ void LodPageRuntime::Update(const renderer::MapCamera2D& camera, const renderer:
     ring.maxX = static_cast<float>(centerX + halfX * (1.0 + 2.0 * kPrefetchMargin));
     ring.maxY = static_cast<float>(centerY + halfY * (1.0 + 2.0 * kPrefetchMargin));
 
-    // A camera that has not moved asks for exactly the same pages as last frame.
+    // A camera that has not moved asks for exactly the same pages as last frame. A view that
+    // needs more pages than the GPU pool holds is drawn as from farther away (coarser level and
+    // tolerance) until it fits.
     const auto planBegin = Clock::now();
     if (!planned_ || query != plannedQuery_ || ring != plannedRing_) {
-        required_.clear();
-        prefetch_.clear();
-        chmv::streaming::lod::CollectLodPages(Groups(), Directory(), query, required_);
-        chmv::streaming::lod::CollectLodPages(Groups(), Directory(), ring, prefetch_);
         plannedQuery_ = query;
         plannedRing_ = ring;
         planned_ = true;
+        const auto farther = [&](std::uint32_t steps) {
+            const auto coarser = chmv::streaming::lod::PlanView(
+                camera, lod, width, height, pixelTolerance, file_->Header().maxLevel,
+                static_cast<double>(steps) / kFitStepsPerOctave);
+            auto result = coarser.query;
+            result.threshold = unfolding::ThresholdFor(unfold.Mode(), coarser.toleranceCode);
+            return result;
+        };
+        const auto fitted = FitView(query, farther, required_, fitSteps_);
+        fittedLevel_ = fitted.level;
+        fittedThreshold_ = fitted.threshold;
+        ring.level = fittedLevel_;
+        ring.threshold = fittedThreshold_;
+        prefetch_.clear();
+        chmv::streaming::lod::CollectLodPages(Groups(), Directory(), ring, prefetch_);
     }
     stats_.planMs = Milliseconds(planBegin);
+    stats_.cameraLevel = query.level;
+    stats_.cameraThreshold = query.threshold;
+    stats_.zoomOutOctaves = static_cast<float>(fitSteps_) / kFitStepsPerOctave;
+    stats_.fittedToPool = fittedLevel_ != query.level || fittedThreshold_ != query.threshold;
+    query.level = fittedLevel_;
+    query.threshold = fittedThreshold_;
 
     // Pin what the target needs and, if the pool has room for both, what is on screen now;
     // a small pool gives up the old picture rather than never reaching the new one. Then queue
@@ -312,22 +336,23 @@ void LodPageRuntime::Update(const renderer::MapCamera2D& camera, const renderer:
             filterKey.push_back((std::uint64_t{page} << 32u) | slot);
         }
     }
-    // A traversal culls with the view, so its result changes with the view too; the interval
-    // rules only depend on level, threshold and pages.
+    // A traversal culls with the view, as does segment culling, so their result changes with
+    // the view too; the interval rules alone only depend on level, threshold and pages.
     const auto sameQuery = [&](const chmv::streaming::lod::LodPageQuery& done) {
         return done.level == drawQuery_.level && done.threshold == drawQuery_.threshold &&
-               (!unfold.Traverses() || done == drawQuery_);
+               ((!unfold.Traverses() && !cullSegments_) || done == drawQuery_);
     };
     const DrawState drawState{drawQuery_.level, drawQuery_.threshold, true};
     const bool retry = renderer_.TakeRetry();
     const bool count = countSteps && unfold.Mode() == geometry::RefinementMode::Adaptive;
     stats_.filtered = retry || !filteredQuery_ || !sameQuery(*filteredQuery_) ||
                       filterKey != filteredPages_ || filteredBy_ != &filter ||
-                      unfoldedBy_ != &unfold || (count && !counted_);
+                      unfoldedBy_ != &unfold || (count && !counted_) || culled_ != cullSegments_;
     if (stats_.filtered) {
         renderer_.Process(pool_, Pass(), filter, unfold,
                           count ? std::optional{planned.pixelCode} : std::nullopt);
         counted_ = count;
+        culled_ = cullSegments_;
         filteredQuery_ = drawQuery_;
         filteredPages_ = std::move(filterKey);
         filteredBy_ = &filter;
@@ -378,6 +403,74 @@ void LodPageRuntime::Update(const renderer::MapCamera2D& camera, const renderer:
         stats_.readerError = reader.error;
     }
     stats_.updateMs = Milliseconds(begin);
+}
+
+// The pages of a view must fit in the pool (it then gives up the old picture rather than never
+// showing the new one). Farther away, level and tolerance are coarser and fewer pages are
+// needed. Where the farthest view still needs too many (the LOD curve stops at the overview
+// level, or the level is set by hand), the level is raised beyond it, up to the coarsest, with
+// the tolerance of the nearest view that reaches that level.
+// Both searches double their step until the pages fit, then halve back to the nearest that
+// fits; the coarsest is taken even if it does not fit.
+chmv::streaming::lod::LodPageQuery LodPageRuntime::FitView(
+    const chmv::streaming::lod::LodPageQuery& query,
+    const std::function<chmv::streaming::lod::LodPageQuery(std::uint32_t)>& farther,
+    std::vector<std::uint32_t>& pages, std::uint32_t& steps) const {
+    const auto limit = std::size_t{pool_.SlotCount()};
+    const auto fits = [&](const chmv::streaming::lod::LodPageQuery& candidate) {
+        pages.clear();
+        chmv::streaming::lod::CollectLodPages(Groups(), Directory(), candidate, pages);
+        return pages.size() <= limit;
+    };
+    // The least value in (low, high] for which coarser(value) fits, high if none does.
+    const auto search = [&](std::uint32_t low, std::uint32_t high, const auto& coarser) {
+        auto last = high;
+        for (std::uint32_t step = 1; low + step < high; step *= 2u) {
+            if (fits(coarser(low + step))) {
+                last = low + step;
+                break;
+            }
+            low += step;
+        }
+        while (last - low > 1u) {
+            const auto middle = low + (last - low) / 2u;
+            if (fits(coarser(middle))) {
+                last = middle;
+            } else {
+                low = middle;
+            }
+        }
+        return last;
+    };
+    steps = 0;
+    if (fits(query)) {
+        return query;
+    }
+    steps = search(0u, kMaxFitSteps, farther);
+    auto fitted = farther(steps);
+    if (fits(fitted)) {
+        return fitted;
+    }
+    // From the nearest step that already has the farthest level on: farther still would only
+    // make the tolerance coarser.
+    std::uint32_t low = 0;
+    while (steps - low > 1u) {
+        const auto middle = low + (steps - low) / 2u;
+        (farther(middle).level == fitted.level ? steps : low) = middle;
+    }
+    fitted = farther(steps);
+    const auto coarsest =
+        static_cast<std::uint32_t>(std::max(file_->Header().maxLevel, std::int32_t{0}));
+    if (fitted.level < coarsest) {
+        const auto withLevel = [&](std::uint32_t level) {
+            auto raised = fitted;
+            raised.level = level;
+            return raised;
+        };
+        fitted.level = search(fitted.level, coarsest, withLevel);
+    }
+    (void)fits(fitted);
+    return fitted;
 }
 
 // With preloading, every page the view does not need yet is queued behind the view's own, a
@@ -526,11 +619,15 @@ void LodPageRuntime::Draw(const renderer::MapCamera2D& camera, int width, int he
 
 LodPageBenchmarkResult LodPageRuntime::Benchmark(filtering::IRangeFilterStrategy& filter,
                                                  unfolding::IUnfoldingStrategy& unfold,
-                                                 std::uint32_t iterations) {
+                                                 std::uint32_t iterations,
+                                                 const renderer::MapCamera2D& camera, int width,
+                                                 int height,
+                                                 const renderer::RoadStyleConfig& styles) {
     if (!poolReady_) {
         return {};
     }
-    return renderer_.Benchmark(pool_, Pass(), filter, unfold, iterations);
+    return renderer_.Benchmark(pool_, Pass(), filter, unfold, iterations, camera, width, height,
+                               styles);
 }
 
 std::vector<std::uint32_t> LodPageRuntime::DrawnEdgesInView() const {

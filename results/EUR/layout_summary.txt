@@ -1,0 +1,30 @@
+LOD page file layout
+Written:            2026-11-08 16:37:11 UTC
+File:               D:\Project\毕业\CH_MapViewer\assets\data\EUR\EUR.chlod
+Format version:     6 (zstd)
+Region:             lat 32.6342 .. 78.9430, lon -31.2665 .. 46.6776 (about 4878 x 5155 km)
+
+CH
+Nodes:              273011288
+Edges:              1015746745
+Levels:             0 .. 468
+Hierarchy height:   32
+
+Records and pages
+Records:            978069064 (0.963 per edge)
+Extra contexts:     0
+Split covers:       0
+Pages:              3820618 (59698 groups of 64)
+Records per page:   mean 256.0, p50 256, p5 256, min 1 (capacity 256; fill 100.0 %)
+Vertices per record: 0.640 (shared end points within a page)
+Page box size:      p50 4.411 km, p95 36.152 km, max 4326.5 km
+Traversal pages:    3820618 (directory of the hierarchy walk)
+
+Sizes
+File on disk:       26.29 GiB (37.6 % of 69.96 GiB uncompressed)
+Render pages:       20706.1 MiB uncompressed, 9491.0 MiB stored, 10.2 bytes per record stored
+
+layout_layers.csv: pages per quality layer (0 = 1 px, 1 = 2 px, ...) and zoom octave
+layout_levels.csv: pages each level can select
+layout_page_fill.csv: pages by records per page
+layout_sections.csv: every section uncompressed and stored
